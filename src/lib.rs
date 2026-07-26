@@ -1,3 +1,5 @@
 pub mod bits;
 pub mod instances;
+pub mod netlist;
 pub mod table;
+pub mod xag;
