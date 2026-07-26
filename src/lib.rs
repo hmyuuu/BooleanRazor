@@ -2,6 +2,8 @@ pub mod arithmetic;
 pub mod bits;
 pub mod instances;
 pub mod netlist;
+#[cfg(feature = "oxidd-oracle")]
+pub mod oxidd_oracle;
 pub mod robdd;
 pub mod table;
 pub mod xag;
