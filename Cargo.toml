@@ -1,0 +1,17 @@
+[package]
+name = "occam-circuit-hmyuuu"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.93"
+publish = false
+
+[features]
+default = ["oxidd-oracle"]
+oxidd-oracle = ["dep:oxidd"]
+sat = ["dep:rustsat", "dep:rustsat-cadical"]
+
+[dependencies]
+oxidd = { version = "=0.12.0", default-features = false, features = ["manager-index", "bcdd", "apply-cache-direct-mapped"], optional = true }
+rustsat = { version = "=0.7.5", optional = true }
+rustsat-cadical = { version = "=0.7.5", optional = true }
+sha2 = "=0.10.9"
