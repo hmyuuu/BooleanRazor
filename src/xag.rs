@@ -357,7 +357,54 @@ impl Circuit {
             .fold(0, |value, (index, bit)| value | (u64::from(*bit) << index)))
     }
 
+    pub fn reachable_gate_count(&self) -> Result<usize, String> {
+        self.graph.reachable_gate_count(&self.outputs)
+    }
+
+    pub fn evaluate_all(&self) -> Result<Vec<Vec<bool>>, String> {
+        let shift = u32::try_from(self.graph.ninputs)
+            .map_err(|_| "XAG input dimensions overflow".to_string())?;
+        let row_count = 1usize
+            .checked_shl(shift)
+            .ok_or_else(|| "XAG input dimensions overflow".to_string())?;
+        let mut rows = vec![vec![false; self.outputs.len()]; row_count];
+        let mut values = vec![0u64; self.graph.node_count()];
+
+        for base in (0..row_count).step_by(u64::BITS as usize) {
+            values.fill(0);
+            let lanes = (row_count - base).min(u64::BITS as usize);
+            for input in 0..self.graph.ninputs {
+                let mut word = 0u64;
+                for lane in 0..lanes {
+                    if (((base + lane) >> input) & 1) != 0 {
+                        word |= 1u64 << lane;
+                    }
+                }
+                values[input + 1] = word;
+            }
+            for (index, gate) in self.graph.gates.iter().enumerate() {
+                let left = word_value(gate.left, &values);
+                let right = word_value(gate.right, &values);
+                values[self.graph.gate_node(index)] = match gate.op {
+                    Op::And => left & right,
+                    Op::Xor => left ^ right,
+                };
+            }
+            for (output, literal) in self.outputs.iter().enumerate() {
+                let word = word_value(*literal, &values);
+                for lane in 0..lanes {
+                    rows[base + lane][output] = ((word >> lane) & 1) != 0;
+                }
+            }
+        }
+        Ok(rows)
+    }
+
     pub fn to_netlist(&self) -> Result<String, String> {
         crate::netlist::serialize(self)
     }
+}
+
+fn word_value(literal: Lit, values: &[u64]) -> u64 {
+    values[literal.node] ^ if literal.inverted { u64::MAX } else { 0 }
 }
