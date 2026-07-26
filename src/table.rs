@@ -46,6 +46,21 @@ impl PartialTable {
             rows,
         })
     }
+
+    pub fn validate_against(&self, completed: &CompleteTable) -> Result<(), String> {
+        if self.ninputs != completed.ninputs {
+            return Err("input width does not match completed table".into());
+        }
+        if self.noutputs != completed.noutputs {
+            return Err("output width does not match completed table".into());
+        }
+        for (input, observed_output) in &self.rows {
+            if *observed_output != completed.outputs[row_index(input)] {
+                return Err("observed output mismatch".into());
+            }
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

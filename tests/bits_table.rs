@@ -102,6 +102,21 @@ fn predictions_reject_table_width_mismatches() {
 }
 
 #[test]
+fn partial_table_validation_requires_every_observed_output_to_match() {
+    let completed = CompleteTable::from_fn(2, 1, |mask| mask & 1);
+    let wrong = PartialTable::parse("input,output\n00,1\n", 2, 1).unwrap();
+    assert!(
+        wrong
+            .validate_against(&completed)
+            .unwrap_err()
+            .contains("observed output mismatch")
+    );
+
+    let correct = PartialTable::parse("input,output\n00,0\n10,1\n", 2, 1).unwrap();
+    assert!(correct.validate_against(&completed).is_ok());
+}
+
+#[test]
 fn sha256_hex_is_lowercase_digest_of_exact_bytes() {
     assert_eq!(
         sha256_hex(b"abc"),
