@@ -1,6 +1,36 @@
 use crate::instances::Family;
 use crate::xag::{Circuit, Lit, Xag};
 
+const WIDTH_ERROR: &str = "arithmetic width overflow";
+
+fn checked_add(left: usize, right: usize) -> Result<usize, String> {
+    left.checked_add(right)
+        .ok_or_else(|| WIDTH_ERROR.to_string())
+}
+
+fn checked_mul(left: usize, right: usize) -> Result<usize, String> {
+    left.checked_mul(right)
+        .ok_or_else(|| WIDTH_ERROR.to_string())
+}
+
+fn checked_sub(left: usize, right: usize) -> Result<usize, String> {
+    left.checked_sub(right)
+        .ok_or_else(|| WIDTH_ERROR.to_string())
+}
+
+fn try_reserve<T>(values: &mut Vec<T>, additional: usize) -> Result<(), String> {
+    values
+        .try_reserve_exact(additional)
+        .map_err(|_| WIDTH_ERROR.to_string())
+}
+
+fn empty_columns(count: usize) -> Result<Vec<Vec<Lit>>, String> {
+    let mut columns = Vec::new();
+    try_reserve(&mut columns, count)?;
+    columns.resize_with(count, Vec::new);
+    Ok(columns)
+}
+
 fn half_adder(graph: &mut Xag, a: Lit, b: Lit) -> Result<(Lit, Lit), String> {
     let sum = graph.xor(a, b)?;
     let carry = graph.and(a, b)?;
@@ -32,7 +62,9 @@ fn require_same_nonzero_width(left: &[Lit], right: &[Lit]) -> Result<usize, Stri
 
 pub fn ripple_add(graph: &mut Xag, left: &[Lit], right: &[Lit]) -> Result<Vec<Lit>, String> {
     let width = require_same_nonzero_width(left, right)?;
-    let mut output = Vec::with_capacity(width + 1);
+    let output_width = checked_add(width, 1)?;
+    let mut output = Vec::new();
+    try_reserve(&mut output, output_width)?;
 
     let (sum, mut carry) = half_adder(graph, left[0], right[0])?;
     output.push(sum);
@@ -51,7 +83,8 @@ pub fn absolute_difference(
     right: &[Lit],
 ) -> Result<Vec<Lit>, String> {
     let width = require_same_nonzero_width(left, right)?;
-    let mut difference = Vec::with_capacity(width);
+    let mut difference = Vec::new();
+    try_reserve(&mut difference, width)?;
 
     let first_propagate = graph.xor(left[0], right[0])?;
     difference.push(first_propagate);
@@ -70,12 +103,13 @@ pub fn absolute_difference(
     }
 
     let mask = borrow;
-    let mut absolute = Vec::with_capacity(width);
+    let mut absolute = Vec::new();
+    try_reserve(&mut absolute, width)?;
     absolute.push(difference[0]);
     let mut prefix = graph.and(mask, difference[0])?;
     for bit in 1..width {
         absolute.push(graph.xor(difference[bit], prefix)?);
-        if bit + 1 < width {
+        if checked_add(bit, 1)? < width {
             let masked_bit = graph.and(mask, difference[bit])?;
             prefix = graph.or(prefix, masked_bit)?;
         }
@@ -89,10 +123,14 @@ fn reduce_heap(
     output_width: usize,
 ) -> Result<Vec<Lit>, String> {
     if columns.len() <= output_width {
-        columns.resize_with(output_width + 1, Vec::new);
+        let required_columns = checked_add(output_width, 1)?;
+        let additional = checked_sub(required_columns, columns.len())?;
+        try_reserve(&mut columns, additional)?;
+        columns.resize_with(required_columns, Vec::new);
     }
 
-    let mut output = Vec::with_capacity(output_width);
+    let mut output = Vec::new();
+    try_reserve(&mut output, output_width)?;
     for column in 0..output_width {
         while columns[column].len() >= 3 {
             let carry_in = columns[column].pop().unwrap();
@@ -100,7 +138,7 @@ fn reduce_heap(
             let left = columns[column].pop().unwrap();
             let (sum, carry) = full_adder(graph, left, right, carry_in)?;
             columns[column].push(sum);
-            columns[column + 1].push(carry);
+            columns[checked_add(column, 1)?].push(carry);
         }
 
         match columns[column].len() {
@@ -111,7 +149,7 @@ fn reduce_heap(
                 let left = columns[column].pop().unwrap();
                 let (sum, carry) = half_adder(graph, left, right)?;
                 output.push(sum);
-                columns[column + 1].push(carry);
+                columns[checked_add(column, 1)?].push(carry);
             }
             _ => unreachable!("full-adder reduction leaves at most two bits"),
         }
@@ -130,11 +168,11 @@ fn reduce_heap(
 
 pub fn unsigned_multiply(graph: &mut Xag, left: &[Lit], right: &[Lit]) -> Result<Vec<Lit>, String> {
     let width = require_same_nonzero_width(left, right)?;
-    let output_width = 2 * width;
-    let mut columns = vec![Vec::new(); output_width + 1];
+    let output_width = checked_mul(2, width)?;
+    let mut columns = empty_columns(checked_add(output_width, 1)?)?;
     for (left_bit, &left_lit) in left.iter().enumerate() {
         for (right_bit, &right_lit) in right.iter().enumerate() {
-            columns[left_bit + right_bit].push(graph.and(left_lit, right_lit)?);
+            columns[checked_add(left_bit, right_bit)?].push(graph.and(left_lit, right_lit)?);
         }
     }
     reduce_heap(graph, columns, output_width)
@@ -142,16 +180,17 @@ pub fn unsigned_multiply(graph: &mut Xag, left: &[Lit], right: &[Lit]) -> Result
 
 fn sum_squares(graph: &mut Xag, left: &[Lit], right: &[Lit]) -> Result<Vec<Lit>, String> {
     let width = require_same_nonzero_width(left, right)?;
-    let output_width = 2 * width + 1;
-    let mut columns = vec![Vec::new(); output_width + 1];
+    let output_width = checked_add(checked_mul(2, width)?, 1)?;
+    let mut columns = empty_columns(checked_add(output_width, 1)?)?;
 
     for operand in [left, right] {
         for (bit, &literal) in operand.iter().enumerate() {
-            columns[2 * bit].push(literal);
+            columns[checked_mul(2, bit)?].push(literal);
         }
         for low in 0..width {
-            for high in low + 1..width {
-                columns[low + high + 1].push(graph.and(operand[low], operand[high])?);
+            for high in checked_add(low, 1)?..width {
+                let column = checked_add(checked_add(low, high)?, 1)?;
+                columns[column].push(graph.and(operand[low], operand[high])?);
             }
         }
     }
@@ -166,11 +205,12 @@ pub fn synthesize_family(
     if input_width == 0 {
         return Err("input width must be positive".into());
     }
+    let graph_input_width = checked_mul(2, input_width)?;
     let required_output_width = match family {
-        Family::Add => input_width + 1,
+        Family::Add => checked_add(input_width, 1)?,
         Family::AbsDiff => input_width,
-        Family::Multiply => 2 * input_width,
-        Family::SumSquares => 2 * input_width + 1,
+        Family::Multiply => checked_mul(2, input_width)?,
+        Family::SumSquares => checked_add(checked_mul(2, input_width)?, 1)?,
     };
     if output_width != required_output_width {
         return Err(format!(
@@ -178,11 +218,17 @@ pub fn synthesize_family(
         ));
     }
 
-    let mut graph = Xag::new(2 * input_width);
-    let left: Vec<_> = (0..input_width).map(|bit| graph.input(bit)).collect();
-    let right: Vec<_> = (0..input_width)
-        .map(|bit| graph.input(input_width + bit))
-        .collect();
+    let mut graph = Xag::new(graph_input_width);
+    let mut left = Vec::new();
+    try_reserve(&mut left, input_width)?;
+    for bit in 0..input_width {
+        left.push(graph.input(bit));
+    }
+    let mut right = Vec::new();
+    try_reserve(&mut right, input_width)?;
+    for bit in 0..input_width {
+        right.push(graph.input(checked_add(input_width, bit)?));
+    }
     let outputs = match family {
         Family::Add => ripple_add(&mut graph, &left, &right)?,
         Family::AbsDiff => absolute_difference(&mut graph, &left, &right)?,

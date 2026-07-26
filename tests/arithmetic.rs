@@ -83,3 +83,19 @@ fn declared_output_width_is_enforced() {
     assert!(synthesize_family(Family::Multiply, 6, 11).is_err());
     assert!(synthesize_family(Family::SumSquares, 5, 10).is_err());
 }
+
+#[test]
+fn extreme_widths_return_stable_errors_before_allocation() {
+    for family in [
+        Family::Add,
+        Family::AbsDiff,
+        Family::Multiply,
+        Family::SumSquares,
+    ] {
+        assert_eq!(
+            synthesize_family(family, usize::MAX, 0).unwrap_err(),
+            "arithmetic width overflow",
+            "{family:?}"
+        );
+    }
+}
