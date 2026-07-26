@@ -362,6 +362,9 @@ impl Circuit {
     }
 
     pub fn evaluate_all(&self) -> Result<Vec<Vec<bool>>, String> {
+        for output in &self.outputs {
+            self.graph.validate(*output)?;
+        }
         let shift = u32::try_from(self.graph.ninputs)
             .map_err(|_| "XAG input dimensions overflow".to_string())?;
         let row_count = 1usize
@@ -407,4 +410,43 @@ impl Circuit {
 
 fn word_value(literal: Lit, values: &[u64]) -> u64 {
     values[literal.node] ^ if literal.inverted { u64::MAX } else { 0 }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Circuit, Lit, Xag};
+
+    #[test]
+    fn evaluate_all_rejects_foreign_same_index_output() {
+        let graph = Xag::new(1);
+        let foreign = Xag::new(1);
+        let circuit = Circuit {
+            graph,
+            outputs: vec![foreign.input(0)],
+        };
+
+        assert_eq!(
+            circuit.evaluate_all().unwrap_err(),
+            "literal belongs to a different XAG"
+        );
+    }
+
+    #[test]
+    fn evaluate_all_rejects_out_of_range_output_without_panicking() {
+        let graph = Xag::new(1);
+        let invalid = Lit {
+            owner: graph.owner,
+            node: graph.node_count(),
+            inverted: false,
+        };
+        let circuit = Circuit {
+            graph,
+            outputs: vec![invalid],
+        };
+
+        assert_eq!(
+            circuit.evaluate_all().unwrap_err(),
+            "literal node is out of range for this XAG"
+        );
+    }
 }
