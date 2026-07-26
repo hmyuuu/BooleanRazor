@@ -54,3 +54,35 @@ pub fn semantic_output(family: Family, _n: usize, x: u64, y: u64) -> u64 {
         Family::SumSquares => x * x + y * y,
     }
 }
+
+pub fn instance_by_slug(slug: &str) -> Result<&'static InstanceSpec, String> {
+    MYSTERY_INSTANCES
+        .iter()
+        .find(|spec| spec.slug == slug)
+        .ok_or_else(|| format!("{slug:?} is not an exact mystery slug"))
+}
+
+pub fn complete_table(spec: &InstanceSpec) -> Result<crate::table::CompleteTable, String> {
+    if spec.input_bits % 2 != 0 {
+        return Err(format!(
+            "{} input width is not two equal operands",
+            spec.slug
+        ));
+    }
+    let operand_bits = spec.input_bits / 2;
+    let shift = u32::try_from(operand_bits)
+        .map_err(|_| format!("{} operand dimensions overflow", spec.slug))?;
+    let operand_count = 1usize
+        .checked_shl(shift)
+        .ok_or_else(|| format!("{} operand dimensions overflow", spec.slug))?;
+    let operand_mask = operand_count - 1;
+    Ok(crate::table::CompleteTable::from_fn(
+        spec.input_bits,
+        spec.output_bits,
+        |mask| {
+            let x = (mask & operand_mask) as u64;
+            let y = (mask >> operand_bits) as u64;
+            semantic_output(spec.family, operand_bits, x, y) as usize
+        },
+    ))
+}

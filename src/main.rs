@@ -5,13 +5,22 @@ use std::process::ExitCode;
 
 use occam_circuit_hmyuuu::arithmetic::synthesize_family;
 use occam_circuit_hmyuuu::bits::encode_lsb;
-use occam_circuit_hmyuuu::instances::{InstanceSpec, MYSTERY_INSTANCES, semantic_output};
+use occam_circuit_hmyuuu::instances::{
+    InstanceSpec, MYSTERY_INSTANCES, complete_table, instance_by_slug,
+};
 use occam_circuit_hmyuuu::netlist::Netlist;
+use occam_circuit_hmyuuu::order::{
+    OrderScore, OrderScorer, beam_search_with_callback, search_csv_bytes, seed_orders,
+};
+#[cfg(feature = "oxidd-oracle")]
+use occam_circuit_hmyuuu::oxidd_oracle::OxiddForest;
 use occam_circuit_hmyuuu::table::{
     CompleteTable, InputTable, PartialTable, prediction_csv_bytes, row_index, sha256_hex,
 };
 
-const USAGE: &str = "usage: occam-circuit-hmyuuu solve-v1 DATA_ROOT OUTPUT_ROOT";
+const USAGE: &str = "usage:
+  occam-circuit-hmyuuu solve-v1 DATA_ROOT OUTPUT_ROOT
+  occam-circuit-hmyuuu search-order DATA_ROOT EXACT_SLUG --beam N --rounds N";
 
 struct Candidate {
     spec: &'static InstanceSpec,
@@ -55,10 +64,13 @@ fn main() -> ExitCode {
 }
 
 fn run(arguments: Vec<std::ffi::OsString>) -> Result<(), String> {
-    if arguments.len() != 3 || arguments[0] != "solve-v1" {
-        return Err(USAGE.into());
+    match arguments.first().and_then(|argument| argument.to_str()) {
+        Some("solve-v1") if arguments.len() == 3 => {
+            solve_v1(Path::new(&arguments[1]), Path::new(&arguments[2]))
+        }
+        Some("search-order") => search_order(&arguments[1..]),
+        _ => Err(USAGE.into()),
     }
-    solve_v1(Path::new(&arguments[1]), Path::new(&arguments[2]))
 }
 
 fn solve_v1(data_root: &Path, output_root: &Path) -> Result<(), String> {
@@ -102,10 +114,105 @@ fn solve_v1(data_root: &Path, output_root: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn build_and_validate_candidate(
+fn search_order(arguments: &[std::ffi::OsString]) -> Result<(), String> {
+    if arguments.len() < 2 {
+        return Err(USAGE.into());
+    }
+    let data_root = Path::new(&arguments[0]);
+    let slug = arguments[1]
+        .to_str()
+        .ok_or_else(|| "instance slug is not valid UTF-8".to_string())?;
+    let spec = instance_by_slug(slug)?;
+    let (beam_width, max_rounds) = parse_search_flags(&arguments[2..])?;
+
+    let (completed, _) = load_validated_table(data_root, spec)?;
+    let seeds = seed_orders(spec.input_bits / 2)?;
+    let mut scorer = OrderScorer::new(&completed)?;
+    let stderr = io::stderr();
+    let mut progress_output = stderr.lock();
+    let result =
+        beam_search_with_callback(&mut scorer, &seeds, beam_width, max_rounds, |progress| {
+            writeln!(
+                progress_output,
+                "{} round={} xag_gates={} bdd_nodes={} unique_evaluations={}",
+                spec.slug,
+                progress.round,
+                progress.best.xag_gates,
+                progress.best.bdd_nodes,
+                progress.unique_evaluations
+            )
+            .map_err(|error| format!("write search progress: {error}"))?;
+            progress_output
+                .flush()
+                .map_err(|error| format!("flush search progress: {error}"))
+        })?;
+    writeln!(
+        progress_output,
+        "{} complete rounds={} finalists={} unique_evaluations={}",
+        spec.slug,
+        result.rounds_completed,
+        result.finalists.len(),
+        scorer.unique_evaluations()
+    )
+    .map_err(|error| format!("write search completion: {error}"))?;
+    progress_output
+        .flush()
+        .map_err(|error| format!("flush search completion: {error}"))?;
+    cross_check_finalists(&completed, &result.finalists, &mut progress_output)?;
+    let bytes = search_csv_bytes(spec.slug, &result.finalists)?;
+    let stdout = io::stdout();
+    let mut output = stdout.lock();
+    output
+        .write_all(&bytes)
+        .map_err(|error| format!("write search CSV: {error}"))?;
+    output
+        .flush()
+        .map_err(|error| format!("flush search CSV: {error}"))
+}
+
+fn parse_search_flags(arguments: &[std::ffi::OsString]) -> Result<(usize, usize), String> {
+    let mut beam_width = None;
+    let mut max_rounds = None;
+    let mut index = 0;
+    while index < arguments.len() {
+        let flag = arguments[index]
+            .to_str()
+            .ok_or_else(|| "search flag is not valid UTF-8".to_string())?;
+        let target = match flag {
+            "--beam" => &mut beam_width,
+            "--rounds" => &mut max_rounds,
+            _ => return Err(format!("unknown flag {flag:?}")),
+        };
+        if target.is_some() {
+            return Err(format!("duplicate flag {flag}"));
+        }
+        let value = arguments
+            .get(index + 1)
+            .ok_or_else(|| format!("missing value for {flag}"))?
+            .to_str()
+            .ok_or_else(|| format!("{flag} value is not valid UTF-8"))?;
+        *target = Some(
+            value
+                .parse::<usize>()
+                .map_err(|_| format!("{flag} requires a nonnegative integer"))?,
+        );
+        index += 2;
+    }
+    let beam_width = beam_width.ok_or_else(|| "missing required flag --beam".to_string())?;
+    if beam_width == 0 {
+        return Err("beam width must be positive".into());
+    }
+    let max_rounds = max_rounds.ok_or_else(|| "missing required flag --rounds".to_string())?;
+    if max_rounds == 0 {
+        return Err("round count must be positive".into());
+    }
+    Ok((beam_width, max_rounds))
+}
+
+fn load_validated_table(
     data_root: &Path,
     spec: &'static InstanceSpec,
-) -> Result<Candidate, String> {
+) -> Result<(CompleteTable, usize), String> {
     let dataset = data_root.join("datasets").join(spec.slug);
     let commitment_text = fs::read_to_string(dataset.join("commitment.sha256"))
         .map_err(|error| format!("{} commitment: {error}", spec.slug))?;
@@ -116,14 +223,8 @@ fn build_and_validate_candidate(
         ));
     }
 
-    let operand_bits = spec.input_bits / 2;
-    let operand_mask = (1usize << operand_bits) - 1;
-    let completed = CompleteTable::from_fn(spec.input_bits, spec.output_bits, |mask| {
-        let x = (mask & operand_mask) as u64;
-        let y = (mask >> operand_bits) as u64;
-        semantic_output(spec.family, operand_bits, x, y) as usize
-    });
-
+    let completed =
+        complete_table(spec).map_err(|error| format!("{} complete table: {error}", spec.slug))?;
     let training_text = fs::read_to_string(dataset.join("train.csv"))
         .map_err(|error| format!("{} training data: {error}", spec.slug))?;
     let training = PartialTable::parse(&training_text, spec.input_bits, spec.output_bits)
@@ -131,6 +232,64 @@ fn build_and_validate_candidate(
     training
         .validate_against(&completed)
         .map_err(|error| format!("{} training consistency: {error}", spec.slug))?;
+    Ok((completed, training.rows.len()))
+}
+
+#[cfg(feature = "oxidd-oracle")]
+fn cross_check_finalists(
+    table: &CompleteTable,
+    finalists: &[OrderScore],
+    progress_output: &mut impl Write,
+) -> Result<(), String> {
+    use std::collections::HashSet;
+
+    let mut seen = HashSet::new();
+    for (rank, score) in finalists
+        .iter()
+        .filter(|score| seen.insert(score.order.clone()))
+        .take(3)
+        .enumerate()
+    {
+        let oracle = OxiddForest::build(table, score.order.clone())
+            .map_err(|error| format!("OxiDD finalist {rank}: {error}"))?;
+        if oracle.shared_node_count() != score.bdd_nodes {
+            return Err(format!(
+                "OxiDD finalist {rank} shared node count mismatch: expected {}, got {}",
+                score.bdd_nodes,
+                oracle.shared_node_count()
+            ));
+        }
+        if oracle.evaluate_all()? != table.outputs {
+            return Err(format!("OxiDD finalist {rank} semantic mismatch"));
+        }
+        writeln!(
+            progress_output,
+            "oxidd finalist={rank} semantics=exact shared_nodes={}",
+            score.bdd_nodes
+        )
+        .map_err(|error| format!("write OxiDD progress: {error}"))?;
+        progress_output
+            .flush()
+            .map_err(|error| format!("flush OxiDD progress: {error}"))?;
+    }
+    Ok(())
+}
+
+#[cfg(not(feature = "oxidd-oracle"))]
+fn cross_check_finalists(
+    _table: &CompleteTable,
+    _finalists: &[OrderScore],
+    _progress_output: &mut impl Write,
+) -> Result<(), String> {
+    Ok(())
+}
+
+fn build_and_validate_candidate(
+    data_root: &Path,
+    spec: &'static InstanceSpec,
+) -> Result<Candidate, String> {
+    let dataset = data_root.join("datasets").join(spec.slug);
+    let (completed, training_rows) = load_validated_table(data_root, spec)?;
 
     let test_text = fs::read_to_string(dataset.join("test_inputs.csv"))
         .map_err(|error| format!("{} test inputs: {error}", spec.slug))?;
@@ -146,7 +305,7 @@ fn build_and_validate_candidate(
         ));
     }
 
-    let circuit = synthesize_family(spec.family, operand_bits, spec.output_bits)
+    let circuit = synthesize_family(spec.family, spec.input_bits / 2, spec.output_bits)
         .map_err(|error| format!("{} circuit synthesis: {error}", spec.slug))?;
     let circuit_text = circuit
         .to_netlist()
@@ -185,7 +344,7 @@ fn build_and_validate_candidate(
         spec,
         circuit_bytes: circuit_text.into_bytes(),
         prediction_bytes,
-        training_rows: training.rows.len(),
+        training_rows,
         gates,
     })
 }
