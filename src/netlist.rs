@@ -179,7 +179,7 @@ fn literal_value(literal: NetLit, inputs: &[bool], gates: &[bool]) -> bool {
 }
 
 pub(crate) fn serialize(circuit: &Circuit) -> Result<String, String> {
-    let (graph, outputs) = circuit.graph.compact(&circuit.outputs);
+    let (graph, outputs) = circuit.graph.compact(&circuit.outputs)?;
     let needs_constant = outputs.iter().any(|output| graph.is_constant(*output));
     if needs_constant && graph.input_count() == 0 {
         return Err("cannot materialize a constant without an input".into());
@@ -194,8 +194,8 @@ pub(crate) fn serialize(circuit: &Circuit) -> Result<String, String> {
         text.push_str(&format!(
             "w{} = {op} {} {}\n",
             index + 1,
-            graph.format_literal(gate.left),
-            graph.format_literal(gate.right)
+            graph.format_literal(gate.left)?,
+            graph.format_literal(gate.right)?
         ));
     }
 
@@ -212,7 +212,7 @@ pub(crate) fn serialize(circuit: &Circuit) -> Result<String, String> {
             }
             text.push_str(&format!("w{constant_wire}"));
         } else {
-            text.push_str(&graph.format_literal(output));
+            text.push_str(&graph.format_literal(output)?);
         }
     }
     text.push('\n');

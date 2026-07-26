@@ -1,8 +1,12 @@
 use std::collections::HashMap;
 use std::ops::Not;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static NEXT_OWNER: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct Lit {
+    owner: u64,
     node: usize,
     inverted: bool,
 }
@@ -10,6 +14,7 @@ pub struct Lit {
 impl Lit {
     fn with_polarity(self, inverted: bool) -> Self {
         Self {
+            owner: self.owner,
             node: self.node,
             inverted: self.inverted ^ inverted,
         }
@@ -44,8 +49,9 @@ struct GateKey {
     right: Lit,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct Xag {
+    owner: u64,
     ninputs: usize,
     gates: Vec<Gate>,
     unique: HashMap<GateKey, Lit>,
@@ -54,25 +60,27 @@ pub struct Xag {
 impl Xag {
     pub fn new(ninputs: usize) -> Self {
         Self {
+            owner: NEXT_OWNER.fetch_add(1, Ordering::Relaxed),
             ninputs,
             gates: Vec::new(),
             unique: HashMap::new(),
         }
     }
 
-    pub const fn constant(value: bool) -> Lit {
+    pub const fn constant(&self, value: bool) -> Lit {
         Lit {
+            owner: self.owner,
             node: 0,
             inverted: value,
         }
     }
 
     pub const fn f(&self) -> Lit {
-        Self::constant(false)
+        self.constant(false)
     }
 
     pub const fn t(&self) -> Lit {
-        Self::constant(true)
+        self.constant(true)
     }
 
     pub fn input(&self, index: usize) -> Lit {
@@ -82,52 +90,53 @@ impl Xag {
             self.ninputs
         );
         Lit {
+            owner: self.owner,
             node: index + 1,
             inverted: false,
         }
     }
 
-    pub fn and(&mut self, left: Lit, right: Lit) -> Lit {
-        self.assert_valid(left);
-        self.assert_valid(right);
+    pub fn and(&mut self, left: Lit, right: Lit) -> Result<Lit, String> {
+        self.validate(left)?;
+        self.validate(right)?;
         if left == self.f() || right == self.f() {
-            return self.f();
+            return Ok(self.f());
         }
         if left == self.t() {
-            return right;
+            return Ok(right);
         }
         if right == self.t() {
-            return left;
+            return Ok(left);
         }
         if left == right {
-            return left;
+            return Ok(left);
         }
         if left == !right {
-            return self.f();
+            return Ok(self.f());
         }
-        self.intern(Op::And, left, right)
+        Ok(self.intern(Op::And, left, right))
     }
 
-    pub fn xor(&mut self, left: Lit, right: Lit) -> Lit {
-        self.assert_valid(left);
-        self.assert_valid(right);
+    pub fn xor(&mut self, left: Lit, right: Lit) -> Result<Lit, String> {
+        self.validate(left)?;
+        self.validate(right)?;
         if left == self.f() {
-            return right;
+            return Ok(right);
         }
         if right == self.f() {
-            return left;
+            return Ok(left);
         }
         if left == self.t() {
-            return !right;
+            return Ok(!right);
         }
         if right == self.t() {
-            return !left;
+            return Ok(!left);
         }
         if left == right {
-            return self.f();
+            return Ok(self.f());
         }
         if left == !right {
-            return self.t();
+            return Ok(self.t());
         }
         let output_inverted = left.inverted ^ right.inverted;
         let left = Lit {
@@ -138,19 +147,25 @@ impl Xag {
             inverted: false,
             ..right
         };
-        self.intern(Op::Xor, left, right)
-            .with_polarity(output_inverted)
+        Ok(self
+            .intern(Op::Xor, left, right)
+            .with_polarity(output_inverted))
     }
 
-    pub fn or(&mut self, left: Lit, right: Lit) -> Lit {
+    pub fn or(&mut self, left: Lit, right: Lit) -> Result<Lit, String> {
+        self.validate(left)?;
+        self.validate(right)?;
         let not_left = !left;
         let not_right = !right;
-        !self.and(not_left, not_right)
+        Ok(!self.and(not_left, not_right)?)
     }
 
-    pub fn mux(&mut self, select: Lit, then_value: Lit, else_value: Lit) -> Lit {
-        let difference = self.xor(then_value, else_value);
-        let selected_difference = self.and(select, difference);
+    pub fn mux(&mut self, select: Lit, then_value: Lit, else_value: Lit) -> Result<Lit, String> {
+        self.validate(select)?;
+        self.validate(then_value)?;
+        self.validate(else_value)?;
+        let difference = self.xor(then_value, else_value)?;
+        let selected_difference = self.and(select, difference)?;
         self.xor(else_value, selected_difference)
     }
 
@@ -163,9 +178,7 @@ impl Xag {
             ));
         }
         for output in outputs {
-            if output.node >= self.node_count() {
-                return Err("output literal does not belong to this XAG".into());
-            }
+            self.validate(*output)?;
         }
 
         let mut values = vec![false; self.node_count()];
@@ -187,17 +200,18 @@ impl Xag {
             .collect())
     }
 
-    pub fn reachable_gate_count(&self, outputs: &[Lit]) -> usize {
-        self.live_gates(outputs)
+    pub fn reachable_gate_count(&self, outputs: &[Lit]) -> Result<usize, String> {
+        Ok(self
+            .live_gates(outputs)?
             .into_iter()
             .filter(|is_live| *is_live)
-            .count()
+            .count())
     }
 
-    pub fn compact(&self, outputs: &[Lit]) -> (Self, Vec<Lit>) {
-        let live = self.live_gates(outputs);
+    pub fn compact(&self, outputs: &[Lit]) -> Result<(Self, Vec<Lit>), String> {
+        let live = self.live_gates(outputs)?;
         let mut compact = Self::new(self.ninputs);
-        let mut remap = vec![self.f(); self.node_count()];
+        let mut remap = vec![compact.f(); self.node_count()];
         for input in 0..self.ninputs {
             remap[input + 1] = compact.input(input);
         }
@@ -207,8 +221,8 @@ impl Xag {
                 let left = remap[gate.left.node].with_polarity(gate.left.inverted);
                 let right = remap[gate.right.node].with_polarity(gate.right.inverted);
                 remap[self.gate_node(index)] = match gate.op {
-                    Op::And => compact.and(left, right),
-                    Op::Xor => compact.xor(left, right),
+                    Op::And => compact.and(left, right)?,
+                    Op::Xor => compact.xor(left, right)?,
                 };
             }
         }
@@ -217,7 +231,7 @@ impl Xag {
             .iter()
             .map(|output| remap[output.node].with_polarity(output.inverted))
             .collect();
-        (compact, outputs)
+        Ok((compact, outputs))
     }
 
     fn intern(&mut self, op: Op, mut left: Lit, mut right: Lit) -> Lit {
@@ -230,6 +244,7 @@ impl Xag {
         }
 
         let literal = Lit {
+            owner: self.owner,
             node: self.gate_node(self.gates.len()),
             inverted: false,
         };
@@ -238,11 +253,11 @@ impl Xag {
         literal
     }
 
-    fn live_gates(&self, outputs: &[Lit]) -> Vec<bool> {
+    fn live_gates(&self, outputs: &[Lit]) -> Result<Vec<bool>, String> {
         let mut live = vec![false; self.gates.len()];
         let mut stack = outputs.to_vec();
         while let Some(literal) = stack.pop() {
-            self.assert_valid(literal);
+            self.validate(literal)?;
             if let Some(index) = self.gate_index(literal.node) {
                 if live[index] {
                     continue;
@@ -253,14 +268,17 @@ impl Xag {
                 stack.push(gate.right);
             }
         }
-        live
+        Ok(live)
     }
 
-    fn assert_valid(&self, literal: Lit) {
-        assert!(
-            literal.node < self.node_count(),
-            "literal does not belong to this XAG"
-        );
+    fn validate(&self, literal: Lit) -> Result<(), String> {
+        if literal.owner != self.owner {
+            return Err("literal belongs to a different XAG".into());
+        }
+        if literal.node >= self.node_count() {
+            return Err("literal node is out of range for this XAG".into());
+        }
+        Ok(())
     }
 
     fn literal_value(&self, literal: Lit, values: &[bool]) -> bool {
@@ -288,16 +306,16 @@ impl Xag {
         &self.gates
     }
 
-    pub(crate) fn format_literal(&self, literal: Lit) -> String {
-        self.assert_valid(literal);
+    pub(crate) fn format_literal(&self, literal: Lit) -> Result<String, String> {
+        self.validate(literal)?;
         let prefix = if literal.inverted { "~" } else { "" };
-        if literal.node == 0 {
+        Ok(if literal.node == 0 {
             format!("{prefix}0")
         } else if literal.node <= self.ninputs {
             format!("{prefix}x{}", literal.node)
         } else {
             format!("{prefix}w{}", literal.node - self.ninputs)
-        }
+        })
     }
 
     pub(crate) fn is_constant(&self, literal: Lit) -> bool {
@@ -310,18 +328,18 @@ impl Xag {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct Circuit {
     pub(crate) graph: Xag,
     pub(crate) outputs: Vec<Lit>,
 }
 
 impl Circuit {
-    pub fn new(graph: Xag, outputs: Vec<Lit>) -> Self {
+    pub fn new(graph: Xag, outputs: Vec<Lit>) -> Result<Self, String> {
         for output in &outputs {
-            graph.assert_valid(*output);
+            graph.validate(*output)?;
         }
-        Self { graph, outputs }
+        Ok(Self { graph, outputs })
     }
 
     pub fn evaluate(&self, inputs: &[bool]) -> Result<Vec<bool>, String> {
