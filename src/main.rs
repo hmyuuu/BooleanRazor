@@ -281,21 +281,63 @@ fn artifact_paths() -> Vec<PathBuf> {
     paths
 }
 
-fn commit_staged_tree(stage: &Path, output_root: &Path) -> Result<(), String> {
-    if !output_root.exists() {
-        fs::rename(stage, output_root).map_err(|error| {
-            format!(
-                "atomically install output tree {}: {error}",
-                output_root.display()
-            )
-        })?;
-        return Ok(());
+fn require_real_directory_if_present(path: &Path) -> Result<(), String> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if !metadata.file_type().is_dir() => Err(format!(
+            "artifact parent {} is not a real directory",
+            path.display()
+        )),
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!(
+            "inspect artifact parent {}: {error}",
+            path.display()
+        )),
     }
-    if !output_root.is_dir() {
-        return Err(format!(
-            "output root {} is not a directory",
-            output_root.display()
-        ));
+}
+
+fn commit_staged_tree(stage: &Path, output_root: &Path) -> Result<(), String> {
+    commit_staged_tree_with_hook(stage, output_root, |_, _| Ok(()))
+}
+
+fn commit_staged_tree_with_hook<F>(
+    stage: &Path,
+    output_root: &Path,
+    mut before_install: F,
+) -> Result<(), String>
+where
+    F: FnMut(usize, &Path) -> Result<(), String>,
+{
+    let mut stage_cleanup = CleanupDir::new(stage.to_path_buf());
+    match fs::symlink_metadata(output_root) {
+        Ok(metadata) if !metadata.file_type().is_dir() => {
+            return Err(format!(
+                "output root {} is not a real directory",
+                output_root.display()
+            ));
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            fs::rename(stage, output_root).map_err(|error| {
+                format!(
+                    "atomically install output tree {}: {error}",
+                    output_root.display()
+                )
+            })?;
+            stage_cleanup.disarm();
+            return Ok(());
+        }
+        Err(error) => {
+            return Err(format!(
+                "inspect output root {}: {error}",
+                output_root.display()
+            ));
+        }
+    }
+    let predictions = output_root.join("predictions");
+    require_real_directory_if_present(&predictions)?;
+    for spec in &MYSTERY_INSTANCES {
+        require_real_directory_if_present(&predictions.join(spec.slug))?;
     }
     for relative in artifact_paths() {
         let final_path = output_root.join(&relative);
@@ -323,6 +365,7 @@ fn commit_staged_tree(stage: &Path, output_root: &Path) -> Result<(), String> {
     let mut installed = Vec::new();
     let commit_result = (|| {
         for relative in artifact_paths() {
+            before_install(installed.len(), &relative)?;
             let staged_path = stage.join(&relative);
             let final_path = output_root.join(&relative);
             let final_parent = final_path
@@ -375,9 +418,11 @@ fn commit_staged_tree(stage: &Path, output_root: &Path) -> Result<(), String> {
         if rollback_errors.is_empty() {
             return Err(error);
         }
+        backup_cleanup.disarm();
         return Err(format!(
-            "{error}; rollback also failed for {}",
-            rollback_errors.join(", ")
+            "{error}; rollback also failed for {}; recovery backup retained at {}",
+            rollback_errors.join(", "),
+            backup.display()
         ));
     }
 
@@ -386,5 +431,83 @@ fn commit_staged_tree(stage: &Path, output_root: &Path) -> Result<(), String> {
     backup_cleanup.disarm();
     fs::remove_dir_all(stage)
         .map_err(|error| format!("remove completed stage {}: {error}", stage.display()))?;
+    stage_cleanup.disarm();
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use super::*;
+
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new() -> Self {
+            let nonce = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let path =
+                std::env::temp_dir().join(format!("occam-rollback-{}-{nonce}", std::process::id()));
+            fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn failed_install_rolls_back_every_artifact_and_removes_transaction_dirs() {
+        let temporary = TempDir::new();
+        let output_root = temporary.0.join("output");
+        let stage = temporary.0.join(".output.occam-stage-test");
+        fs::create_dir(&output_root).unwrap();
+        fs::create_dir(&stage).unwrap();
+
+        let mut originals = BTreeMap::new();
+        for relative in artifact_paths() {
+            let original = format!("original {}\n", relative.display()).into_bytes();
+            let replacement = format!("replacement {}\n", relative.display()).into_bytes();
+            for (root, bytes) in [
+                (&output_root, original.as_slice()),
+                (&stage, replacement.as_slice()),
+            ] {
+                let path = root.join(&relative);
+                fs::create_dir_all(path.parent().unwrap()).unwrap();
+                fs::write(path, bytes).unwrap();
+            }
+            originals.insert(relative, original);
+        }
+
+        let error =
+            commit_staged_tree_with_hook(&stage, &output_root, |installed_count, _relative| {
+                if installed_count == 3 {
+                    Err("injected install failure".into())
+                } else {
+                    Ok(())
+                }
+            })
+            .unwrap_err();
+        assert!(error.contains("injected install failure"));
+        for (relative, original) in originals {
+            assert_eq!(fs::read(output_root.join(relative)).unwrap(), original);
+        }
+        assert!(!stage.exists());
+        let leaked: Vec<_> = fs::read_dir(&temporary.0)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| path != &output_root)
+            .collect();
+        assert!(
+            leaked.is_empty(),
+            "transaction directories leaked: {leaked:?}"
+        );
+    }
 }

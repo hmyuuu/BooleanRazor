@@ -63,12 +63,31 @@ fn artifact_paths() -> Vec<PathBuf> {
     paths
 }
 
+fn write_artifacts(root: &Path, bytes: &[u8]) {
+    for relative in artifact_paths() {
+        let path = root.join(relative);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, bytes).unwrap();
+    }
+}
+
+fn assert_artifacts(root: &Path, bytes: &[u8]) {
+    for relative in artifact_paths() {
+        assert_eq!(
+            fs::read(root.join(&relative)).unwrap(),
+            bytes,
+            "{} changed unexpectedly",
+            relative.display()
+        );
+    }
+}
+
 fn copy_v1_datasets(source_root: &Path, destination_root: &Path) {
     for spec in &MYSTERY_INSTANCES {
         let source = source_root.join("datasets").join(spec.slug);
         let destination = destination_root.join("datasets").join(spec.slug);
         fs::create_dir_all(&destination).unwrap();
-        for file in ["train.csv", "test_inputs.csv"] {
+        for file in ["train.csv", "test_inputs.csv", "commitment.sha256"] {
             fs::copy(source.join(file), destination.join(file)).unwrap();
         }
     }
@@ -178,7 +197,8 @@ fn official_v1_rows_commitments_and_circuits_are_exact() {
         .join("mystery-D")
         .join("train.csv");
     let mut bad_train = fs::read_to_string(&bad_train_path).unwrap();
-    let output_start = bad_train.find(',').unwrap() + 1;
+    let first_row = bad_train.find('\n').unwrap() + 1;
+    let output_start = first_row + bad_train[first_row..].find(',').unwrap() + 1;
     let replacement = if bad_train.as_bytes()[output_start] == b'0' {
         "1"
     } else {
@@ -188,16 +208,17 @@ fn official_v1_rows_commitments_and_circuits_are_exact() {
     fs::write(bad_train_path, bad_train).unwrap();
 
     let output_root = TempDir::new("existing-v1-output");
-    for relative in artifact_paths() {
-        let path = output_root.0.join(relative);
-        fs::create_dir_all(path.parent().unwrap()).unwrap();
-        fs::write(path, b"existing artifact\n").unwrap();
-    }
+    write_artifacts(&output_root.0, b"existing artifact\n");
 
     let command = run_solve(&corrupt_root.0, &output_root.0);
     assert!(
         !command.status.success(),
         "corrupt training data was accepted"
+    );
+    assert!(
+        String::from_utf8_lossy(&command.stderr).contains("mystery-D training consistency"),
+        "late corruption did not reach mystery-D validation:\n{}",
+        String::from_utf8_lossy(&command.stderr)
     );
     for relative in artifact_paths() {
         assert_eq!(
@@ -209,11 +230,7 @@ fn official_v1_rows_commitments_and_circuits_are_exact() {
     }
 
     let directory_output = TempDir::new("directory-v1-output");
-    for relative in artifact_paths() {
-        let path = directory_output.0.join(relative);
-        fs::create_dir_all(path.parent().unwrap()).unwrap();
-        fs::write(path, b"existing artifact\n").unwrap();
-    }
+    write_artifacts(&directory_output.0, b"existing artifact\n");
     let directory_target = directory_output.0.join("mystery-A.txt");
     fs::remove_file(&directory_target).unwrap();
     fs::create_dir(&directory_target).unwrap();
@@ -239,4 +256,170 @@ fn official_v1_rows_commitments_and_circuits_are_exact() {
             relative.display()
         );
     }
+
+    let predictions_file_output = TempDir::new("predictions-file-output");
+    for spec in &MYSTERY_INSTANCES {
+        fs::write(
+            predictions_file_output.0.join(format!("{}.txt", spec.slug)),
+            b"existing circuit\n",
+        )
+        .unwrap();
+    }
+    fs::write(
+        predictions_file_output.0.join("predictions"),
+        b"not a directory\n",
+    )
+    .unwrap();
+    let command = run_solve(&data_root, &predictions_file_output.0);
+    assert!(
+        !command.status.success(),
+        "a regular-file predictions parent was accepted"
+    );
+    assert_eq!(
+        fs::read(predictions_file_output.0.join("predictions")).unwrap(),
+        b"not a directory\n"
+    );
+    for spec in &MYSTERY_INSTANCES {
+        assert_eq!(
+            fs::read(predictions_file_output.0.join(format!("{}.txt", spec.slug))).unwrap(),
+            b"existing circuit\n"
+        );
+    }
+
+    let instance_file_output = TempDir::new("instance-file-output");
+    fs::create_dir(instance_file_output.0.join("predictions")).unwrap();
+    fs::write(
+        instance_file_output.0.join("predictions").join("mystery-B"),
+        b"not an instance directory\n",
+    )
+    .unwrap();
+    let command = run_solve(&data_root, &instance_file_output.0);
+    assert!(
+        !command.status.success(),
+        "a regular-file instance parent was accepted"
+    );
+    assert_eq!(
+        fs::read(instance_file_output.0.join("predictions").join("mystery-B")).unwrap(),
+        b"not an instance directory\n"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn solve_v1_rejects_symlinks_inside_the_existing_output_tree() {
+    use std::os::unix::fs::symlink;
+
+    let Some(data_root) = std::env::var_os("OCCAM_V1_ROOT").map(PathBuf::from) else {
+        println!(
+            "skipped solve_v1_rejects_symlinks_inside_the_existing_output_tree: OCCAM_V1_ROOT unset"
+        );
+        return;
+    };
+
+    let root_case = TempDir::new("symlink-root");
+    let outside_root = root_case.0.join("outside");
+    fs::create_dir(&outside_root).unwrap();
+    write_artifacts(&outside_root, b"outside root\n");
+    let output_link = root_case.0.join("output-link");
+    symlink(&outside_root, &output_link).unwrap();
+    let command = run_solve(&data_root, &output_link);
+    assert!(
+        !command.status.success(),
+        "a symlinked output root was accepted"
+    );
+    assert_artifacts(&outside_root, b"outside root\n");
+
+    let predictions_case = TempDir::new("symlink-predictions");
+    write_artifacts(&predictions_case.0, b"inside predictions\n");
+    fs::remove_dir_all(predictions_case.0.join("predictions")).unwrap();
+    let outside_predictions = TempDir::new("outside-predictions");
+    for spec in &MYSTERY_INSTANCES {
+        let path = outside_predictions
+            .0
+            .join(spec.slug)
+            .join("test_outputs.csv");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, b"outside predictions\n").unwrap();
+    }
+    symlink(
+        &outside_predictions.0,
+        predictions_case.0.join("predictions"),
+    )
+    .unwrap();
+    let command = run_solve(&data_root, &predictions_case.0);
+    assert!(
+        !command.status.success(),
+        "a symlinked predictions directory was accepted"
+    );
+    for spec in &MYSTERY_INSTANCES {
+        assert_eq!(
+            fs::read(
+                outside_predictions
+                    .0
+                    .join(spec.slug)
+                    .join("test_outputs.csv")
+            )
+            .unwrap(),
+            b"outside predictions\n"
+        );
+    }
+
+    let instance_case = TempDir::new("symlink-instance");
+    write_artifacts(&instance_case.0, b"inside instance\n");
+    fs::remove_dir_all(instance_case.0.join("predictions").join("mystery-C")).unwrap();
+    let outside_instance = TempDir::new("outside-instance");
+    fs::write(
+        outside_instance.0.join("test_outputs.csv"),
+        b"outside instance\n",
+    )
+    .unwrap();
+    symlink(
+        &outside_instance.0,
+        instance_case.0.join("predictions").join("mystery-C"),
+    )
+    .unwrap();
+    let command = run_solve(&data_root, &instance_case.0);
+    assert!(
+        !command.status.success(),
+        "a symlinked instance directory was accepted"
+    );
+    assert_eq!(
+        fs::read(outside_instance.0.join("test_outputs.csv")).unwrap(),
+        b"outside instance\n"
+    );
+
+    let final_case = TempDir::new("symlink-final");
+    write_artifacts(&final_case.0, b"inside final\n");
+    let final_link = final_case.0.join("mystery-B.txt");
+    fs::remove_file(&final_link).unwrap();
+    let outside_final_root = TempDir::new("outside-final");
+    let outside_final = outside_final_root.0.join("outside-final.txt");
+    fs::write(&outside_final, b"outside final\n").unwrap();
+    symlink(&outside_final, &final_link).unwrap();
+    let command = run_solve(&data_root, &final_case.0);
+    assert!(
+        !command.status.success(),
+        "a symlinked final artifact was accepted"
+    );
+    assert_eq!(fs::read(&outside_final).unwrap(), b"outside final\n");
+
+    let dangling_case = TempDir::new("symlink-dangling");
+    write_artifacts(&dangling_case.0, b"inside dangling\n");
+    let dangling_link = dangling_case.0.join("mystery-D.txt");
+    fs::remove_file(&dangling_link).unwrap();
+    let dangling_target_root = TempDir::new("outside-dangling");
+    let missing_target = dangling_target_root.0.join("missing-target.txt");
+    symlink(&missing_target, &dangling_link).unwrap();
+    let command = run_solve(&data_root, &dangling_case.0);
+    assert!(
+        !command.status.success(),
+        "a dangling final symlink was accepted"
+    );
+    assert!(
+        fs::symlink_metadata(&dangling_link)
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+    assert!(!missing_target.exists());
 }

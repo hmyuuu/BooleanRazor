@@ -5,7 +5,6 @@ use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use occam_circuit_hmyuuu::instances::MYSTERY_INSTANCES;
-use occam_circuit_hmyuuu::table::sha256_hex;
 
 struct TempDir(PathBuf);
 
@@ -43,8 +42,8 @@ fn run_solve(data_root: &Path, output_root: &Path) {
     );
 }
 
-fn collect_hashes(root: &Path) -> BTreeMap<PathBuf, String> {
-    fn visit(root: &Path, directory: &Path, hashes: &mut BTreeMap<PathBuf, String>) {
+fn collect_bytes(root: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
+    fn visit(root: &Path, directory: &Path, artifacts: &mut BTreeMap<PathBuf, Vec<u8>>) {
         let mut entries: Vec<_> = fs::read_dir(directory)
             .unwrap()
             .map(|entry| entry.unwrap().path())
@@ -52,21 +51,21 @@ fn collect_hashes(root: &Path) -> BTreeMap<PathBuf, String> {
         entries.sort();
         for path in entries {
             if path.is_dir() {
-                visit(root, &path, hashes);
+                visit(root, &path, artifacts);
             } else {
                 let relative = path.strip_prefix(root).unwrap().to_path_buf();
                 assert!(
-                    hashes
-                        .insert(relative, sha256_hex(&fs::read(&path).unwrap()))
+                    artifacts
+                        .insert(relative, fs::read(&path).unwrap())
                         .is_none()
                 );
             }
         }
     }
 
-    let mut hashes = BTreeMap::new();
-    visit(root, root, &mut hashes);
-    hashes
+    let mut artifacts = BTreeMap::new();
+    visit(root, root, &mut artifacts);
+    artifacts
 }
 
 #[test]
@@ -81,8 +80,8 @@ fn solve_v1_is_byte_identical_in_two_fresh_roots() {
     run_solve(&data_root, &first);
     run_solve(&data_root, &second);
 
-    let first_hashes = collect_hashes(&first);
-    let second_hashes = collect_hashes(&second);
+    let first_artifacts = collect_bytes(&first);
+    let second_artifacts = collect_bytes(&second);
     let mut expected_paths = Vec::new();
     for spec in &MYSTERY_INSTANCES {
         expected_paths.push(PathBuf::from(format!("{}.txt", spec.slug)));
@@ -95,8 +94,18 @@ fn solve_v1_is_byte_identical_in_two_fresh_roots() {
     expected_paths.sort();
 
     assert_eq!(
-        first_hashes.keys().cloned().collect::<Vec<_>>(),
+        first_artifacts.keys().cloned().collect::<Vec<_>>(),
         expected_paths
     );
-    assert_eq!(first_hashes, second_hashes);
+    assert_eq!(first_artifacts, second_artifacts);
+
+    let committed_root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let committed_artifacts: BTreeMap<_, _> = expected_paths
+        .into_iter()
+        .map(|relative| {
+            let bytes = fs::read(committed_root.join(&relative)).unwrap();
+            (relative, bytes)
+        })
+        .collect();
+    assert_eq!(first_artifacts, committed_artifacts);
 }
