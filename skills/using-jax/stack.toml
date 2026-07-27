@@ -1,0 +1,31 @@
+id = "jax"
+name = "JAX"
+language = "python"
+canonical_for = ["jax-backend", "vqe", "tensorcircuit-ng"]
+default_profile = "cpu"
+
+[profiles.cpu]
+label = "CPU"
+default = true
+install = "cpu"
+smoke = "cpu"
+
+[profiles.cpu.requirements]
+allocation = "login-or-compute"
+mpi = false
+
+[install.cpu]
+command = "make install jax EXTRA=cpu"
+notes = "Use EXTRA=cpu locally. On GPU servers, replace cpu with the CUDA extra declared by the active cluster profile; prefer cuda13 where the cluster supports it."
+
+[smoke.cpu]
+where = "login"
+command = ".venv/bin/python -c 'import jax; print(jax.devices())'"
+
+[smoke.gpu]
+where = "compute"
+command = "JAX_PLATFORM_NAME=gpu .venv/bin/python -c 'import jax; print(jax.devices())'"
+
+[docs]
+official = "https://jax.dev/"
+install = "https://docs.jax.dev/en/latest/installation.html"

@@ -1,0 +1,53 @@
+# Local Slurm profile for testing the cluster-jobs toolkit.
+# Live probe/submit/fetch require passwordless `ssh localhost` (BatchMode).
+# The cluster_guardrail.py safety checks (inspect / check-path) need no ssh.
+
+[identity]
+name = "localhost"
+purpose = "local Slurm for testing the cluster-jobs toolkit"
+maintainer = "leo"
+
+[connection]
+repo_path_remote = "/home/leo/Documents/harness/quantum.harness"
+
+[connection.ssh]
+alias = "localhost"
+host = "localhost"
+user = "leo"
+identity_file = "~/.ssh/id_ed25519"
+port = 22
+
+[scheduler]
+type = "slurm"
+default_partition = "debug"
+
+[[partitions]]
+name = "debug"
+class = "debug"
+cores = 32
+max_wall = "infinite"
+gpu = ""
+
+[network]
+internet_from_login = true
+internet_from_compute = true
+
+[region]
+region = ""
+
+[limits.hard]
+max_walltime = "24:00:00"
+max_nodes = 1
+max_cpus = 32
+max_array_size = 200
+
+[limits.soft]
+warn_walltime = "08:00:00"
+warn_cpus = 16
+unusual_partitions = []
+
+[limits.paths]
+allowed_roots = ["~/scratch", "~/results"]
+
+[commands]
+quota_command = ""

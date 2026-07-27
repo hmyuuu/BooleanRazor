@@ -1,0 +1,30 @@
+[options]
+skills-dir = "skills"
+
+[skills]
+# Superpowers development workflow, vendored locally.
+using-superpowers = { type = "local" }
+using-git-worktrees = { type = "local" }
+brainstorming = { type = "local" }
+writing-plans = { type = "local" }
+executing-plans = { type = "local" }
+subagent-driven-development = { type = "local" }
+dispatching-parallel-agents = { type = "local" }
+test-driven-development = { type = "local" }
+systematic-debugging = { type = "local" }
+requesting-code-review = { type = "local" }
+receiving-code-review = { type = "local" }
+verification-before-completion = { type = "local" }
+finishing-a-development-branch = { type = "local" }
+
+# Research, handoff, challenge, and compute workflow, vendored locally.
+survey = { type = "local" }
+download-ref = { type = "local" }
+session-handoff = { type = "local" }
+take-challenge = { type = "local" }
+method-qcs = { type = "local" }
+using-jax = { type = "local" }
+using-slurm = { type = "local" }
+cluster-jobs = { type = "local" }
+setup-cluster = { type = "local" }
+build-apptainer-image = { type = "local" }

@@ -1,0 +1,43 @@
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# Rust
+target/
+
+# Experiment output (LOG.md is intentionally not ignored)
+runs/
+results/
+artifacts/
+slurm-*.out
+*.sbatch.tmp
+*.sif
+.superpowers/
+
+# Private and sealed material
+.private/
+data/private/
+data/sealed/
+custodian/
+.raw/
+.figures/
+**/.raw/
+**/.figures/
+.env
+.env.*
+*.pem
+*.key
+
+# Local editor and operating-system state
+.DS_Store
+.idea/
+.vscode/
+*~
+
+# Managed by ion
+skills/ion-cli

@@ -1,0 +1,137 @@
+[[skill]]
+name = "brainstorming"
+source = ""
+kind = "local"
+checksum = "sha256:60f43c0a4a3032b99bf365570fc1f5f0c6ae4c2afd8fbeca3306125d7d7b3201"
+
+[[skill]]
+name = "build-apptainer-image"
+source = ""
+kind = "local"
+checksum = "sha256:4488976e66f34a8e45e1d17ab3d3802abd3006b641fbf86db3a8380d5f46fc10"
+
+[[skill]]
+name = "cluster-jobs"
+source = ""
+kind = "local"
+checksum = "sha256:0b487ec22a28b014a354242db60923fc567d57ecae1466b37cf5bd54f3ec82c7"
+
+[[skill]]
+name = "dispatching-parallel-agents"
+source = ""
+kind = "local"
+checksum = "sha256:85df55d2235a7623b315dac4bc340c14a37dcdc57c869c80a829e1a53a174689"
+
+[[skill]]
+name = "download-ref"
+source = ""
+kind = "local"
+checksum = "sha256:e9ba5e6a0ed2b2120746954ed83dd43e8df0aeaa5bc8ebab8225861202045b27"
+
+[[skill]]
+name = "executing-plans"
+source = ""
+kind = "local"
+checksum = "sha256:08604f93f2e38dd3575e5503c79cda5c623c78a8df0e472457ac5ef7a33f22b8"
+
+[[skill]]
+name = "finishing-a-development-branch"
+source = ""
+kind = "local"
+checksum = "sha256:aa2632ed96df59c36348bd8f8ec1ff0fb0c5cc68b60691834687bf4cedc6be3f"
+
+[[skill]]
+name = "method-qcs"
+source = ""
+kind = "local"
+checksum = "sha256:4eedae5687e25ce59540a9c998b351af90f93a4be084ae1af29766b0becab2b6"
+
+[[skill]]
+name = "receiving-code-review"
+source = ""
+kind = "local"
+checksum = "sha256:3f56080356c62e4f74a183d7371686babc661e41a952dc67a97c2c76fe8a9329"
+
+[[skill]]
+name = "requesting-code-review"
+source = ""
+kind = "local"
+checksum = "sha256:c9c9a81cdba20d04d29acdd6d456ab309e2db776e547b4008c459983e5fd7f83"
+
+[[skill]]
+name = "session-handoff"
+source = ""
+kind = "local"
+checksum = "sha256:424c59565069a8015cf85c56ba735685a70cab07ba7728b3f0cac2c514c77984"
+
+[[skill]]
+name = "setup-cluster"
+source = ""
+kind = "local"
+checksum = "sha256:1f7ab61bef998440c3fcc7083c23aeef1c4eb6e0869eb6d013e7c1b63222a2c1"
+
+[[skill]]
+name = "subagent-driven-development"
+source = ""
+kind = "local"
+checksum = "sha256:757034cd2210fcaa20f9aca84fe857ae33f4a4e73895207c15bc91dcdb0f2456"
+
+[[skill]]
+name = "survey"
+source = ""
+kind = "local"
+checksum = "sha256:0cfab5e37c0a3b127f9d93ccd820bb4631ece0a7fd9c2301a1e663617c083375"
+
+[[skill]]
+name = "systematic-debugging"
+source = ""
+kind = "local"
+checksum = "sha256:1858a982fd8037b11e297b74f28375301304e79c7cc2cafe1c54e594fef849d7"
+
+[[skill]]
+name = "take-challenge"
+source = ""
+kind = "local"
+checksum = "sha256:9ecd3874c0c285a6c3831276a9483bcf6ce098bb4edc684cfae9fa4a81b9f215"
+
+[[skill]]
+name = "test-driven-development"
+source = ""
+kind = "local"
+checksum = "sha256:eee144aea35d783296d178017e9fe843c6d16cc8b240e106f5e50910f6caf329"
+
+[[skill]]
+name = "using-git-worktrees"
+source = ""
+kind = "local"
+checksum = "sha256:212ad917e5543e84ea3adf4e3fab537675db976fdab05d4de432870e38b49e80"
+
+[[skill]]
+name = "using-jax"
+source = ""
+kind = "local"
+checksum = "sha256:1312c043dbe2042841cc421ae713c13aaa5148d7150913032a326153f8dc222f"
+
+[[skill]]
+name = "using-slurm"
+source = ""
+kind = "local"
+checksum = "sha256:7789022aacb0b9947359d1ced8c56968c750275c334c61989509e2fec5902226"
+
+[[skill]]
+name = "using-superpowers"
+source = ""
+kind = "local"
+checksum = "sha256:436454e9dc370401074b1df5c0d2a47b86d8a6350af405b63697a528a6167596"
+
+[[skill]]
+name = "verification-before-completion"
+source = ""
+kind = "local"
+checksum = "sha256:9b446f0c7fe1cfb560b1d34439523b1a76d5f177290007b2c053a1c749a4a8ba"
+
+[[skill]]
+name = "writing-plans"
+source = ""
+kind = "local"
+checksum = "sha256:56ce74d3f05986ea81295d3789adb71bf03845d05d182883fc5e56bf367c6af7"
