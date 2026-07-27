@@ -1,19 +1,24 @@
 # Reblinded benchmark boundary
 
 This directory is the public, committed boundary between an independent
-custodian and proposal worktrees. At the proposer-safe source freeze it
-intentionally contains only this README:
+custodian and proposal worktrees. The commitment and nonidentifying 180-row
+manifest are now frozen; no public training bundle is mounted in this
+worktree, and no private benchmark or evaluator material is stored here.
 
-- `COMMITMENT.txt` does not exist yet;
-- `manifest.csv` does not exist yet;
-- no public training bundle is mounted;
-- no generator, family inventory, secret seed, mapping, complete table, sealed
-  digest, or evaluator result is stored here.
+## Publication record
 
-`research/check_gate.py --phase protocol` must fail on the missing commitment,
-manifest, baseline matrix, and matrix digest until the custodian completes the
-separate benchmark build. That failure is expected and prevents accidental
-proposal access before the algorithm freeze.
+- Commitment: `f2af9d3df949c6d07cfb80d209bc18040068fc1b2b5b3b36ec9743d7cfedc315`
+- Public manifest: 180 instances, 22,438 bytes,
+  SHA-256 `405ebeb9b83b92065d268360f763ecfefb8d0ea114556019b85ace958e6f9836`
+- Canonical public archive: 23,570,730 bytes,
+  SHA-256 `23e58e1f263052a290ad1321d7fccf45996224fc528a51a1b169cd97bf877d40`
+- Frozen baseline matrix: 360 rows, 72,240 bytes,
+  SHA-256 `cf3749189d84bb6aebf038e20c4af8397dcd9d8157cf201e21676004ab4ed569`
+
+The custodian retained the canonical extracted public bundle and
+`occam-reblind-public-f2af9d3df949c6d07cfb80d209bc18040068fc1b2b5b3b36ec9743d7cfedc315.tar.zst`
+outside proposer worktrees. Byte-identical regeneration and archive-layout
+audits passed before this publication.
 
 ## Custodian publication contract
 
