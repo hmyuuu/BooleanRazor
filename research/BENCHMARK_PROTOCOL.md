@@ -83,6 +83,15 @@ Terminal states are `SUCCESS`, `TIMEOUT`, `OOM`, `NONZERO_EXIT`,
 `MISSING_SUCCESS_MANIFEST`. Failure is retained as evidence. Unavailable values
 are the literal `none`; blank fields are invalid.
 
+Verifier values are exactly `pass`, `fail`, and `not_run`. `SUCCESS` requires
+`pass`, `VERIFIER_FAILED` requires `fail`, and every other terminal failure
+requires `not_run`. A successful `train_exact` is exactly `1.0`; visible
+accuracies are finite canonical decimals in [0,1], gates and peak memory are
+canonical nonnegative integers, and elapsed seconds is a finite canonical
+nonnegative decimal no larger than the cell timeout. Failed quality metrics and
+candidate artifact remain `none`; elapsed time and peak memory may be `none`,
+but are checked with the same semantics when present.
+
 ## Metrics and inference
 
 The primary per-instance metric is exact-row accuracy across all unobserved
@@ -109,14 +118,32 @@ evaluation. No row-level bootstrap may masquerade as independent evidence.
 `research/check_gate.py --phase protocol` validates the reviewed survey, the
 public manifest/commitment, canonical 360-row matrix plus digest, and the exact
 header-only visible-results schema. `--phase baseline` additionally requires
-one terminal blind result per matrix row and rejects any sealed field.
+one terminal blind result per matrix row and rejects any sealed field. Each
+baseline `evidence_path` is repository-relative below `results/`, cannot escape
+that root, names an existing JSON manifest, hashes exactly to
+`manifest_sha256`, recursively contains no forbidden key, conforms to the
+terminal-manifest schema, and agrees with the row’s provenance, status, and
+metrics.
 
-`--phase manifests --run <run>` is read-only. It joins `<run>/spec.csv` to
-exactly one `cells/**/manifest.csv` record per comparison ID, checks provenance,
-terminal status, evidence hashes, verifier state, and absence of sealed fields.
-A successful cell requires `verifier=pass` and a valid artifact hash. Failed
-cells retain provenance and evidence but set unavailable candidate metrics and
-artifact hash to `none`.
+`--phase manifests --run <run> --expected-spec <path>` is read-only.
+`<expected-spec>` must resolve to an existing file below this `research/`
+directory. The native run layout is:
+
+```text
+<run>/run_spec.json
+<run>/cells/<cell_id>/manifest.json
+```
+
+For a JSON expected spec, `run_spec.json` is byte-identical. For the canonical
+`BASELINE_MATRIX.csv`, the native JSON `cells` array is semantically the exact
+360-row matrix: `cell_id=comparison_id`, and `params` contains every matrix
+field verbatim. No empty or incomplete design is accepted. Exactly one terminal
+JSON manifest must exist at the native path for every expected cell, with no
+extra manifest. The checker validates recursive sealed-key absence, provenance,
+status/verifier/metric semantics, run-contained artifact paths, and exact
+artifact hashes. Successful cells require `verifier=pass`; failed cells retain
+terminal evidence and use `none` for unavailable candidate quality metrics and
+artifact.
 
 The visible-results schema is:
 
