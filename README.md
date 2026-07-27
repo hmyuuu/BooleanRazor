@@ -38,6 +38,9 @@ make test
 Then read:
 
 - [`GOAL.md`](GOAL.md) — concise research objective and success bar.
+- [`docs/LEADERBOARD.md`](docs/LEADERBOARD.md) — disclosed-v1 scores,
+  reproduction evidence, and improvement against the published and internal
+  references.
 - [`docs/plans/2026-07-23-occam-circuit-rust-bdd-tn.md`](docs/plans/2026-07-23-occam-circuit-rust-bdd-tn.md)
   — ratified implementation and evaluation plan.
 - [`docs/handoff/SESSION_HANDOFF.md`](docs/handoff/SESSION_HANDOFF.md) —
