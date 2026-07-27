@@ -62,9 +62,43 @@ timeout `300`, one declared local hardware card, and
 `SHA256(COMMITMENT || method || opaque_id)` over the UTF-8 text as the
 lowercase algorithm seed.
 
+## Frozen design and execution provenance
+
+A tracked JSON benchmark declaration is a provenance-free canonical design spec
+with exactly `schema_version` and `cells`. It never attempts to hash the commit
+that contains itself. Every cell has exactly `cell_id` and `params`; the latter
+has the canonical string fields `comparison_id`, `role`, `method`,
+`method_version`, `blind`, `evaluation_scope`, `hardware`, `dataset_id`, `tier`,
+`observation_fraction`, `algorithm_seed`, `repeat`, and `timeout_seconds`.
+`comparison_id=cell_id`, `blind=true`, and
+`evaluation_scope=visible_cv_only`. A generic candidate role may declare any
+nonblank method and version; the two frozen-method restrictions apply only to
+the canonical baseline matrix.
+
+The ignored execution `RUN_ROOT/run_spec.json` adds one top-level `provenance`
+object to that exact design projection. Its fields are exactly
+`source_commit`, `runner_commit`, `tree_digest`, `image_sha256`, and `compiler_digest`.
+For a local run, the worktree is clean including untracked files,
+`source_commit=runner_commit=HEAD`, `image_sha256=none`, and `tree_digest` is
+the SHA-256 of the raw bytes from:
+
+```bash
+git ls-tree -rz --full-tree HEAD
+```
+
+A container run instead supplies a canonical, independently checked provenance
+JSON whose five values equal the run spec. Image verification occurs before
+runner invocation; the runner records that result and does not claim to
+measure its own container.
+
 ## Timing and hardware
 
-Every candidate and matched baseline cell has a hard 300-second wall cap.
+Every candidate and matched baseline cell has a declared hard wall cap in
+`(0,300]` seconds; the frozen baseline value is `300`. The monotonic deadline
+includes child startup. The runner reserves bounded termination grace inside
+the declared cap, sends `SIGTERM`, sends `SIGKILL` no later than the deadline,
+and reaps the process group. A timeout records the declared cap as its censored
+elapsed value and separately records measured post-deadline cleanup.
 Compilation, dependency installation, environment construction, archive
 transfer, and input staging occur before the clock. Parsing visible input,
 training/completion, model selection, the final fit, observation restoration,
@@ -91,6 +125,20 @@ canonical nonnegative integers, and elapsed seconds is a finite canonical
 nonnegative decimal no larger than the cell timeout. Failed quality metrics and
 candidate artifact remain `none`; elapsed time and peak memory may be `none`,
 but are checked with the same semantics when present.
+
+`run-experiment.py` requires `--run-root`, one declared `--cell-id`, its direct
+in-cell `--metrics-json`, optional independently checked
+`--container-provenance`, and a nonempty argv after `--`. It rejects an
+existing cell directory and never overwrites evidence.
+
+A zero-exit child must write exact-key visible-only metrics plus the fixed
+regular files `completed-table.csv`, `circuit.txt`, and `artifact.json`.
+The compact sorted-key artifact index binds the table and circuit filenames,
+their SHA-256 digests, `schema_version=1`, and `equivalence=pass`. The metrics
+table digest, both index digests, both stable file hashes, and the manifest’s
+hash of the index must all agree. Symlinks, path races, missing or extra keys,
+nonfinite/out-of-range accuracies, a nonexact training fit, and the
+`bit_accuracy` alias are invalid.
 
 ## Metrics and inference
 
@@ -134,16 +182,45 @@ directory. The native run layout is:
 <run>/cells/<cell_id>/manifest.json
 ```
 
-For a JSON expected spec, `run_spec.json` is byte-identical. For the canonical
-`BASELINE_MATRIX.csv`, the native JSON `cells` array is semantically the exact
-360-row matrix: `cell_id=comparison_id`, and `params` contains every matrix
-field verbatim. No empty or incomplete design is accepted. Exactly one terminal
-JSON manifest must exist at the native path for every expected cell, with no
-extra manifest. The checker validates recursive sealed-key absence, provenance,
-status/verifier/metric semantics, run-contained artifact paths, and exact
-artifact hashes. Successful cells require `verifier=pass`; failed cells retain
-terminal evidence and use `none` for unavailable candidate quality metrics and
-artifact.
+For a JSON expected spec, the checker canonicalizes the execution projection
+`{"schema_version":1,"cells":[...]}` and requires those bytes to equal the
+tracked design. Execution provenance is validated independently. For the
+canonical `BASELINE_MATRIX.csv`, the native JSON `cells` array is semantically
+the exact 360-row matrix: `cell_id=comparison_id`; `params` preserves every
+matrix field verbatim and adds only `role=baseline`, `blind=true`, and
+`evaluation_scope=visible_cv_only`. No empty or incomplete design is accepted.
+
+Exactly one terminal JSON manifest must exist at the native path for every
+expected cell, with no extra manifest. Every manifest binds the run-spec hash,
+source provenance, row parameters, producer, argv, timestamps, stdout/stderr
+hashes, scheduler metadata, cleanup, completed-table digest, circuit digest,
+and artifact index. Runner logs use
+`SHA256(frame(stdout) || frame(stderr))`, where each frame is an
+eight-byte unsigned big-endian length followed by the raw bytes. Runner scheduler fields
+are all `none`; scheduler-materialized evidence instead has empty argv,
+unavailable timestamps, and populated raw-accounting fields. Successful cells
+require `verifier=pass`; failed cells retain terminal evidence and use `none`
+for all unavailable candidate quality and artifact fields.
+
+For a Slurm task killed before runner evidence is written,
+`materialize-slurm-failures.py` consumes separately captured raw parsable
+accounting with the exact header:
+
+```text
+JobIDRaw|State|ExitCode|MaxRSS|ElapsedRaw
+```
+
+The capture uses `sacct --units=K`. One unique root allocation row
+`<job-id>_<one-based-index>` is required per ordered cell; uniquely named
+`.batch` and `.extern` rows may contribute to the maximum KiB observation.
+`MaxRSS` is blank or a canonical integer followed by `K`; decimal and other
+units are rejected. The complete raw bytes and exact
+`RUN_ROOT/slurm-<job-id>_<one-based-index>.out` are hashed. Pending, unknown,
+duplicate, incomplete, inconsistent, or log-less evidence fails before any
+manifest is written. The materializer can emit only `TIMEOUT`, `OOM`,
+`NONZERO_EXIT`, `CANCELLED`, or `MISSING_SUCCESS_MANIFEST`; it never emits
+`SUCCESS`. The stable top-level harness remains unchanged, and the actual raw
+capture integration is deferred to Task 14 resource-card ratification.
 
 The visible-results schema is:
 

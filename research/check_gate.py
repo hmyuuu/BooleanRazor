@@ -10,6 +10,7 @@ import io
 import json
 import re
 import sys
+from datetime import datetime
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
@@ -82,12 +83,87 @@ SOURCE_PATH = re.compile(r"`(\.knowledge/literature/[^`]+\.md)`")
 CANONICAL_INTEGER = re.compile(r"(?:0|[1-9][0-9]*)")
 CANONICAL_DECIMAL = re.compile(r"(?:0|[1-9][0-9]*)\.[0-9]+")
 CELL_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*")
+RFC3339_UTC = re.compile(
+    r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}"
+    r"(?:\.[0-9]+)?Z"
+)
+RAW_EXIT_CODE = re.compile(
+    r"((?:0|[1-9][0-9]*)):((?:0|[1-9][0-9]*))"
+)
 BASELINE_FIELDS = set(BASELINES_HEADER.split(","))
 MANIFEST_ROW_FIELDS = BASELINE_FIELDS - {"manifest_sha256", "evidence_path"}
-MANIFEST_REQUIRED_FIELDS = MANIFEST_ROW_FIELDS | {"artifact_path"}
-MANIFEST_ALLOWED_FIELDS = MANIFEST_REQUIRED_FIELDS | {
+PARAM_FIELDS = {
+    "comparison_id",
+    "role",
+    "method",
+    "method_version",
+    "blind",
+    "evaluation_scope",
+    "hardware",
+    "dataset_id",
+    "tier",
+    "observation_fraction",
+    "algorithm_seed",
+    "repeat",
+    "timeout_seconds",
+}
+PROVENANCE_FIELDS = {
+    "source_commit",
+    "runner_commit",
+    "tree_digest",
+    "image_sha256",
+    "compiler_digest",
+}
+MANIFEST_OPERATIONAL_FIELDS = {
+    "schema_version",
+    "producer",
+    "run_spec_sha256",
+    "argv",
+    "started_utc",
+    "ended_utc",
+    "stdout_sha256",
+    "stderr_sha256",
+    "scheduler_job_id",
+    "scheduler_task_index",
+    "scheduler_state",
+    "scheduler_exit_code",
+    "scheduler_classification",
+    "scheduler_elapsed_seconds",
+    "cleanup_seconds",
     "scheduler_sha256",
     "log_sha256",
+}
+MANIFEST_REQUIRED_FIELDS = (
+    MANIFEST_ROW_FIELDS
+    | {
+        "artifact_path",
+        "completed_table_sha256",
+        "circuit_sha256",
+    }
+    | MANIFEST_OPERATIONAL_FIELDS
+)
+MANIFEST_ALLOWED_FIELDS = MANIFEST_REQUIRED_FIELDS
+RUNNER_STATES = {
+    "SUCCESS",
+    "TIMEOUT",
+    "NONZERO_EXIT",
+    "INVALID_METRICS",
+    "VERIFIER_FAILED",
+    "VERIFIER_NOT_RUN",
+}
+SCHEDULER_STATES = {
+    "TIMEOUT",
+    "OOM",
+    "NONZERO_EXIT",
+    "CANCELLED",
+    "MISSING_SUCCESS_MANIFEST",
+}
+SCHEDULER_STATE_BY_STATUS = {
+    "TIMEOUT": "TIMEOUT",
+    "OOM": "OUT_OF_MEMORY",
+    "NONZERO_EXIT": "FAILED",
+    "CANCELLED": "CANCELLED",
+    "MISSING_SUCCESS_MANIFEST": "COMPLETED",
 }
 
 
@@ -244,6 +320,10 @@ def canonical_csv_bytes(header: str, rows: list[dict[str, str]]) -> bytes:
     return stream.getvalue().encode("utf-8")
 
 
+def canonical_json_bytes(value: object) -> bytes:
+    return (json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n").encode()
+
+
 def check_matrix(
     path: Path,
     digest_path: Path,
@@ -393,11 +473,17 @@ def check_manifest_schema(
     for field in MANIFEST_ROW_FIELDS:
         if field not in payload:
             continue
-        text = scalar_text(payload[field])
-        if text is None:
-            errors.append(f"{label} field {field} must be a scalar")
+        if not isinstance(payload[field], str):
+            errors.append(f"{label} field {field} must be a canonical string")
         else:
-            row[field] = text
+            row[field] = payload[field]
+    if payload.get("schema_version") != 1:
+        errors.append(f"{label} schema_version must equal integer 1")
+    if payload.get("producer") not in {"runner", "scheduler"}:
+        errors.append(f"{label} has invalid producer")
+    argv = payload.get("argv")
+    if not isinstance(argv, list) or any(not isinstance(value, str) for value in argv):
+        errors.append(f"{label} argv must be a string array")
     return row
 
 
@@ -442,6 +528,32 @@ def canonical_integer(
     return int(value)
 
 
+def canonical_timeout(
+    value: str, field: str, label: str, errors: list[str]
+) -> Decimal | None:
+    if CANONICAL_INTEGER.fullmatch(value):
+        number = Decimal(value)
+    elif CANONICAL_DECIMAL.fullmatch(value):
+        try:
+            number = Decimal(value)
+        except InvalidOperation:
+            errors.append(f"{label} has invalid {field}")
+            return None
+        canonical = format(number.normalize(), "f")
+        if "." not in canonical:
+            canonical += ".0"
+        if value != canonical:
+            errors.append(f"{label} has noncanonical {field}")
+            return None
+    else:
+        errors.append(f"{label} has noncanonical {field}")
+        return None
+    if not number.is_finite() or number <= 0 or number > Decimal(300):
+        errors.append(f"{label} has out-of-range {field}")
+        return None
+    return number
+
+
 def check_terminal_metrics(row: dict[str, str], label: str, errors: list[str]) -> None:
     status = row.get("status", "")
     if status not in TERMINAL_STATES:
@@ -458,9 +570,27 @@ def check_terminal_metrics(row: dict[str, str], label: str, errors: list[str]) -
         errors.append(f"{label} {status} requires verifier={expected_verifier}")
     if row.get("timed_out") not in {"true", "false"}:
         errors.append(f"{label} has invalid timed_out")
-    timeout = canonical_integer(
+    timeout = canonical_timeout(
         row.get("timeout_seconds", ""), "timeout_seconds", label, errors
     )
+    expected_exit = {
+        "SUCCESS": "0",
+        "TIMEOUT": "124",
+        "OOM": "137",
+        "INVALID_METRICS": "65",
+        "VERIFIER_FAILED": "66",
+        "VERIFIER_NOT_RUN": "67",
+        "CANCELLED": "130",
+        "MISSING_SUCCESS_MANIFEST": "70",
+    }.get(status)
+    if expected_exit is not None and row.get("exit_code") != expected_exit:
+        errors.append(f"{label} {status} has inconsistent exit_code")
+    if status == "NONZERO_EXIT":
+        exit_code = canonical_integer(
+            row.get("exit_code", ""), "exit_code", label, errors
+        )
+        if exit_code == 0:
+            errors.append(f"{label} NONZERO_EXIT has zero exit_code")
     if status == "SUCCESS":
         if row.get("exit_code") != "0" or row.get("timed_out") != "false":
             errors.append(f"{label} SUCCESS has inconsistent process status")
@@ -500,9 +630,40 @@ def check_terminal_metrics(row: dict[str, str], label: str, errors: list[str]) -
             elapsed = canonical_decimal(elapsed_text, "elapsed_seconds", label, errors)
             if elapsed is not None and timeout is not None and elapsed > timeout:
                 errors.append(f"{label} elapsed_seconds exceeds timeout_seconds")
+            if (
+                status == "TIMEOUT"
+                and elapsed is not None
+                and timeout is not None
+                and elapsed != timeout
+            ):
+                errors.append(f"{label} TIMEOUT must record the declared censored cap")
         peak_text = row.get("peak_memory_kib", "")
         if peak_text != "none":
             canonical_integer(peak_text, "peak_memory_kib", label, errors)
+
+
+def check_execution_row(
+    row: dict[str, str], label: str, errors: list[str]
+) -> None:
+    if any(row.get(field, "") == "" for field in MANIFEST_ROW_FIELDS):
+        errors.append(f"{label} contains a blank row field")
+    if row.get("role") not in {"baseline", "candidate"}:
+        errors.append(f"{label} has invalid role")
+    if (
+        row.get("blind") != "true"
+        or row.get("evaluation_scope") != "visible_cv_only"
+    ):
+        errors.append(f"{label} violates blind visible-CV scope")
+    for field in ("source_commit", "runner_commit"):
+        if not COMMIT_HASH.fullmatch(row.get(field, "")):
+            errors.append(f"{label} has invalid {field}")
+    if not HEX_64.fullmatch(row.get("tree_digest", "")):
+        errors.append(f"{label} has invalid tree_digest")
+    for field in ("image_sha256", "compiler_digest"):
+        value = row.get(field, "")
+        if value != "none" and not HEX_64.fullmatch(value):
+            errors.append(f"{label} has invalid {field}")
+    check_terminal_metrics(row, label, errors)
 
 
 def results_path(value: str, label: str, errors: list[str]) -> Path | None:
@@ -535,29 +696,69 @@ def check_baseline_evidence(
     payload = read_json_object(evidence, f"{label} evidence", errors)
     if payload is None:
         return
+    if raw != canonical_json_bytes(payload):
+        errors.append(f"{label} evidence is not canonical compact sorted-key JSON")
     evidence_row = check_manifest_schema(payload, f"{label} evidence", errors)
     for field in MANIFEST_ROW_FIELDS:
         if evidence_row.get(field) != row.get(field):
             errors.append(f"{label} evidence disagrees on {field}")
-    artifact_path = scalar_text(payload.get("artifact_path"))
-    if row.get("status") == "SUCCESS":
-        if artifact_path in {None, "none"}:
-            errors.append(f"{label} SUCCESS lacks artifact_path")
-        else:
-            artifact = results_path(artifact_path, f"{label} artifact_path", errors)
-            if artifact is not None:
-                if not artifact.is_file():
-                    errors.append(f"{label} references missing artifact")
-                elif hashlib.sha256(artifact.read_bytes()).hexdigest() != row.get(
-                    "artifact_sha256"
-                ):
-                    errors.append(f"{label} artifact hash mismatch")
-    elif artifact_path != "none":
-        errors.append(f"{label} failed evidence must set artifact_path=none")
-    if row.get("status") in FAILED_STATES:
-        for field in ("scheduler_sha256", "log_sha256"):
-            if not HEX_64.fullmatch(scalar_text(payload.get(field)) or ""):
-                errors.append(f"{label} failed evidence has invalid {field}")
+    if (
+        evidence.name != "manifest.json"
+        or evidence.parent.name != row.get("comparison_id")
+        or evidence.parent.parent.name != "cells"
+    ):
+        errors.append(f"{label} evidence is not at the native cell manifest path")
+        return
+    run = evidence.parents[2]
+    run_spec_path = run / "run_spec.json"
+    run_spec_raw = regular_bytes(
+        run_spec_path, f"{label} evidence run_spec.json", errors
+    )
+    if run_spec_raw is None:
+        return
+    try:
+        run_spec = json.loads(run_spec_raw)
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        errors.append(f"{label} evidence run_spec.json is not valid JSON")
+        return
+    if not isinstance(run_spec, dict):
+        errors.append(f"{label} evidence run_spec.json must be an object")
+        return
+    if run_spec_raw != canonical_json_bytes(run_spec):
+        errors.append(f"{label} evidence run_spec.json is not canonical")
+    if set(run_spec) != {"schema_version", "cells", "provenance"}:
+        errors.append(f"{label} evidence run_spec.json has the wrong schema")
+    cells = native_cells(run_spec, f"{label} evidence run_spec.json", errors)
+    provenance = check_provenance(
+        run_spec.get("provenance"),
+        f"{label} evidence run_spec.json provenance",
+        errors,
+    )
+    comparison_id = row.get("comparison_id", "")
+    run_params = cells.get(comparison_id)
+    if run_params is None or any(
+        evidence_row.get(field) != run_params.get(field) for field in PARAM_FIELDS
+    ):
+        errors.append(f"{label} evidence disagrees with run_spec params")
+    if any(
+        evidence_row.get(field) != provenance.get(field)
+        for field in PROVENANCE_FIELDS
+    ):
+        errors.append(f"{label} evidence disagrees with run_spec provenance")
+    expected_task_index = (
+        list(cells).index(comparison_id) + 1 if comparison_id in cells else None
+    )
+    check_execution_row(evidence_row, f"{label} evidence", errors)
+    check_operational_metadata(
+        run,
+        payload,
+        evidence_row,
+        f"{label} evidence",
+        hashlib.sha256(run_spec_raw).hexdigest(),
+        errors,
+        expected_task_index=expected_task_index,
+    )
+    check_native_artifacts(run, payload, evidence_row, f"{label} evidence", errors)
 
 
 def check_baseline_rows(
@@ -696,19 +897,20 @@ def expected_spec_path(path: Path, errors: list[str]) -> Path | None:
 
 def native_cells(
     spec: dict[str, object], label: str, errors: list[str]
-) -> dict[str, dict[str, object]]:
+) -> dict[str, dict[str, str]]:
     cells = spec.get("cells")
     if not isinstance(cells, list):
         errors.append(f"{label} must contain a cells array")
         return {}
     if not cells:
         errors.append(f"{label} must contain at least one cell")
-    indexed: dict[str, dict[str, object]] = {}
-    required_params = set(MATRIX_HEADER.split(","))
+    indexed: dict[str, dict[str, str]] = {}
     for index, cell in enumerate(cells):
         cell_label = f"{label} cells[{index}]"
-        if not isinstance(cell, dict):
-            errors.append(f"{cell_label} must be an object")
+        if not isinstance(cell, dict) or set(cell) != {"cell_id", "params"}:
+            errors.append(
+                f"{cell_label} must contain exactly cell_id and params"
+            )
             continue
         cell_id = cell.get("cell_id")
         params = cell.get("params")
@@ -721,30 +923,222 @@ def native_cells(
         if not isinstance(params, dict):
             errors.append(f"{cell_label} must contain an object params")
             continue
-        missing_params = sorted(required_params - set(params))
-        if missing_params:
+        missing_params = sorted(PARAM_FIELDS - set(params))
+        extra_params = sorted(set(params) - PARAM_FIELDS)
+        if missing_params or extra_params:
+            details = []
+            if missing_params:
+                details.append(f"missing={','.join(missing_params)}")
+            if extra_params:
+                details.append(f"extra={','.join(extra_params)}")
             errors.append(
-                f"{cell_label} has incomplete params: {','.join(missing_params)}"
+                f"{cell_label} params violate schema ({'; '.join(details)})"
             )
-        if scalar_text(params.get("comparison_id")) != cell_id:
+        if any(not isinstance(value, str) for value in params.values()):
+            errors.append(f"{cell_label} params values must be canonical strings")
+            continue
+        canonical_params = {str(key): value for key, value in params.items()}
+        if canonical_params.get("comparison_id") != cell_id:
             errors.append(f"{cell_label} params comparison_id differs from cell_id")
-        indexed[cell_id] = params
+        if canonical_params.get("role") not in {"baseline", "candidate"}:
+            errors.append(f"{cell_label} params has invalid role")
+        if (
+            canonical_params.get("blind") != "true"
+            or canonical_params.get("evaluation_scope") != "visible_cv_only"
+        ):
+            errors.append(f"{cell_label} params violate blind visible-CV scope")
+        if not HEX_64.fullmatch(canonical_params.get("algorithm_seed", "")):
+            errors.append(f"{cell_label} params has invalid algorithm_seed")
+        canonical_integer(
+            canonical_params.get("repeat", ""), "repeat", cell_label, errors
+        )
+        canonical_timeout(
+            canonical_params.get("timeout_seconds", ""),
+            "timeout_seconds",
+            cell_label,
+            errors,
+        )
+        for field in PARAM_FIELDS - {
+            "algorithm_seed",
+            "repeat",
+            "timeout_seconds",
+        }:
+            if canonical_params.get(field, "") == "":
+                errors.append(f"{cell_label} params has blank {field}")
+        indexed[cell_id] = canonical_params
     return indexed
 
 
-def run_relative_path(
-    run: Path, value: str, label: str, errors: list[str]
-) -> Path | None:
-    raw = Path(value)
-    resolved_run = run.resolve()
-    if raw.is_absolute():
-        errors.append(f"{label} must be relative to the run")
+def check_provenance(
+    value: object, label: str, errors: list[str]
+) -> dict[str, str]:
+    if not isinstance(value, dict) or set(value) != PROVENANCE_FIELDS:
+        errors.append(f"{label} must contain exactly the five provenance fields")
+        return {}
+    if any(not isinstance(item, str) for item in value.values()):
+        errors.append(f"{label} values must be canonical strings")
+        return {}
+    provenance = {str(key): item for key, item in value.items()}
+    for field in ("source_commit", "runner_commit"):
+        if not COMMIT_HASH.fullmatch(provenance[field]):
+            errors.append(f"{label} has invalid {field}")
+    if not HEX_64.fullmatch(provenance["tree_digest"]):
+        errors.append(f"{label} has invalid tree_digest")
+    for field in ("image_sha256", "compiler_digest"):
+        item = provenance[field]
+        if item != "none" and not HEX_64.fullmatch(item):
+            errors.append(f"{label} has invalid {field}")
+    return provenance
+
+
+def regular_bytes(path: Path, label: str, errors: list[str]) -> bytes | None:
+    if path.is_symlink() or not path.is_file():
+        errors.append(f"{label} must be an existing regular file, not a symlink")
         return None
-    resolved = (run / raw).resolve()
-    if not resolved.is_relative_to(resolved_run):
-        errors.append(f"{label} escapes the run")
+    try:
+        return path.read_bytes()
+    except OSError as exc:
+        errors.append(f"{label} cannot be read: {exc}")
         return None
-    return resolved
+
+
+def check_timestamp(value: object, field: str, label: str, errors: list[str]) -> None:
+    if not isinstance(value, str) or not RFC3339_UTC.fullmatch(value):
+        errors.append(f"{label} has invalid {field}")
+        return
+    try:
+        datetime.fromisoformat(value[:-1] + "+00:00")
+    except ValueError:
+        errors.append(f"{label} has invalid {field}")
+
+
+def check_operational_metadata(
+    run: Path,
+    payload: dict[str, object],
+    row: dict[str, str],
+    label: str,
+    run_spec_sha256: str,
+    errors: list[str],
+    *,
+    expected_task_index: int | None = None,
+) -> None:
+    if payload.get("run_spec_sha256") != run_spec_sha256:
+        errors.append(f"{label} run_spec_sha256 does not match frozen run spec")
+    producer = payload.get("producer")
+    argv = payload.get("argv")
+    cell_id = row.get("comparison_id", "")
+    if producer == "runner":
+        if not isinstance(argv, list) or not argv or any(
+            not isinstance(value, str) for value in argv
+        ):
+            errors.append(f"{label} runner argv must be a nonempty string array")
+        check_timestamp(payload.get("started_utc"), "started_utc", label, errors)
+        check_timestamp(payload.get("ended_utc"), "ended_utc", label, errors)
+        if row.get("status") not in RUNNER_STATES:
+            errors.append(f"{label} runner cannot emit {row.get('status', '')}")
+        runner_scheduler_fields = (
+            "scheduler_sha256",
+            "scheduler_job_id",
+            "scheduler_task_index",
+            "scheduler_state",
+            "scheduler_exit_code",
+            "scheduler_classification",
+            "scheduler_elapsed_seconds",
+        )
+        if any(payload.get(field) != "none" for field in runner_scheduler_fields):
+            errors.append(f"{label} runner scheduler fields must all equal none")
+        canonical_decimal(
+            scalar_text(payload.get("cleanup_seconds")) or "",
+            "cleanup_seconds",
+            label,
+            errors,
+        )
+        cell = run / "cells" / cell_id
+        stdout = regular_bytes(cell / "stdout.log", f"{label} stdout.log", errors)
+        stderr = regular_bytes(cell / "stderr.log", f"{label} stderr.log", errors)
+        if stdout is not None and payload.get("stdout_sha256") != hashlib.sha256(
+            stdout
+        ).hexdigest():
+            errors.append(f"{label} stdout_sha256 does not match stdout.log")
+        if stderr is not None and payload.get("stderr_sha256") != hashlib.sha256(
+            stderr
+        ).hexdigest():
+            errors.append(f"{label} stderr_sha256 does not match stderr.log")
+        if stdout is not None and stderr is not None:
+            framed = (
+                len(stdout).to_bytes(8, "big")
+                + stdout
+                + len(stderr).to_bytes(8, "big")
+                + stderr
+            )
+            if payload.get("log_sha256") != hashlib.sha256(framed).hexdigest():
+                errors.append(f"{label} log_sha256 does not match framed logs")
+    elif producer == "scheduler":
+        if argv != []:
+            errors.append(f"{label} scheduler argv must be empty")
+        if payload.get("started_utc") != "none" or payload.get("ended_utc") != "none":
+            errors.append(f"{label} scheduler timestamps must equal none")
+        if payload.get("cleanup_seconds") != "none":
+            errors.append(f"{label} scheduler cleanup_seconds must equal none")
+        status = row.get("status", "")
+        if status not in SCHEDULER_STATES:
+            errors.append(f"{label} scheduler cannot emit {status}")
+        if not HEX_64.fullmatch(scalar_text(payload.get("scheduler_sha256")) or ""):
+            errors.append(f"{label} scheduler_sha256 is invalid")
+        job_id = scalar_text(payload.get("scheduler_job_id")) or ""
+        task_index = scalar_text(payload.get("scheduler_task_index")) or ""
+        if not re.fullmatch(r"[1-9][0-9]*", job_id):
+            errors.append(f"{label} scheduler_job_id is invalid")
+        if not re.fullmatch(r"[1-9][0-9]*", task_index):
+            errors.append(f"{label} scheduler_task_index is invalid")
+        elif (
+            expected_task_index is not None
+            and task_index != str(expected_task_index)
+        ):
+            errors.append(f"{label} scheduler ordered task index is inconsistent")
+        expected_state = SCHEDULER_STATE_BY_STATUS.get(status)
+        if payload.get("scheduler_state") != expected_state:
+            errors.append(f"{label} scheduler state/classification is inconsistent")
+        if payload.get("scheduler_classification") != status:
+            errors.append(f"{label} scheduler state/classification is inconsistent")
+        raw_exit = scalar_text(payload.get("scheduler_exit_code")) or ""
+        match = RAW_EXIT_CODE.fullmatch(raw_exit)
+        if match is None or any(int(value) > 255 for value in match.groups()):
+            errors.append(f"{label} scheduler_exit_code is invalid")
+        else:
+            code, exit_signal = (int(value) for value in match.groups())
+            if status == "MISSING_SUCCESS_MANIFEST" and (
+                code != 0 or exit_signal != 0
+            ):
+                errors.append(f"{label} scheduler state/exit pair is inconsistent")
+            if status == "NONZERO_EXIT":
+                if code == 0 and exit_signal == 0:
+                    errors.append(
+                        f"{label} scheduler state/exit pair is inconsistent"
+                    )
+                normalized = code if code else 128 + exit_signal if exit_signal else 1
+                if row.get("exit_code") != str(normalized):
+                    errors.append(f"{label} scheduler NONZERO_EXIT is not normalized")
+        elapsed_raw = scalar_text(payload.get("scheduler_elapsed_seconds")) or ""
+        if not CANONICAL_INTEGER.fullmatch(elapsed_raw):
+            errors.append(f"{label} scheduler_elapsed_seconds is invalid")
+        elif status != "TIMEOUT" and row.get("elapsed_seconds") != f"{elapsed_raw}.0":
+            errors.append(f"{label} scheduler elapsed evidence is inconsistent")
+        if job_id and task_index:
+            log_path = run / f"slurm-{job_id}_{task_index}.out"
+            log = regular_bytes(log_path, f"{label} scheduler task log", errors)
+            if log is not None:
+                digest = hashlib.sha256(log).hexdigest()
+                if payload.get("stdout_sha256") != digest:
+                    errors.append(
+                        f"{label} stdout_sha256 does not match scheduler task log"
+                    )
+                if payload.get("log_sha256") != digest:
+                    errors.append(
+                        f"{label} log_sha256 does not match scheduler task log"
+                    )
+                if payload.get("stderr_sha256") != "none":
+                    errors.append(f"{label} scheduler stderr_sha256 must equal none")
 
 
 def check_native_artifacts(
@@ -755,26 +1149,73 @@ def check_native_artifacts(
     errors: list[str],
 ) -> None:
     artifact_path = scalar_text(payload.get("artifact_path"))
-    if row.get("status") == "SUCCESS":
-        if artifact_path in {None, "none"}:
-            errors.append(f"{label} SUCCESS lacks artifact_path")
-        else:
-            artifact = run_relative_path(
-                run, artifact_path, f"{label} artifact_path", errors
-            )
-            if artifact is not None:
-                if not artifact.is_file():
-                    errors.append(f"{label} references missing artifact")
-                elif hashlib.sha256(artifact.read_bytes()).hexdigest() != row.get(
-                    "artifact_sha256"
-                ):
-                    errors.append(f"{label} artifact hash mismatch")
-    elif artifact_path != "none":
-        errors.append(f"{label} failed manifest must set artifact_path=none")
-    if row.get("status") in FAILED_STATES:
-        for field in ("scheduler_sha256", "log_sha256"):
-            if not HEX_64.fullmatch(scalar_text(payload.get(field)) or ""):
-                errors.append(f"{label} failed manifest has invalid {field}")
+    completed_digest = scalar_text(payload.get("completed_table_sha256"))
+    circuit_digest = scalar_text(payload.get("circuit_sha256"))
+    if row.get("status") != "SUCCESS":
+        for field, value in (
+            ("artifact_path", artifact_path),
+            ("completed_table_sha256", completed_digest),
+            ("circuit_sha256", circuit_digest),
+        ):
+            if value != "none":
+                errors.append(f"{label} failed manifest must set {field}=none")
+        return
+    cell_id = row.get("comparison_id", "")
+    expected_artifact_path = f"cells/{cell_id}/artifact.json"
+    if artifact_path != expected_artifact_path:
+        errors.append(f"{label} artifact_path is not the fixed in-cell index")
+        return
+    if not HEX_64.fullmatch(completed_digest or ""):
+        errors.append(f"{label} SUCCESS has invalid completed table digest")
+    if not HEX_64.fullmatch(circuit_digest or ""):
+        errors.append(f"{label} SUCCESS has invalid circuit digest")
+    cell = run / "cells" / cell_id
+    artifact_raw = regular_bytes(cell / "artifact.json", f"{label} artifact.json", errors)
+    if artifact_raw is None:
+        return
+    try:
+        artifact = json.loads(artifact_raw)
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        errors.append(f"{label} artifact.json is not valid UTF-8 JSON")
+        return
+    if not isinstance(artifact, dict):
+        errors.append(f"{label} artifact.json must be an object")
+        return
+    if artifact_raw != canonical_json_bytes(artifact):
+        errors.append(f"{label} artifact.json is not canonical")
+    expected_fields = {
+        "circuit_path",
+        "circuit_sha256",
+        "completed_table_path",
+        "completed_table_sha256",
+        "equivalence",
+        "schema_version",
+    }
+    if set(artifact) != expected_fields:
+        errors.append(f"{label} artifact.json has the wrong schema")
+        return
+    if (
+        artifact.get("schema_version") != 1
+        or artifact.get("circuit_path") != "circuit.txt"
+        or artifact.get("completed_table_path") != "completed-table.csv"
+    ):
+        errors.append(f"{label} artifact.json has invalid fixed fields")
+    if artifact.get("equivalence") != "pass":
+        errors.append(f"{label} artifact equivalence must equal pass")
+    if hashlib.sha256(artifact_raw).hexdigest() != row.get("artifact_sha256"):
+        errors.append(f"{label} artifact index hash mismatch")
+    if artifact.get("completed_table_sha256") != completed_digest:
+        errors.append(f"{label} completed table digest disagrees with artifact index")
+    if artifact.get("circuit_sha256") != circuit_digest:
+        errors.append(f"{label} circuit digest disagrees with artifact index")
+    table = regular_bytes(
+        cell / "completed-table.csv", f"{label} completed-table.csv", errors
+    )
+    circuit = regular_bytes(cell / "circuit.txt", f"{label} circuit.txt", errors)
+    if table is not None and hashlib.sha256(table).hexdigest() != completed_digest:
+        errors.append(f"{label} completed table hash mismatch")
+    if circuit is not None and hashlib.sha256(circuit).hexdigest() != circuit_digest:
+        errors.append(f"{label} circuit hash mismatch")
 
 
 def check_manifests(run: Path, expected_spec: Path) -> list[str]:
@@ -790,15 +1231,44 @@ def check_manifests(run: Path, expected_spec: Path) -> list[str]:
     run_spec = read_json_object(run_spec_path, "run_spec.json", errors)
     if run_spec is None:
         return sorted(set(errors))
+    run_spec_raw = run_spec_path.read_bytes()
+    if run_spec_raw != canonical_json_bytes(run_spec):
+        errors.append("run_spec.json is not canonical compact sorted-key JSON")
     forbidden = forbidden_key(run_spec)
     if forbidden is not None:
         errors.append(f"run_spec.json contains forbidden key: {forbidden}")
+    if set(run_spec) != {"schema_version", "cells", "provenance"}:
+        errors.append(
+            "run_spec.json must contain exactly schema_version, cells, and provenance"
+        )
+    if run_spec.get("schema_version") != 1:
+        errors.append("run_spec.json schema_version must equal integer 1")
     cells = native_cells(run_spec, "run_spec.json", errors)
+    provenance = check_provenance(
+        run_spec.get("provenance"), "run_spec.json provenance", errors
+    )
 
-    expected_matrix: dict[str, dict[str, str]] = {}
     if expected.suffix == ".json":
-        if run_spec_path.read_bytes() != expected.read_bytes():
-            errors.append("run_spec.json is not byte-identical to expected JSON spec")
+        expected_payload = read_json_object(expected, "expected JSON design spec", errors)
+        if expected_payload is not None:
+            expected_raw = expected.read_bytes()
+            if expected_raw != canonical_json_bytes(expected_payload):
+                errors.append("expected JSON design spec is not canonical")
+            if set(expected_payload) != {"schema_version", "cells"}:
+                errors.append(
+                    "expected JSON design spec must contain exactly schema_version and cells"
+                )
+            if expected_payload.get("schema_version") != 1:
+                errors.append("expected JSON design spec schema_version must equal 1")
+            native_cells(expected_payload, "expected JSON design spec", errors)
+            projection = {
+                "schema_version": run_spec.get("schema_version"),
+                "cells": run_spec.get("cells"),
+            }
+            if canonical_json_bytes(projection) != expected_raw:
+                errors.append(
+                    "run_spec.json design projection does not equal tracked design spec"
+                )
     elif expected == (RESEARCH_ROOT / "BASELINE_MATRIX.csv").resolve():
         matrix_rows = read_csv(expected, MATRIX_HEADER, errors)
         if len(matrix_rows) != 360:
@@ -813,12 +1283,15 @@ def check_manifests(run: Path, expected_spec: Path) -> list[str]:
         for cell_id in sorted(set(cells) & set(expected_matrix)):
             params = cells[cell_id]
             matrix_row = expected_matrix[cell_id]
-            if any(
-                scalar_text(params.get(field)) != value
-                for field, value in matrix_row.items()
-            ):
+            expected_params = {
+                **matrix_row,
+                "role": "baseline",
+                "blind": "true",
+                "evaluation_scope": "visible_cv_only",
+            }
+            if params != expected_params:
                 errors.append(
-                    f"run_spec.json cell {cell_id} params do not contain matrix fields verbatim"
+                    f"run_spec.json cell {cell_id} params do not preserve matrix fields verbatim with fixed baseline fields"
                 )
     else:
         errors.append(
@@ -838,9 +1311,7 @@ def check_manifests(run: Path, expected_spec: Path) -> list[str]:
     for path in sorted(actual_manifests - expected_manifests):
         errors.append(f"unexpected manifest: {path.relative_to(run)}")
 
-    rows: list[dict[str, str]] = []
-    matrix_rows: list[dict[str, str]] = []
-    for cell_id in sorted(cells):
+    for task_index, cell_id in enumerate(cells, start=1):
         path = run / "cells" / cell_id / "manifest.json"
         if not path.is_file():
             continue
@@ -848,25 +1319,29 @@ def check_manifests(run: Path, expected_spec: Path) -> list[str]:
         payload = read_json_object(path, label, errors)
         if payload is None:
             continue
+        if path.read_bytes() != canonical_json_bytes(payload):
+            errors.append(f"{label} is not canonical compact sorted-key JSON")
         row = check_manifest_schema(payload, label, errors)
         if row.get("comparison_id") != cell_id:
             errors.append(f"{label} comparison_id differs from cell_id")
         params = cells[cell_id]
-        native_matrix: dict[str, str] = {}
-        for field in MATRIX_HEADER.split(","):
-            value = scalar_text(params.get(field))
-            if value is not None:
-                native_matrix[field] = value
-            if row.get(field) != value:
+        for field in PARAM_FIELDS:
+            if row.get(field) != params.get(field):
                 errors.append(f"{label} disagrees with run_spec params field {field}")
-        if set(native_matrix) == set(MATRIX_HEADER.split(",")):
-            matrix_rows.append(native_matrix)
-            full_row = dict(row)
-            full_row["manifest_sha256"] = hashlib.sha256(path.read_bytes()).hexdigest()
-            full_row["evidence_path"] = label
-            rows.append(full_row)
+        for field in PROVENANCE_FIELDS:
+            if row.get(field) != provenance.get(field):
+                errors.append(f"{label} disagrees with run_spec provenance field {field}")
+        check_execution_row(row, label, errors)
+        check_operational_metadata(
+            run,
+            payload,
+            row,
+            label,
+            hashlib.sha256(run_spec_raw).hexdigest(),
+            errors,
+            expected_task_index=task_index,
+        )
         check_native_artifacts(run, payload, row, label, errors)
-    check_baseline_rows(rows, matrix_rows, errors, label="cell manifests")
     return sorted(set(errors))
 
 
