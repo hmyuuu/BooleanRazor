@@ -693,6 +693,76 @@ class CheckerReviewTests(unittest.TestCase):
         errors = self.manifest_errors(run, expected)
         self.assertTrue(any("scheduler argv" in error for error in errors), errors)
 
+    def test_timeout_requires_declared_cap_for_runner_and_scheduler(self) -> None:
+        for producer in ("runner", "scheduler"):
+            with self.subTest(producer=producer):
+                params = params_row(timeout_seconds="0.05")
+                expected, run = self.write_expected_json(
+                    cells=[{"cell_id": "cell-a", "params": params}]
+                )
+                path = self.write_manifest(
+                    run, params, status="TIMEOUT", producer=producer
+                )
+                payload = json.loads(path.read_bytes())
+                payload["elapsed_seconds"] = "none"
+                path.write_bytes(json_bytes(payload))
+
+                errors = self.manifest_errors(run, expected)
+
+                self.assertTrue(
+                    any("declared censored cap" in error for error in errors),
+                    errors,
+                )
+
+    def test_runner_requires_measured_elapsed_for_every_observed_terminal(self) -> None:
+        for status in (
+            "SUCCESS",
+            "NONZERO_EXIT",
+            "INVALID_METRICS",
+            "VERIFIER_FAILED",
+            "VERIFIER_NOT_RUN",
+        ):
+            with self.subTest(status=status):
+                params = params_row()
+                expected, run = self.write_expected_json(
+                    cells=[{"cell_id": "cell-a", "params": params}]
+                )
+                path = self.write_manifest(run, params, status=status)
+                payload = json.loads(path.read_bytes())
+                payload["elapsed_seconds"] = "none"
+                path.write_bytes(json_bytes(payload))
+
+                errors = self.manifest_errors(run, expected)
+
+                self.assertTrue(
+                    any("runner elapsed_seconds must be measured" in error for error in errors),
+                    errors,
+                )
+
+    def test_runner_cleanup_is_zero_unless_timeout_and_measured_on_timeout(
+        self,
+    ) -> None:
+        cases = (
+            ("NONZERO_EXIT", "0.01", "non-timeout cleanup_seconds"),
+            ("TIMEOUT", "none", "timeout cleanup_seconds"),
+        )
+        for status, cleanup, fragment in cases:
+            with self.subTest(status=status):
+                params = params_row(
+                    timeout_seconds="0.05" if status == "TIMEOUT" else "300"
+                )
+                expected, run = self.write_expected_json(
+                    cells=[{"cell_id": "cell-a", "params": params}]
+                )
+                path = self.write_manifest(run, params, status=status)
+                payload = json.loads(path.read_bytes())
+                payload["cleanup_seconds"] = cleanup
+                path.write_bytes(json_bytes(payload))
+
+                errors = self.manifest_errors(run, expected)
+
+                self.assertTrue(any(fragment in error for error in errors), errors)
+
     def test_manifest_row_fields_must_be_json_strings(self) -> None:
         params = params_row()
         expected, run = self.write_expected_json(

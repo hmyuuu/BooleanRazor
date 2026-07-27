@@ -305,6 +305,79 @@ class MaterializeSlurmFailuresTests(unittest.TestCase):
                 self.assertIn(fragment, result.stderr)
                 self.assertFalse((run / "cells").exists())
 
+    def test_symlinked_destination_components_are_rejected_without_escape(self) -> None:
+        for component in ("cells", "cell"):
+            with self.subTest(component=component):
+                run = self.write_run(f"symlink-{component}")
+                raw = self.write_raw(run, ["8123_1|FAILED|1:0||1"])
+                self.write_logs(run, "8123", 1)
+                outside = self.root / f"outside-{component}"
+                outside.mkdir()
+                if component == "cells":
+                    (run / "cells").symlink_to(outside, target_is_directory=True)
+                    escaped = outside / "cell-a/manifest.json"
+                else:
+                    (run / "cells").mkdir()
+                    (run / "cells/cell-a").symlink_to(
+                        outside, target_is_directory=True
+                    )
+                    escaped = outside / "manifest.json"
+
+                result = self.invoke(run, raw)
+
+                self.assertEqual(result.returncode, 2)
+                self.assertIn("symlink", result.stderr)
+                self.assertFalse(escaped.exists())
+
+    def test_every_cell_has_full_semantic_validation_before_materialization(
+        self,
+    ) -> None:
+        cases = {
+            "role": "untrusted",
+            "algorithm_seed": "not-a-digest",
+            "repeat": "01",
+            "method": "",
+            "timeout_seconds": "301",
+        }
+        for field, invalid in cases.items():
+            with self.subTest(field=field):
+                run = self.write_run(f"invalid-cell-{field}", ("cell-a", "cell-b"))
+                spec_path = run / "run_spec.json"
+                spec = json.loads(spec_path.read_bytes())
+                spec["cells"][1]["params"][field] = invalid
+                spec_path.write_bytes(canonical_json_bytes(spec))
+                raw = self.write_raw(
+                    run,
+                    [
+                        "8123_1|FAILED|1:0||1",
+                        "8123_2|FAILED|1:0||1",
+                    ],
+                )
+                self.write_logs(run, "8123", 2)
+
+                result = self.invoke(run, raw)
+
+                self.assertEqual(result.returncode, 2)
+                self.assertIn(field, result.stderr)
+                self.assertFalse((run / "cells").exists())
+
+    def test_non_timeout_elapsed_beyond_cap_blocks_all_planned_writes(self) -> None:
+        run = self.write_run("elapsed-transaction", ("cell-a", "cell-b"))
+        raw = self.write_raw(
+            run,
+            [
+                "8123_1|FAILED|1:0||1",
+                "8123_2|FAILED|1:0||301",
+            ],
+        )
+        self.write_logs(run, "8123", 2)
+
+        result = self.invoke(run, raw)
+
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("ElapsedRaw", result.stderr)
+        self.assertFalse((run / "cells").exists())
+
     def test_existing_runner_manifest_is_byte_identical_but_other_manifest_rejected(
         self,
     ) -> None:

@@ -91,6 +91,8 @@ class RunResult:
     peak_memory_kib: str
     started_utc: str
     ended_utc: str
+    stdout: bytes
+    stderr: bytes
 
 
 @dataclass(frozen=True)
@@ -145,10 +147,13 @@ def canonical_seconds(value: float) -> str:
 def canonical_accuracy(value: object, field: str) -> str:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise ValidationError(f"{field} must be a finite JSON number")
-    number = float(value)
-    if not math.isfinite(number) or not 0 <= number <= 1:
+    try:
+        number = Decimal(str(value))
+    except (InvalidOperation, ValueError, OverflowError) as exc:
+        raise ValidationError(f"{field} must be a finite JSON number") from exc
+    if not number.is_finite() or not Decimal(0) <= number <= Decimal(1):
         raise ValidationError(f"{field} must be finite and in [0,1]")
-    text = format(Decimal(str(value)).normalize(), "f")
+    text = format(number.normalize(), "f")
     if "." not in text:
         text += ".0"
     return text
@@ -221,6 +226,8 @@ def validate_timeout(value: str) -> float:
 def validate_params(params: dict[str, str], cell_id: str) -> float:
     if params["comparison_id"] != cell_id:
         raise ValidationError("cell params comparison_id must equal cell_id")
+    if params["role"] not in {"baseline", "candidate"}:
+        raise ValidationError("cell params role must equal baseline or candidate")
     if params["blind"] != "true":
         raise ValidationError("cell params blind must equal true")
     if params["evaluation_scope"] != "visible_cv_only":
@@ -302,7 +309,8 @@ def prepare_run(args: argparse.Namespace) -> PreparedRun:
     cells = spec["cells"]
     if not isinstance(cells, list) or not cells:
         raise ValidationError("run_spec.json cells must be a nonempty array")
-    selected: dict[str, object] | None = None
+    selected_params: dict[str, str] | None = None
+    selected_timeout: float | None = None
     seen: set[str] = set()
     for index, cell in enumerate(cells):
         if not isinstance(cell, dict) or set(cell) != {"cell_id", "params"}:
@@ -315,12 +323,15 @@ def prepare_run(args: argparse.Namespace) -> PreparedRun:
         if cell_id in seen:
             raise ValidationError(f"run_spec.json has duplicate cell_id: {cell_id}")
         seen.add(cell_id)
+        params = string_object(
+            cell["params"], PARAM_FIELDS, f"params for {cell_id}"
+        )
+        timeout = validate_params(params, cell_id)
         if cell_id == args.cell_id:
-            selected = cell
-    if selected is None:
+            selected_params = params
+            selected_timeout = timeout
+    if selected_params is None or selected_timeout is None:
         raise ValidationError(f"run_spec.json does not declare cell {args.cell_id}")
-    params = string_object(selected["params"], PARAM_FIELDS, "cell params")
-    timeout = validate_params(params, args.cell_id)
     provenance = string_object(
         spec["provenance"], PROVENANCE_FIELDS, "run_spec.json provenance"
     )
@@ -340,9 +351,9 @@ def prepare_run(args: argparse.Namespace) -> PreparedRun:
         cell_id=args.cell_id,
         cell_dir=cell_dir,
         metrics_path=metrics_path,
-        params=params,
+        params=selected_params,
         provenance=provenance,
-        timeout=timeout,
+        timeout=selected_timeout,
         argv=list(args.command),
     )
 
@@ -388,7 +399,7 @@ def run_child(prepared: PreparedRun) -> RunResult:
     raw_returncode = 0
     timed_out = False
     cleanup = 0.0
-    with stdout_path.open("xb") as stdout_file, stderr_path.open("xb") as stderr_file:
+    with stdout_path.open("x+b") as stdout_file, stderr_path.open("x+b") as stderr_file:
         try:
             process = subprocess.Popen(
                 prepared.argv,
@@ -408,6 +419,16 @@ def run_child(prepared: PreparedRun) -> RunResult:
                 process, start, prepared.timeout
             )
             raw_returncode = process.returncode
+        stdout_file.flush()
+        stderr_file.flush()
+        os.fsync(stdout_file.fileno())
+        os.fsync(stderr_file.fileno())
+        stdout_file.seek(0)
+        stderr_file.seek(0)
+        stdout = stdout_file.read()
+        stderr = stderr_file.read()
+    atomic_write(stdout_path, stdout)
+    atomic_write(stderr_path, stderr)
     ended_utc = utc_now()
     measured = max(0.0, time.monotonic() - start)
     if timed_out:
@@ -438,6 +459,8 @@ def run_child(prepared: PreparedRun) -> RunResult:
         peak_memory_kib=str(peak),
         started_utc=started_utc,
         ended_utc=ended_utc,
+        stdout=stdout,
+        stderr=stderr,
     )
 
 
@@ -607,8 +630,8 @@ def terminal_manifest(
     verifier: str,
     evidence: CandidateEvidence | None,
 ) -> dict[str, object]:
-    stdout = (prepared.cell_dir / "stdout.log").read_bytes()
-    stderr = (prepared.cell_dir / "stderr.log").read_bytes()
+    stdout = result.stdout
+    stderr = result.stderr
     payload: dict[str, object] = {
         **prepared.params,
         **prepared.provenance,
@@ -708,6 +731,8 @@ def main() -> int:
             peak_memory_kib=result.peak_memory_kib,
             started_utc=result.started_utc,
             ended_utc=result.ended_utc,
+            stdout=result.stdout,
+            stderr=result.stderr,
         )
     manifest = terminal_manifest(prepared, result, verifier, evidence)
     atomic_write(prepared.cell_dir / "manifest.json", canonical_json_bytes(manifest))

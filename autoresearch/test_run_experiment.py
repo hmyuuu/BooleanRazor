@@ -297,6 +297,35 @@ class RunExperimentTests(unittest.TestCase):
         self.assertEqual((run_root / "cells/cell-001/stdout.log").read_bytes(), stdout)
         self.assertEqual((run_root / "cells/cell-001/stderr.log").read_bytes(), stderr)
 
+    def test_child_cannot_remove_runner_owned_terminal_logs(self) -> None:
+        run_root, metrics_path = self.write_run_spec("2")
+        command = [
+            sys.executable,
+            "-c",
+            "\n".join(
+                (
+                    "import os, sys",
+                    "print('owned out')",
+                    "print('owned err', file=sys.stderr)",
+                    "sys.stdout.flush()",
+                    "sys.stderr.flush()",
+                    "os.unlink('stdout.log')",
+                    "os.unlink('stderr.log')",
+                    "raise SystemExit(17)",
+                )
+            ),
+        ]
+        result = self.invoke(run_root, metrics_path, command)
+
+        self.assertEqual(result.returncode, 17, result.stderr)
+        _, manifest = self.read_manifest(run_root)
+        stdout = b"owned out\n"
+        stderr = b"owned err\n"
+        self.assertEqual((run_root / "cells/cell-001/stdout.log").read_bytes(), stdout)
+        self.assertEqual((run_root / "cells/cell-001/stderr.log").read_bytes(), stderr)
+        self.assertEqual(manifest["stdout_sha256"], hashlib.sha256(stdout).hexdigest())
+        self.assertEqual(manifest["stderr_sha256"], hashlib.sha256(stderr).hexdigest())
+
     def test_signal_exit_is_normalized_to_128_plus_signal(self) -> None:
         run_root, metrics_path = self.write_run_spec("2")
         result = self.invoke(
@@ -363,6 +392,35 @@ class RunExperimentTests(unittest.TestCase):
                     "does not declare" if mode == "missing" else "duplicate",
                     result.stderr,
                 )
+                self.assertFalse((run_root / "cells/cell-001").exists())
+
+    def test_every_cell_has_full_semantic_validation_before_execution(self) -> None:
+        cases = {
+            "role": "untrusted",
+            "algorithm_seed": "not-a-digest",
+            "repeat": "01",
+            "method": "",
+            "timeout_seconds": "301",
+        }
+        for field, invalid in cases.items():
+            with self.subTest(field=field):
+                run_root, metrics_path = self.write_run_spec("2")
+                spec_path = run_root / "run_spec.json"
+                spec = json.loads(spec_path.read_bytes())
+                sibling = json.loads(json.dumps(spec["cells"][0]))
+                sibling["cell_id"] = "cell-002"
+                sibling["params"]["comparison_id"] = "cell-002"
+                sibling["params"][field] = invalid
+                spec["cells"].append(sibling)
+                spec_path.write_bytes(canonical_json_bytes(spec))
+                result = self.invoke(
+                    run_root,
+                    metrics_path,
+                    [sys.executable, "-c", "raise SystemExit(0)"],
+                )
+
+                self.assertEqual(result.returncode, 2)
+                self.assertIn(field, result.stderr)
                 self.assertFalse((run_root / "cells/cell-001").exists())
 
     def test_run_spec_symlink_outside_run_root_is_rejected(self) -> None:
@@ -485,6 +543,9 @@ class RunExperimentTests(unittest.TestCase):
                 metrics_updates={"train_exact": 0.999}
             ),
             "negative-gates": self.artifact_command(metrics_updates={"gates": -1}),
+            "huge-integer": self.artifact_command(
+                metrics_updates={"visible_cv_exact": 10**400}
+            ),
         }
         for name, command in cases.items():
             with self.subTest(name=name):

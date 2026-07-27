@@ -20,6 +20,7 @@ RAW_HEADER = b"JobIDRaw|State|ExitCode|MaxRSS|ElapsedRaw\n"
 CELL_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*")
 JOB_ID = re.compile(r"[1-9][0-9]*")
 CANONICAL_INTEGER = re.compile(r"(?:0|[1-9][0-9]*)")
+CANONICAL_TIMEOUT = re.compile(r"(?:0|[1-9][0-9]*)(?:\.[0-9]+)?")
 EXIT_CODE = re.compile(r"((?:0|[1-9][0-9]*)):((?:0|[1-9][0-9]*))")
 RSS_KIB = re.compile(r"((?:0|[1-9][0-9]*))K")
 HEX_64 = re.compile(r"[0-9a-f]{64}")
@@ -170,6 +171,43 @@ def string_object(
     return {str(key): item for key, item in value.items()}
 
 
+def validate_timeout(value: str, label: str) -> Decimal:
+    if not CANONICAL_TIMEOUT.fullmatch(value):
+        raise ValidationError(f"{label} timeout_seconds is not canonical")
+    number = Decimal(value)
+    canonical = canonical_timeout_elapsed(value)
+    if "." in value and canonical != value:
+        raise ValidationError(f"{label} timeout_seconds is not canonical")
+    if not number.is_finite() or number <= 0 or number > Decimal(300):
+        raise ValidationError(f"{label} timeout_seconds must be in (0,300]")
+    return number
+
+
+def validate_params(params: dict[str, str], cell_id: str) -> Decimal:
+    label = f"params for {cell_id}"
+    if params["comparison_id"] != cell_id:
+        raise ValidationError(f"{label} disagree on comparison_id")
+    if params["role"] not in {"baseline", "candidate"}:
+        raise ValidationError(f"{label} role must equal baseline or candidate")
+    if (
+        params["blind"] != "true"
+        or params["evaluation_scope"] != "visible_cv_only"
+    ):
+        raise ValidationError(f"{label} violate blind scope")
+    if not HEX_64.fullmatch(params["algorithm_seed"]):
+        raise ValidationError(f"{label} algorithm_seed must be 64 lowercase hex")
+    if not CANONICAL_INTEGER.fullmatch(params["repeat"]):
+        raise ValidationError(f"{label} repeat must be canonical")
+    for field in PARAM_FIELDS - {
+        "algorithm_seed",
+        "repeat",
+        "timeout_seconds",
+    }:
+        if params[field] == "":
+            raise ValidationError(f"{label} {field} must not be blank")
+    return validate_timeout(params["timeout_seconds"], label)
+
+
 def read_run_spec(run_root: Path) -> tuple[list[Cell], dict[str, str], bytes]:
     spec, raw = read_canonical_object(run_root / "run_spec.json", "run_spec.json")
     if set(spec) != {"schema_version", "cells", "provenance"}:
@@ -203,13 +241,7 @@ def read_run_spec(run_root: Path) -> tuple[list[Cell], dict[str, str], bytes]:
             raise ValidationError(f"run_spec.json has duplicate cell_id: {cell_id}")
         seen.add(cell_id)
         params = string_object(value["params"], PARAM_FIELDS, f"params for {cell_id}")
-        if params["comparison_id"] != cell_id:
-            raise ValidationError(f"params for {cell_id} disagree on comparison_id")
-        if (
-            params["blind"] != "true"
-            or params["evaluation_scope"] != "visible_cv_only"
-        ):
-            raise ValidationError(f"params for {cell_id} violate blind scope")
+        validate_params(params, cell_id)
         cells.append(Cell(cell_id, params))
     return cells, provenance, raw
 
@@ -298,6 +330,62 @@ def validate_job_rows(
         )
 
 
+def validate_destination_components(run_root: Path, cells: list[Cell]) -> None:
+    cells_root = run_root / "cells"
+    try:
+        details = os.lstat(cells_root)
+    except FileNotFoundError:
+        return
+    if stat.S_ISLNK(details.st_mode):
+        raise ValidationError("destination component cells must not be a symlink")
+    if not stat.S_ISDIR(details.st_mode):
+        raise ValidationError("destination component cells must be a directory")
+    for cell in cells:
+        cell_path = cells_root / cell.cell_id
+        try:
+            details = os.lstat(cell_path)
+        except FileNotFoundError:
+            continue
+        if stat.S_ISLNK(details.st_mode):
+            raise ValidationError(
+                f"destination component {cell.cell_id} must not be a symlink"
+            )
+        if not stat.S_ISDIR(details.st_mode):
+            raise ValidationError(
+                f"destination component {cell.cell_id} must be a directory"
+            )
+
+
+def validate_elapsed_caps(
+    cells: list[Cell], rows: dict[str, SchedulerRow], job_id: str
+) -> None:
+    for task_index, cell in enumerate(cells, start=1):
+        row = rows[f"{job_id}_{task_index}"]
+        timeout = validate_timeout(
+            cell.params["timeout_seconds"], f"params for {cell.cell_id}"
+        )
+        if row.state != "TIMEOUT" and Decimal(row.elapsed_raw) > timeout:
+            raise ValidationError(
+                f"raw accounting ElapsedRaw for {cell.cell_id} exceeds timeout_seconds"
+            )
+
+
+def checker_module() -> object:
+    global _CHECKER_MODULE
+    if _CHECKER_MODULE is None:
+        checker_path = (
+            Path(__file__).resolve().parents[1] / "research" / "check_gate.py"
+        )
+        module_spec = importlib.util.spec_from_file_location(
+            "task10_materializer_check_gate", checker_path
+        )
+        if module_spec is None or module_spec.loader is None:
+            raise ValidationError("cannot load checker for manifest validation")
+        _CHECKER_MODULE = importlib.util.module_from_spec(module_spec)
+        module_spec.loader.exec_module(_CHECKER_MODULE)
+    return _CHECKER_MODULE
+
+
 def validate_existing_runner_manifest(
     path: Path,
     cell: Cell,
@@ -320,21 +408,7 @@ def validate_existing_runner_manifest(
         raise ValidationError(
             f"existing manifest for {cell.cell_id} is not terminal"
         )
-    global _CHECKER_MODULE
-    if _CHECKER_MODULE is None:
-        checker_path = (
-            Path(__file__).resolve().parents[1] / "research" / "check_gate.py"
-        )
-        module_spec = importlib.util.spec_from_file_location(
-            "task10_materializer_check_gate", checker_path
-        )
-        if module_spec is None or module_spec.loader is None:
-            raise ValidationError(
-                "cannot load checker for existing manifest validation"
-            )
-        _CHECKER_MODULE = importlib.util.module_from_spec(module_spec)
-        module_spec.loader.exec_module(_CHECKER_MODULE)
-    checker = _CHECKER_MODULE
+    checker = checker_module()
     errors: list[str] = []
     label = f"existing manifest for {cell.cell_id}"
     row = checker.check_manifest_schema(payload, label, errors)
@@ -342,6 +416,33 @@ def validate_existing_runner_manifest(
     run_root = path.parents[2]
     checker.check_operational_metadata(
         run_root, payload, row, label, run_spec_sha256, errors
+    )
+    checker.check_native_artifacts(run_root, payload, row, label, errors)
+    if errors:
+        raise ValidationError(f"{label} is invalid: {errors[0]}")
+
+
+def validate_planned_manifest(
+    data: bytes,
+    run_root: Path,
+    cell: Cell,
+    run_spec_sha256: str,
+    task_index: int,
+) -> None:
+    payload = json.loads(data)
+    checker = checker_module()
+    errors: list[str] = []
+    label = f"planned manifest for {cell.cell_id}"
+    row = checker.check_manifest_schema(payload, label, errors)
+    checker.check_execution_row(row, label, errors)
+    checker.check_operational_metadata(
+        run_root,
+        payload,
+        row,
+        label,
+        run_spec_sha256,
+        errors,
+        expected_task_index=task_index,
     )
     checker.check_native_artifacts(run_root, payload, row, label, errors)
     if errors:
@@ -435,8 +536,10 @@ def plan_materialization(
     if not run_root.is_dir():
         raise ValidationError("run root must be a directory")
     cells, provenance, run_spec_raw = read_run_spec(run_root)
+    validate_destination_components(run_root, cells)
     rows, scheduler_raw = read_scheduler_rows(raw_path.resolve(strict=True))
     validate_job_rows(rows, job_id, len(cells))
+    validate_elapsed_caps(cells, rows, job_id)
     run_spec_sha256 = sha256_bytes(run_spec_raw)
     scheduler_sha256 = sha256_bytes(scheduler_raw)
 
@@ -451,47 +554,122 @@ def plan_materialization(
         log_path = run_root / f"slurm-{job_id}_{task_index}.out"
         log = read_regular(log_path, f"task log {log_path.name}")
         root_id = f"{job_id}_{task_index}"
-        planned.append(
-            PlannedManifest(
-                manifest_path,
-                build_manifest(
-                    cell,
-                    provenance,
-                    run_spec_sha256,
-                    scheduler_sha256,
-                    rows[root_id],
-                    job_id,
-                    task_index,
-                    log,
-                    rows,
-                ),
-            )
+        data = build_manifest(
+            cell,
+            provenance,
+            run_spec_sha256,
+            scheduler_sha256,
+            rows[root_id],
+            job_id,
+            task_index,
+            log,
+            rows,
         )
+        validate_planned_manifest(
+            data, run_root, cell, run_spec_sha256, task_index
+        )
+        planned.append(PlannedManifest(manifest_path, data))
     return planned
 
 
-def atomic_create(path: Path, data: bytes) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(f".{path.name}.tmp-{os.getpid()}")
+def open_or_create_directory(
+    parent_fd: int, name: str, label: str
+) -> int:
     try:
-        with temporary.open("xb") as output:
-            output.write(data)
-            output.flush()
-            os.fsync(output.fileno())
-        try:
-            os.link(temporary, path)
-        except FileExistsError as exc:
-            raise ValidationError(f"refusing to replace existing manifest: {path}") from exc
-        directory = os.open(path.parent, os.O_RDONLY)
-        try:
-            os.fsync(directory)
-        finally:
-            os.close(directory)
+        os.mkdir(name, dir_fd=parent_fd)
+    except FileExistsError:
+        pass
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    try:
+        descriptor = os.open(name, flags, dir_fd=parent_fd)
+    except OSError as exc:
+        raise ValidationError(
+            f"destination component {label} must be a directory, not a symlink"
+        ) from exc
+    details = os.fstat(descriptor)
+    if not stat.S_ISDIR(details.st_mode):
+        os.close(descriptor)
+        raise ValidationError(
+            f"destination component {label} must be a directory, not a symlink"
+        )
+    return descriptor
+
+
+def write_all_manifests(run_root: Path, planned: list[PlannedManifest]) -> None:
+    if not planned:
+        return
+    directory_flags = (
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    run_fd = os.open(run_root, directory_flags)
+    cells_fd: int | None = None
+    entries: list[tuple[int, str]] = []
+    linked: list[int] = []
+    try:
+        cells_fd = open_or_create_directory(run_fd, "cells", "cells")
+        for index, item in enumerate(planned):
+            cell_id = item.path.parent.name
+            cell_fd = open_or_create_directory(cells_fd, cell_id, cell_id)
+            temporary = f".manifest.json.tmp-{os.getpid()}-{index}"
+            entries.append((cell_fd, temporary))
+            flags = (
+                os.O_WRONLY
+                | os.O_CREAT
+                | os.O_EXCL
+                | getattr(os, "O_NOFOLLOW", 0)
+            )
+            descriptor = os.open(
+                temporary, flags, 0o600, dir_fd=cell_fd
+            )
+            try:
+                remaining = memoryview(item.data)
+                while remaining:
+                    written = os.write(descriptor, remaining)
+                    remaining = remaining[written:]
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+
+        for cell_fd, temporary in entries:
+            try:
+                os.link(
+                    temporary,
+                    "manifest.json",
+                    src_dir_fd=cell_fd,
+                    dst_dir_fd=cell_fd,
+                    follow_symlinks=False,
+                )
+            except FileExistsError as exc:
+                raise ValidationError(
+                    "refusing to replace existing manifest"
+                ) from exc
+            linked.append(cell_fd)
+            os.fsync(cell_fd)
+    except Exception:
+        for cell_fd in reversed(linked):
+            try:
+                os.unlink("manifest.json", dir_fd=cell_fd)
+                os.fsync(cell_fd)
+            except FileNotFoundError:
+                pass
+        raise
     finally:
-        try:
-            temporary.unlink()
-        except FileNotFoundError:
-            pass
+        for cell_fd, temporary in entries:
+            try:
+                os.unlink(temporary, dir_fd=cell_fd)
+            except FileNotFoundError:
+                pass
+        for cell_fd, _ in entries:
+            os.close(cell_fd)
+        if cells_fd is not None:
+            os.close(cells_fd)
+        os.close(run_fd)
 
 
 def parse_args() -> argparse.Namespace:
@@ -505,11 +683,11 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     args = parse_args()
     try:
+        run_root = args.run_root.resolve(strict=True)
         planned = plan_materialization(
-            args.run_root, args.raw_accounting, args.job_id
+            run_root, args.raw_accounting, args.job_id
         )
-        for item in planned:
-            atomic_create(item.path, item.data)
+        write_all_manifests(run_root, planned)
     except (OSError, ValidationError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2

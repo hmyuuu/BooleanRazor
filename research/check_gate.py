@@ -626,7 +626,9 @@ def check_terminal_metrics(row: dict[str, str], label: str, errors: list[str]) -
         if status != "TIMEOUT" and row.get("timed_out") != "false":
             errors.append(f"{label} non-timeout failure sets timed_out")
         elapsed_text = row.get("elapsed_seconds", "")
-        if elapsed_text != "none":
+        if status == "TIMEOUT" and elapsed_text == "none":
+            errors.append(f"{label} TIMEOUT must record the declared censored cap")
+        elif elapsed_text != "none":
             elapsed = canonical_decimal(elapsed_text, "elapsed_seconds", label, errors)
             if elapsed is not None and timeout is not None and elapsed > timeout:
                 errors.append(f"{label} elapsed_seconds exceeds timeout_seconds")
@@ -1047,12 +1049,25 @@ def check_operational_metadata(
         )
         if any(payload.get(field) != "none" for field in runner_scheduler_fields):
             errors.append(f"{label} runner scheduler fields must all equal none")
-        canonical_decimal(
-            scalar_text(payload.get("cleanup_seconds")) or "",
-            "cleanup_seconds",
-            label,
-            errors,
-        )
+        cleanup_text = scalar_text(payload.get("cleanup_seconds")) or ""
+        if row.get("status") == "TIMEOUT":
+            if (
+                canonical_decimal(
+                    cleanup_text,
+                    "cleanup_seconds",
+                    label,
+                    errors,
+                )
+                is None
+            ):
+                errors.append(
+                    f"{label} timeout cleanup_seconds must be measured, canonical, "
+                    "and nonnegative"
+                )
+        elif cleanup_text != "0.0":
+            errors.append(f"{label} non-timeout cleanup_seconds must equal 0.0")
+        if row.get("elapsed_seconds") == "none":
+            errors.append(f"{label} runner elapsed_seconds must be measured")
         cell = run / "cells" / cell_id
         stdout = regular_bytes(cell / "stdout.log", f"{label} stdout.log", errors)
         stderr = regular_bytes(cell / "stderr.log", f"{label} stderr.log", errors)
