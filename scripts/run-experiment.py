@@ -11,6 +11,7 @@ import os
 import platform
 import re
 import resource
+import secrets
 import signal
 import stat
 import subprocess
@@ -190,7 +191,7 @@ def read_canonical_object(path: Path, label: str) -> tuple[dict[str, object], by
         raise ValidationError(f"cannot read {label}: {exc}") from exc
     try:
         value = json.loads(raw)
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+    except (UnicodeDecodeError, ValueError, RecursionError, OverflowError) as exc:
         raise ValidationError(f"{label} must be valid UTF-8 JSON") from exc
     if not isinstance(value, dict):
         raise ValidationError(f"{label} must be a JSON object")
@@ -522,7 +523,7 @@ def read_stable_regular(path: Path, label: str) -> bytes:
 def decode_json_object(raw: bytes, label: str) -> dict[str, object]:
     try:
         value = json.loads(raw)
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+    except (UnicodeDecodeError, ValueError, RecursionError, OverflowError) as exc:
         raise ValidationError(f"{label} must be valid UTF-8 JSON") from exc
     if not isinstance(value, dict):
         raise ValidationError(f"{label} must be a JSON object")
@@ -678,12 +679,37 @@ def terminal_manifest(
 
 
 def atomic_write(path: Path, data: bytes) -> None:
-    temporary = path.with_name(f".{path.name}.tmp-{os.getpid()}")
+    temporary: Path | None = None
+    descriptor: int | None = None
+    flags = (
+        os.O_WRONLY
+        | os.O_CREAT
+        | os.O_EXCL
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    for _ in range(16):
+        candidate = path.with_name(
+            f".{path.name}.tmp-{os.getpid()}-{secrets.token_hex(16)}"
+        )
+        try:
+            descriptor = os.open(candidate, flags, 0o600)
+        except FileExistsError:
+            continue
+        temporary = candidate
+        break
+    if temporary is None or descriptor is None:
+        raise ValidationError(f"cannot reserve atomic temporary for {path.name}")
     try:
-        with temporary.open("xb") as output:
-            output.write(data)
-            output.flush()
-            os.fsync(output.fileno())
+        try:
+            remaining = memoryview(data)
+            while remaining:
+                written = os.write(descriptor, remaining)
+                if written <= 0:
+                    raise OSError("atomic temporary write made no progress")
+                remaining = remaining[written:]
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
         os.replace(temporary, path)
         directory = os.open(path.parent, os.O_RDONLY)
         try:

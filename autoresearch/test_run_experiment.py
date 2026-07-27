@@ -326,6 +326,36 @@ class RunExperimentTests(unittest.TestCase):
         self.assertEqual(manifest["stdout_sha256"], hashlib.sha256(stdout).hexdigest())
         self.assertEqual(manifest["stderr_sha256"], hashlib.sha256(stderr).hexdigest())
 
+    def test_child_cannot_precreate_runner_atomic_log_temporaries(self) -> None:
+        run_root, metrics_path = self.write_run_spec("2")
+        command = [
+            sys.executable,
+            "-c",
+            "\n".join(
+                (
+                    "import os, sys",
+                    "from pathlib import Path",
+                    "runner_pid = os.getppid()",
+                    "Path(f'.stdout.log.tmp-{runner_pid}').write_bytes(b'blocked')",
+                    "Path(f'.stderr.log.tmp-{runner_pid}').write_bytes(b'blocked')",
+                    "print('owned out')",
+                    "print('owned err', file=sys.stderr)",
+                    "raise SystemExit(17)",
+                )
+            ),
+        ]
+        result = self.invoke(run_root, metrics_path, command)
+
+        self.assertEqual(result.returncode, 17, result.stderr)
+        _, manifest = self.read_manifest(run_root)
+        self.assertEqual(manifest["status"], "NONZERO_EXIT")
+        self.assertEqual(
+            (run_root / "cells/cell-001/stdout.log").read_bytes(), b"owned out\n"
+        )
+        self.assertEqual(
+            (run_root / "cells/cell-001/stderr.log").read_bytes(), b"owned err\n"
+        )
+
     def test_signal_exit_is_normalized_to_128_plus_signal(self) -> None:
         run_root, metrics_path = self.write_run_spec("2")
         result = self.invoke(
@@ -584,6 +614,28 @@ class RunExperimentTests(unittest.TestCase):
                     "artifact_path",
                 ):
                     self.assertEqual(manifest[field], "none")
+
+    def test_integer_digit_limit_metrics_terminalize_as_invalid(self) -> None:
+        run_root, metrics_path = self.write_run_spec("2")
+        table_digest = hashlib.sha256(TABLE_BYTES).hexdigest().encode()
+        raw_metrics = (
+            b'{"completed_table_sha256":"'
+            + table_digest
+            + b'","gates":37,"train_exact":1.0,"verifier":"pass",'
+            + b'"visible_cv_bit_accuracy":0.875,"visible_cv_exact":'
+            + b"9" * 5000
+            + b"}\n"
+        )
+        result = self.invoke(
+            run_root,
+            metrics_path,
+            self.artifact_command(raw_metrics=raw_metrics),
+        )
+
+        self.assertEqual(result.returncode, 65, result.stderr)
+        _, manifest = self.read_manifest(run_root)
+        self.assertEqual(manifest["status"], "INVALID_METRICS")
+        self.assertEqual(manifest["exit_code"], "65")
 
     def test_invalid_artifact_binding_never_produces_success(self) -> None:
         table_digest = hashlib.sha256(TABLE_BYTES).hexdigest()
