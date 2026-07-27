@@ -1,4 +1,5 @@
 pub mod arithmetic;
+pub mod baseline;
 pub mod bits;
 pub mod instances;
 pub mod netlist;
