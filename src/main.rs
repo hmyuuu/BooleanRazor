@@ -8,6 +8,10 @@ use occam_circuit_hmyuuu::baseline::{
     FrozenBaseline, complete_frozen_baseline, complete_frozen_table,
 };
 use occam_circuit_hmyuuu::bits::{encode_bits, encode_lsb};
+use occam_circuit_hmyuuu::care_bdd::{
+    BlindOrderScorer, EmptyCarePolicy, blind_beam_search, blind_search_csv_bytes,
+    blind_seed_orders, complete_care_set,
+};
 use occam_circuit_hmyuuu::instances::{
     InstanceSpec, MYSTERY_INSTANCES, complete_table, instance_by_slug,
 };
@@ -29,7 +33,12 @@ const USAGE: &str = "usage:
   occam-circuit-hmyuuu search-order DATA_ROOT EXACT_SLUG --beam N --rounds N
   occam-circuit-hmyuuu frozen-baseline PUBLIC_ROOT OPAQUE_ID OUTPUT_DIR --method zero-fill|hamming-1nn --metrics-json OUTPUT_DIR/metrics.json
   occam-circuit-hmyuuu export-visible PUBLIC_ROOT OPAQUE_ID OUTPUT_DIR --seed 64LOWERHEX --folds 5
+  occam-circuit-hmyuuu learn-care PUBLIC_ROOT OPAQUE_ID OUTPUT_DIR --folds 5 --seed 64LOWERHEX --policy reuse-sibling --max-order-evals 32
   occam-circuit-hmyuuu resynthesize INPUT_CIRCUIT OUTPUT_DIR --max-cut-inputs 6 --deadline-seconds 285 --metrics-json OUTPUT_DIR/metrics.json";
+
+const CARE_BEAM_WIDTH: usize = 4;
+const CARE_MAX_ORDER_EVALUATIONS: usize = 32;
+const CARE_METHOD: &str = "care-bdd-reuse-sibling";
 
 struct Candidate {
     spec: &'static InstanceSpec,
@@ -37,6 +46,16 @@ struct Candidate {
     prediction_bytes: Vec<u8>,
     training_rows: usize,
     gates: usize,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct CareArtifacts {
+    completed: CompleteTable,
+    completed_table: Vec<u8>,
+    circuit: Vec<u8>,
+    metrics: Vec<u8>,
+    artifact: Vec<u8>,
+    search: Vec<u8>,
 }
 
 struct CleanupDir {
@@ -80,6 +99,7 @@ fn run(arguments: Vec<std::ffi::OsString>) -> Result<(), String> {
         Some("search-order") => search_order(&arguments[1..]),
         Some("frozen-baseline") => frozen_baseline(&arguments[1..]),
         Some("export-visible") => export_visible(&arguments[1..]),
+        Some("learn-care") => learn_care(&arguments[1..]),
         #[cfg(feature = "sat")]
         Some("resynthesize") => resynthesize(&arguments[1..]),
         _ => Err(USAGE.into()),
@@ -105,6 +125,149 @@ fn resynthesize(arguments: &[std::ffi::OsString]) -> Result<(), String> {
     let output_dir = Path::new(&arguments[1]);
     let metrics_path = Path::new(&arguments[7]);
     run_resynthesis_command(input_path, output_dir, metrics_path)
+}
+
+fn learn_care(arguments: &[std::ffi::OsString]) -> Result<(), String> {
+    const ALLOWED_FLAGS: [&str; 4] = ["--folds", "--seed", "--policy", "--max-order-evals"];
+    for argument in arguments.iter().skip(3) {
+        if let Some(flag) = argument.to_str().filter(|value| value.starts_with("--"))
+            && !ALLOWED_FLAGS.contains(&flag)
+        {
+            return Err(format!("unknown flag {flag}"));
+        }
+    }
+    if arguments.len() != 11
+        || arguments[3] != "--folds"
+        || arguments[5] != "--seed"
+        || arguments[7] != "--policy"
+        || arguments[9] != "--max-order-evals"
+    {
+        return Err(USAGE.into());
+    }
+
+    let root = Path::new(&arguments[0]);
+    let opaque_id = arguments[1]
+        .to_str()
+        .ok_or_else(|| "opaque ID is not valid UTF-8".to_string())?;
+    let output_dir = Path::new(&arguments[2]);
+    let folds = arguments[4]
+        .to_str()
+        .ok_or_else(|| "--folds is not valid UTF-8".to_string())?
+        .parse::<usize>()
+        .map_err(|_| "--folds must be a positive integer".to_string())?;
+    if folds != 5 {
+        return Err("--folds must equal the frozen value 5".into());
+    }
+    let seed = arguments[6]
+        .to_str()
+        .ok_or_else(|| "--seed is not valid UTF-8".to_string())?;
+    validate_selection_seed(seed)?;
+    let expected_seed =
+        sha256_hex(format!("{}{CARE_METHOD}{opaque_id}", tracked_public_commitment()?).as_bytes());
+    if seed != expected_seed {
+        return Err("--seed must equal the frozen algorithm seed".into());
+    }
+    let policy = match arguments[8].to_str() {
+        Some("reuse-sibling") => EmptyCarePolicy::ReuseSibling,
+        Some("zero") => {
+            return Err("--policy must equal the frozen value reuse-sibling".into());
+        }
+        _ => return Err("--policy must be reuse-sibling".into()),
+    };
+    let max_order_evaluations = arguments[10]
+        .to_str()
+        .ok_or_else(|| "--max-order-evals is not valid UTF-8".to_string())?
+        .parse::<usize>()
+        .map_err(|_| "--max-order-evals must be a positive integer".to_string())?;
+    if max_order_evaluations == 0 {
+        return Err("--max-order-evals must be positive".into());
+    }
+    if max_order_evaluations != CARE_MAX_ORDER_EVALUATIONS {
+        return Err(format!(
+            "--max-order-evals must equal the frozen value {CARE_MAX_ORDER_EVALUATIONS}"
+        ));
+    }
+
+    let suite = PublicSuite::load_frozen(root)?;
+    let instance = suite.instance(opaque_id)?;
+    let artifacts = build_care_artifacts(instance, folds, seed, policy, max_order_evaluations)?;
+    atomic_output(output_dir, |stage| {
+        fs::write(
+            stage.join("completed-table.csv"),
+            &artifacts.completed_table,
+        )
+        .map_err(|error| format!("write completed-table.csv: {error}"))?;
+        fs::write(stage.join("circuit.txt"), &artifacts.circuit)
+            .map_err(|error| format!("write circuit.txt: {error}"))?;
+        fs::write(stage.join("artifact.json"), &artifacts.artifact)
+            .map_err(|error| format!("write artifact.json: {error}"))?;
+        fs::write(stage.join("search.csv"), &artifacts.search)
+            .map_err(|error| format!("write search.csv: {error}"))?;
+        fs::write(stage.join("metrics.json"), &artifacts.metrics)
+            .map_err(|error| format!("write metrics.json: {error}"))
+    })
+}
+
+fn build_care_artifacts(
+    instance: &occam_circuit_hmyuuu::reblind::PublicInstance,
+    folds: usize,
+    seed: &str,
+    policy: EmptyCarePolicy,
+    max_order_evaluations: usize,
+) -> Result<CareArtifacts, String> {
+    if max_order_evaluations == 0 {
+        return Err("maximum order evaluations must be positive".into());
+    }
+    let seeds = blind_seed_orders(instance.input_bits)?;
+    let mut scorer = BlindOrderScorer::new(&instance.train, folds, seed)?;
+    let search = blind_beam_search(
+        &mut scorer,
+        &seeds,
+        policy,
+        CARE_BEAM_WIDTH,
+        max_order_evaluations,
+        max_order_evaluations,
+    )?;
+    let winner = search
+        .finalists
+        .first()
+        .ok_or_else(|| "blind order search returned no finalist".to_string())?;
+    let (completed, circuit) = complete_care_set(&instance.train, &winner.order, policy)?;
+    instance.train.validate_against(&completed)?;
+
+    let completed_table = completed_table_csv_bytes(&completed);
+    let circuit = circuit.to_netlist()?.into_bytes();
+    let gates = verify_emitted_circuit(&circuit, &completed)?;
+    let completed_sha256 = sha256_hex(&completed_table);
+    let circuit_sha256 = sha256_hex(&circuit);
+    let metrics = format!(
+        "{{\"completed_table_sha256\":\"{completed_sha256}\",\"gates\":{gates},\"train_exact\":1.0,\"verifier\":\"not_run\",\"visible_cv_bit_accuracy\":{},\"visible_cv_exact\":{}}}\n",
+        decimal_ratio(
+            winner.validation_bit_correct,
+            winner.validation_bits,
+            "validation bit accuracy",
+        )?,
+        decimal_ratio(
+            winner.validation_exact_rows,
+            winner.validation_rows,
+            "validation exact-row accuracy",
+        )?,
+    )
+    .into_bytes();
+    let artifact = format!(
+        "{{\"circuit_path\":\"circuit.txt\",\"circuit_sha256\":\"{circuit_sha256}\",\"completed_table_path\":\"completed-table.csv\",\"completed_table_sha256\":\"{completed_sha256}\",\"equivalence\":\"pass\",\"schema_version\":1}}\n"
+    )
+    .into_bytes();
+    let search = blind_search_csv_bytes(&instance.opaque_id, &search.finalists)?;
+
+    Ok(CareArtifacts {
+        completed,
+        completed_table,
+        circuit,
+        metrics,
+        artifact,
+        search,
+    })
 }
 
 fn frozen_baseline(arguments: &[std::ffi::OsString]) -> Result<(), String> {
@@ -306,6 +469,13 @@ fn decimal(value: f64) -> String {
     } else {
         value.to_string()
     }
+}
+
+fn decimal_ratio(numerator: usize, denominator: usize, label: &str) -> Result<String, String> {
+    if denominator == 0 || numerator > denominator {
+        return Err(format!("{label} is not a valid accuracy ratio"));
+    }
+    Ok(decimal(numerator as f64 / denominator as f64))
 }
 
 fn tracked_public_commitment() -> Result<String, String> {
@@ -929,20 +1099,22 @@ where
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{Duration, Instant};
 
     use super::*;
+
+    static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
 
     struct TempDir(PathBuf);
 
     impl TempDir {
         fn new() -> Self {
-            let nonce = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos();
-            let path =
-                std::env::temp_dir().join(format!("occam-rollback-{}-{nonce}", std::process::id()));
+            let path = std::env::temp_dir().join(format!(
+                "occam-rollback-{}-{}",
+                std::process::id(),
+                NEXT_TEMP.fetch_add(1, Ordering::Relaxed)
+            ));
             fs::create_dir(&path).unwrap();
             Self(path)
         }
@@ -1017,6 +1189,155 @@ mod tests {
         let emitted = b"INPUTS 1\nw1 = XOR x1 x1\nOUTPUTS w1\n";
 
         assert_eq!(verify_emitted_circuit(emitted, &table).unwrap(), 1);
+    }
+
+    #[test]
+    fn synthetic_learn_care_artifacts_are_deterministic_exact_and_task10_shaped() {
+        let instance = occam_circuit_hmyuuu::reblind::PublicInstance {
+            opaque_id: "synthetic-only".into(),
+            input_bits: 4,
+            output_bits: 2,
+            train: PartialTable {
+                ninputs: 4,
+                noutputs: 2,
+                rows: (0..13)
+                    .map(|mask| {
+                        let output = ((mask & 1) ^ ((mask >> 1) & 1)) | (((mask >> 2) & 1) << 1);
+                        (encode_lsb(mask as u64, 4), encode_lsb(output as u64, 2))
+                    })
+                    .collect(),
+            },
+        };
+        let seed = "01".repeat(32);
+
+        let first = build_care_artifacts(
+            &instance,
+            5,
+            &seed,
+            occam_circuit_hmyuuu::care_bdd::EmptyCarePolicy::ReuseSibling,
+            8,
+        )
+        .unwrap();
+        let second = build_care_artifacts(
+            &instance,
+            5,
+            &seed,
+            occam_circuit_hmyuuu::care_bdd::EmptyCarePolicy::ReuseSibling,
+            8,
+        )
+        .unwrap();
+
+        assert_eq!(first, second);
+        assert!(first.completed_table.starts_with(b"input,output\n"));
+        assert!(first.circuit.starts_with(b"INPUTS 4\n"));
+        assert!(first.search.starts_with(b"instance,rank,"));
+        let metrics = std::str::from_utf8(&first.metrics).unwrap();
+        assert!(metrics.ends_with("}\n"));
+        assert!(!metrics.contains(' '));
+        assert_eq!(metrics.matches("\":").count(), 6);
+        for key in [
+            "\"completed_table_sha256\"",
+            "\"gates\"",
+            "\"train_exact\":1.0",
+            "\"verifier\":\"not_run\"",
+            "\"visible_cv_bit_accuracy\"",
+            "\"visible_cv_exact\"",
+        ] {
+            assert!(metrics.contains(key), "missing metrics key {key}");
+        }
+        assert!(!metrics.contains("\"verifier\":\"pass\""));
+        let completed_sha256 = sha256_hex(&first.completed_table);
+        let circuit_sha256 = sha256_hex(&first.circuit);
+        assert_eq!(
+            first.artifact,
+            format!(
+                "{{\"circuit_path\":\"circuit.txt\",\"circuit_sha256\":\"{circuit_sha256}\",\"completed_table_path\":\"completed-table.csv\",\"completed_table_sha256\":\"{completed_sha256}\",\"equivalence\":\"pass\",\"schema_version\":1}}\n"
+            )
+            .into_bytes()
+        );
+        assert!(metrics.contains(&format!(
+            "\"gates\":{}",
+            Netlist::parse(std::str::from_utf8(&first.circuit).unwrap())
+                .unwrap()
+                .gate_count()
+        )));
+        assert!(metrics.contains(&format!(
+            "\"completed_table_sha256\":\"{completed_sha256}\""
+        )));
+        assert_eq!(
+            Netlist::parse(std::str::from_utf8(&first.circuit).unwrap())
+                .unwrap()
+                .evaluate_all()
+                .unwrap(),
+            first.completed.outputs
+        );
+    }
+
+    #[test]
+    #[ignore = "explicit 20-bit timing calibration; run before freezing max-order-evals"]
+    fn synthetic_twenty_bit_care_cell_calibration() {
+        const INPUT_BITS: usize = 20;
+        const OUTPUT_BITS: usize = 21;
+        const VISIBLE_ROWS: usize = 104_857;
+        const DOMAIN_MASK: usize = (1usize << INPUT_BITS) - 1;
+
+        let train = PartialTable {
+            ninputs: INPUT_BITS,
+            noutputs: OUTPUT_BITS,
+            rows: (0..VISIBLE_ROWS)
+                .map(|row| {
+                    let mask = row.wrapping_mul(0x9e37b) & DOMAIN_MASK;
+                    let mut output = 0u64;
+                    for bit in 0..OUTPUT_BITS {
+                        let a = (mask >> (bit % INPUT_BITS)) & 1;
+                        let b = (mask >> ((bit + 3) % INPUT_BITS)) & 1;
+                        let c = (mask >> ((bit + 7) % INPUT_BITS)) & 1;
+                        output |= ((a ^ (b & c)) as u64) << bit;
+                    }
+                    (
+                        encode_lsb(mask as u64, INPUT_BITS),
+                        encode_lsb(output, OUTPUT_BITS),
+                    )
+                })
+                .collect(),
+        };
+        let instance = occam_circuit_hmyuuu::reblind::PublicInstance {
+            opaque_id: "synthetic-20-bit-calibration".into(),
+            input_bits: INPUT_BITS,
+            output_bits: OUTPUT_BITS,
+            train,
+        };
+        let seed = "5a".repeat(32);
+        let max_order_evaluations = std::env::var("CARE_CALIBRATION_EVALS")
+            .ok()
+            .map(|value| value.parse::<usize>().unwrap())
+            .unwrap_or(1);
+        assert!(max_order_evaluations > 0);
+        let started = Instant::now();
+        let artifacts = build_care_artifacts(
+            &instance,
+            5,
+            &seed,
+            EmptyCarePolicy::ReuseSibling,
+            max_order_evaluations,
+        )
+        .unwrap();
+        let elapsed = started.elapsed();
+
+        eprintln!(
+            "care-calibration rows={VISIBLE_ROWS} max_order_evals={max_order_evaluations} elapsed_seconds={:.6} completed_bytes={} circuit_bytes={}",
+            elapsed.as_secs_f64(),
+            artifacts.completed_table.len(),
+            artifacts.circuit.len(),
+        );
+        assert!(elapsed < Duration::from_secs(300));
+        assert_eq!(
+            Netlist::parse(std::str::from_utf8(&artifacts.circuit).unwrap())
+                .unwrap()
+                .evaluate_all()
+                .unwrap(),
+            artifacts.completed.outputs
+        );
     }
 
     #[test]

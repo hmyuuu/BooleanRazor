@@ -22,6 +22,7 @@ skills: ## Validate the vendored local Ion skills
 test-python: ## Run protocol and autoresearch unit tests
 	$(PYTEST) -q \
 		research/test_check_gate.py \
+		research/test_care_bdd_design.py \
 		autoresearch/test_autoresearch_protocol.py
 
 test-hpc: ## Test bounded-run and Slurm adapters without touching a cluster

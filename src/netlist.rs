@@ -273,3 +273,8 @@ pub(crate) fn serialize(circuit: &Circuit) -> Result<String, String> {
     text.push('\n');
     Ok(text)
 }
+
+pub(crate) fn serialized_challenge_gate_count(circuit: &Circuit) -> Result<usize, String> {
+    let text = serialize(circuit)?;
+    Ok(Netlist::parse(&text)?.gate_count())
+}

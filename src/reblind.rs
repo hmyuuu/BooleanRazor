@@ -36,28 +36,7 @@ impl PublicInstance {
     }
 
     pub fn visible_folds(&self, seed_hex: &str, folds: usize) -> Result<Vec<Vec<usize>>, String> {
-        if folds == 0 {
-            return Err("fold count must be positive".into());
-        }
-        let seed = decode_selection_seed(seed_hex)?;
-        let mut ranked: Vec<_> = self
-            .train
-            .rows
-            .iter()
-            .enumerate()
-            .map(|(row, (input, _))| {
-                let mut hasher = Sha256::new();
-                hasher.update(&seed);
-                hasher.update(encode_bits(input).as_bytes());
-                (hasher.finalize().to_vec(), row_index(input), row)
-            })
-            .collect();
-        ranked.sort();
-        let mut result = vec![Vec::new(); folds];
-        for (rank, (_, _, row)) in ranked.into_iter().enumerate() {
-            result[rank % folds].push(row);
-        }
-        Ok(result)
+        visible_folds(&self.train, seed_hex, folds)
     }
 
     pub fn import_completed_table(&self, csv: impl AsRef<[u8]>) -> Result<CompleteTable, String> {
@@ -107,6 +86,34 @@ impl PublicInstance {
         self.train.validate_against(&completed)?;
         Ok(completed)
     }
+}
+
+pub fn visible_folds(
+    table: &PartialTable,
+    seed_hex: &str,
+    folds: usize,
+) -> Result<Vec<Vec<usize>>, String> {
+    if folds == 0 {
+        return Err("fold count must be positive".into());
+    }
+    let seed = decode_selection_seed(seed_hex)?;
+    let mut ranked: Vec<_> = table
+        .rows
+        .iter()
+        .enumerate()
+        .map(|(row, (input, _))| {
+            let mut hasher = Sha256::new();
+            hasher.update(&seed);
+            hasher.update(encode_bits(input).as_bytes());
+            (hasher.finalize().to_vec(), row_index(input), row)
+        })
+        .collect();
+    ranked.sort();
+    let mut result = vec![Vec::new(); folds];
+    for (rank, (_, _, row)) in ranked.into_iter().enumerate() {
+        result[rank % folds].push(row);
+    }
+    Ok(result)
 }
 
 pub fn validate_selection_seed(seed_hex: &str) -> Result<(), String> {
