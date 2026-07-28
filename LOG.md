@@ -38,8 +38,13 @@ Parent commit:
 Hypothesis commit:
 `016d0d1` (`research: precommit care-BDD hypothesis`).
 
-The synthetic-only implementation commit and its clean-tree digest will be
-recorded in a follow-up log commit before any public bundle is mounted.
+Synthetic-only implementation commit:
+`c757952b193a63706b5a1d84d436f7de88fec836`.
+
+Its clean committed tree digest, computed from the raw bytes of
+`git ls-tree -rz --full-tree HEAD`, is
+`46353f189eb89dc3e9c8807d3f671abf010075679968ee8220121b74bb154ec3`.
+No public bundle was mounted before either identifier was recorded.
 
 ## Permitted data
 
