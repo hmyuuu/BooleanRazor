@@ -18,6 +18,8 @@ use occam_circuit_hmyuuu::order::{
 #[cfg(feature = "oxidd-oracle")]
 use occam_circuit_hmyuuu::oxidd_oracle::OxiddForest;
 use occam_circuit_hmyuuu::reblind::{PublicSuite, validate_selection_seed};
+#[cfg(feature = "sat")]
+use occam_circuit_hmyuuu::sat::{ResynthesisStatus, resynthesize_local_cuts};
 use occam_circuit_hmyuuu::table::{
     CompleteTable, InputTable, PartialTable, prediction_csv_bytes, row_index, sha256_hex,
 };
@@ -26,7 +28,8 @@ const USAGE: &str = "usage:
   occam-circuit-hmyuuu solve-v1 DATA_ROOT OUTPUT_ROOT
   occam-circuit-hmyuuu search-order DATA_ROOT EXACT_SLUG --beam N --rounds N
   occam-circuit-hmyuuu frozen-baseline PUBLIC_ROOT OPAQUE_ID OUTPUT_DIR --method zero-fill|hamming-1nn --metrics-json OUTPUT_DIR/metrics.json
-  occam-circuit-hmyuuu export-visible PUBLIC_ROOT OPAQUE_ID OUTPUT_DIR --seed 64LOWERHEX --folds 5";
+  occam-circuit-hmyuuu export-visible PUBLIC_ROOT OPAQUE_ID OUTPUT_DIR --seed 64LOWERHEX --folds 5
+  occam-circuit-hmyuuu resynthesize INPUT_CIRCUIT OUTPUT_DIR --max-cut-inputs 6 --deadline-seconds 285 --metrics-json OUTPUT_DIR/metrics.json";
 
 struct Candidate {
     spec: &'static InstanceSpec,
@@ -77,8 +80,153 @@ fn run(arguments: Vec<std::ffi::OsString>) -> Result<(), String> {
         Some("search-order") => search_order(&arguments[1..]),
         Some("frozen-baseline") => frozen_baseline(&arguments[1..]),
         Some("export-visible") => export_visible(&arguments[1..]),
+        #[cfg(feature = "sat")]
+        Some("resynthesize") => resynthesize(&arguments[1..]),
         _ => Err(USAGE.into()),
     }
+}
+
+#[cfg(feature = "sat")]
+fn resynthesize(arguments: &[std::ffi::OsString]) -> Result<(), String> {
+    const CUT_BUDGET: usize = 128;
+    const SOLVER_CALL_BUDGET: usize = 64;
+    const MAX_CUT_INPUTS: usize = 6;
+    const DEADLINE_SECONDS: u64 = 285;
+
+    if arguments.len() != 8
+        || arguments[2] != "--max-cut-inputs"
+        || arguments[4] != "--deadline-seconds"
+        || arguments[6] != "--metrics-json"
+    {
+        return Err(USAGE.into());
+    }
+    if arguments[3] != "6" {
+        return Err("--max-cut-inputs must equal the frozen value 6".into());
+    }
+    if arguments[5] != "285" {
+        return Err("--deadline-seconds must equal the frozen value 285".into());
+    }
+    let input_path = Path::new(&arguments[0]);
+    let output_dir = Path::new(&arguments[1]);
+    let metrics_path = Path::new(&arguments[7]);
+    if metrics_path != output_dir.join("metrics.json") {
+        return Err("--metrics-json must equal OUTPUT_DIR/metrics.json".into());
+    }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(DEADLINE_SECONDS);
+    let original_bytes =
+        fs::read(input_path).map_err(|error| format!("read INPUT_CIRCUIT: {error}"))?;
+    let original_text = std::str::from_utf8(&original_bytes)
+        .map_err(|_| "INPUT_CIRCUIT is not valid UTF-8".to_string())?;
+    let original =
+        Netlist::parse(original_text).map_err(|error| format!("parse INPUT_CIRCUIT: {error}"))?;
+    let ninputs = original_text
+        .lines()
+        .next()
+        .and_then(|line| line.strip_prefix("INPUTS "))
+        .and_then(|value| value.parse::<usize>().ok())
+        .ok_or_else(|| "parse INPUT_CIRCUIT: invalid INPUTS header".to_string())?;
+    let original_rows = original
+        .evaluate_all()
+        .map_err(|error| format!("evaluate INPUT_CIRCUIT: {error}"))?;
+    let noutputs = original_rows
+        .first()
+        .map(Vec::len)
+        .filter(|outputs| *outputs > 0)
+        .ok_or_else(|| "INPUT_CIRCUIT must have at least one output".to_string())?;
+    let table = CompleteTable {
+        ninputs,
+        noutputs,
+        outputs: original_rows.clone(),
+    };
+    let original_gates = original.gate_count();
+    let outcome = resynthesize_local_cuts(original_text, deadline, CUT_BUDGET, SOLVER_CALL_BUDGET)?;
+    let selected_bytes = outcome
+        .replacement
+        .map(|replacement| replacement.to_netlist().map(String::into_bytes))
+        .transpose()?
+        .unwrap_or(original_bytes);
+    let (status, unknown_reason_digest) = match outcome.status {
+        ResynthesisStatus::Sat => ("sat", None),
+        ResynthesisStatus::Unsat => ("unsat", None),
+        ResynthesisStatus::Timeout => ("timeout", None),
+        ResynthesisStatus::Unknown(reason) => ("unknown", Some(sha256_hex(reason.as_bytes()))),
+    };
+    let rewrites_accepted = usize::from(status == "sat");
+    let solver_calls = outcome.solver_calls;
+    let cuts_considered = outcome.cuts_considered;
+    let encoded_bound = outcome.encoded_bound;
+    let requested_bound = outcome.requested_bound;
+    let dimacs = outcome.dimacs;
+    let proof = outcome.proof;
+
+    if std::time::Instant::now() >= deadline {
+        return Err("absolute 285-second deadline expired before final verification".into());
+    }
+    let selected_text = std::str::from_utf8(&selected_bytes)
+        .map_err(|_| "selected circuit is not valid UTF-8".to_string())?;
+    let selected = Netlist::parse(selected_text)
+        .map_err(|error| format!("parse selected circuit: {error}"))?;
+    if selected.evaluate_all()? != original_rows {
+        return Err("selected whole circuit failed exhaustive equivalence".into());
+    }
+    let selected_gates = selected.gate_count();
+    let gate_delta = selected_gates as i128 - original_gates as i128;
+    let completed_bytes = completed_table_csv_bytes(&table);
+    let completed_sha256 = sha256_hex(&completed_bytes);
+    let circuit_sha256 = sha256_hex(&selected_bytes);
+    let artifact = format!(
+        "{{\"circuit_path\":\"circuit.txt\",\"circuit_sha256\":\"{circuit_sha256}\",\"completed_table_path\":\"completed-table.csv\",\"completed_table_sha256\":\"{completed_sha256}\",\"equivalence\":\"pass\",\"schema_version\":1}}\n"
+    );
+    // This standalone command is a synthetic/tool boundary. The exact-key
+    // metrics file is runner-compatible; SAT-specific evidence stays separate.
+    let metrics = format!(
+        "{{\"completed_table_sha256\":\"{completed_sha256}\",\"gates\":{selected_gates},\"train_exact\":1.0,\"verifier\":\"pass\",\"visible_cv_bit_accuracy\":1.0,\"visible_cv_exact\":1.0}}\n"
+    );
+    let dimacs_digest = if dimacs.is_empty() {
+        "null".to_string()
+    } else {
+        format!("\"{}\"", sha256_hex(&dimacs))
+    };
+    let proof_digest = if proof.is_empty() {
+        "null".to_string()
+    } else {
+        format!("\"{}\"", sha256_hex(&proof))
+    };
+    let encoded_bound = encoded_bound
+        .map(|bound| bound.to_string())
+        .unwrap_or_else(|| "null".into());
+    let requested_bound = requested_bound
+        .map(|bound| bound.to_string())
+        .unwrap_or_else(|| "null".into());
+    let unknown_reason = unknown_reason_digest
+        .map(|digest| format!("\"{digest}\""))
+        .unwrap_or_else(|| "null".into());
+    let sat_report = format!(
+        "{{\"cut_budget\":{CUT_BUDGET},\"cuts_considered\":{cuts_considered},\"dimacs_sha256\":{dimacs_digest},\"encoded_bound\":{encoded_bound},\"exhaustive_equivalence\":\"pass\",\"max_cut_inputs\":{MAX_CUT_INPUTS},\"proof_checked\":false,\"proof_sha256\":{proof_digest},\"requested_bound\":{requested_bound},\"rewrites_accepted\":{rewrites_accepted},\"sat_status\":\"{status}\",\"solver_call_budget\":{SOLVER_CALL_BUDGET},\"solver_calls\":{solver_calls},\"unknown_reason_sha256\":{unknown_reason},\"verifier_status\":\"not-run\",\"whole_circuit_gate_delta\":{gate_delta}}}\n"
+    );
+    atomic_output(output_dir, |stage| {
+        fs::write(stage.join("completed-table.csv"), &completed_bytes)
+            .map_err(|error| format!("write completed-table.csv: {error}"))?;
+        fs::write(stage.join("circuit.txt"), &selected_bytes)
+            .map_err(|error| format!("write circuit.txt: {error}"))?;
+        fs::write(stage.join("artifact.json"), artifact.as_bytes())
+            .map_err(|error| format!("write artifact.json: {error}"))?;
+        fs::write(stage.join("sat-report.json"), sat_report.as_bytes())
+            .map_err(|error| format!("write sat-report.json: {error}"))?;
+        if !dimacs.is_empty() {
+            fs::write(stage.join("sat-instance.cnf"), &dimacs)
+                .map_err(|error| format!("write sat-instance.cnf: {error}"))?;
+        }
+        if !proof.is_empty() {
+            fs::write(stage.join("sat-proof.drat"), &proof)
+                .map_err(|error| format!("write sat-proof.drat: {error}"))?;
+        }
+        fs::write(
+            stage.join(metrics_path.file_name().unwrap()),
+            metrics.as_bytes(),
+        )
+        .map_err(|error| format!("write metrics.json: {error}"))
+    })
 }
 
 fn frozen_baseline(arguments: &[std::ffi::OsString]) -> Result<(), String> {

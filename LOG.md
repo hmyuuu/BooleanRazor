@@ -80,21 +80,70 @@ authorized or appropriate for this CPU-only hypothesis.
 
 ## Result: accuracy, gates, runtime, memory, verifier
 
-No algorithm result exists yet.
+Synthetic-only implementation evidence:
+
+- The exact small-function test proves that two-input XOR is `UNSAT` at bound
+  zero and independently exhaustively verifies a one-gate SAT model at bound
+  one. A constant-zero output is recovered at zero reachable gates by the
+  at-most interface.
+- The multi-output fixture is `UNSAT` through one gate and SAT at exactly two
+  reachable gates. The verified model shares the first gate between the two
+  outputs.
+- The synthetic standalone rewrite reduces a three-gate OR/AND/XOR expression
+  for XOR to one reachable challenge gate. Two fresh command outputs are
+  byte-identical and exhaustively equivalent.
+- The wider synthetic fixture finds the same three-to-one local replacement
+  inside a seven-primary-input circuit. After reinsertion the whole circuit is
+  exhaustively equivalent and falls from four to two reachable challenge
+  gates.
+- An already-expired synthesis deadline returns `Timeout` before solver work;
+  an expired rewrite deadline returns `Timeout` during cut enumeration with
+  zero solver calls. A solver interruption without the deadline signal is
+  classified as `Unknown`, never `UNSAT`.
+- The pinned `rustsat-cadical` 0.7.5 binding bundles CaDiCaL 2.2.1 and exposes
+  DRAT tracing. The command preserves the final frozen DIMACS and any final
+  UNSAT trace as hash-bound artifacts. No independent DRAT checker is pinned,
+  so `proof_checked` is false and no certificate claim is made.
+- CLI tests reject every resource override except the literal six-input and
+  285-second values. Reports retain the fixed 128-cut and 64-solver-call
+  budgets.
+
+Focused RED evidence was retained during development:
+
+- `cargo test --locked --features sat --test sat` first failed with unresolved
+  import `occam_circuit_hmyuuu::sat`.
+- The initial command tests failed on the usage boundary before the
+  `resynthesize` command existed.
+- The wider local-window test failed because the initial whole-circuit-only
+  implementation rejected seven primary inputs.
+- The trace tests failed before `sat-proof.drat` and `sat-instance.cnf` were
+  preserved.
+- The rewrite-deadline test initially returned an error instead of `Timeout`,
+  and the interruption-classification unit test initially failed to compile
+  before the classifier existed.
+
+Fresh precommit verification:
+
+- `cargo test --locked --features sat --release --manifest-path Cargo.toml
+  --test sat -- --nocapture`: 9 passed, 0 failed in 0.50 seconds.
+- `make test`: 29 protocol tests plus 29 subtests passed; 181 runner/cluster
+  tests plus 56 subtests passed; 101 Rust tests passed; formatting passed; and
+  `research/check_gate.py --phase protocol` passed.
+
+No public or sealed rows, public baseline outcomes, private digests, or HPC
+resources were used. Peak memory was not measured by these development test
+commands and no claim is made for it.
 
 Clean-worktree baseline:
 
-- `make setup`: passed;
+- `make setup`: passed after allowing access to the existing shared uv cache;
 - `make skills`: zero errors, warnings only;
-- first `make test`: Python suites passed, then the pre-existing
-  `failed_install_rolls_back_every_artifact_and_removes_transaction_dirs`
-  test failed at `src/main.rs:920` with `AlreadyExists` while creating its
-  PID-plus-clock temporary directory;
-- the focused failing test, the full binary tests in serial and parallel, and
-  a fresh complete `make test` all passed without source changes.
+- `make test`: 29 protocol tests plus 29 subtests, 181 runner/cluster tests
+  plus 56 subtests, every Rust test, and the protocol gate passed.
 
-The nonreproducing baseline failure is retained as flaky test-isolation
-evidence and is not silently attributed to Task 12.
+The preflight's earlier nonreproducing `AlreadyExists` failure remains retained
+as flaky test-isolation evidence. It did not reproduce in this worktree and
+the unrelated helper was not modified.
 
 ## Failure signal and interpretation
 
@@ -108,8 +157,8 @@ missing verifier evidence, or violation of the 300-second cell cap.
 
 ## Next pivot
 
-Implement exact small-table synthesis test-first, then add deterministic cut
-replacement and the runner-compatible artifact boundary. Review the
-synthetic-only commit before mounting any public data. If no verified local
-rewrite improves mystery-C from 168 gates, retain the exact control and move
-to the blind care-BDD comparison rather than broadening claims or time limits.
+Review the synthetic-only commit before mounting any public data. Standalone
+results remain tool evidence only. Any later benchmark cell must compose this
+rewriter inside a `PublicSuite`-backed learner and satisfy the Task 10 artifact,
+training-consistency, visible-CV, and verifier contract without changing these
+budgets.

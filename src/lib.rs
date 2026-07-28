@@ -8,5 +8,7 @@ pub mod order;
 pub mod oxidd_oracle;
 pub mod reblind;
 pub mod robdd;
+#[cfg(feature = "sat")]
+pub mod sat;
 pub mod table;
 pub mod xag;

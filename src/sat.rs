@@ -1,0 +1,1385 @@
+use std::collections::{BTreeSet, VecDeque};
+use std::fs;
+use std::ops::Not;
+use std::path::PathBuf;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, AtomicU64, Ordering},
+};
+use std::time::Instant;
+
+use rustsat::solvers::{ControlSignal, Solve, SolverResult, Terminate};
+use rustsat::types::{Clause, Lit as SatLit, TernaryVal, Var};
+use rustsat_cadical::{CaDiCaL, ProofFormat};
+
+use crate::bits::encode_lsb;
+use crate::netlist::Netlist;
+use crate::table::CompleteTable;
+use crate::xag::{Circuit, Lit, Op, Xag};
+
+const MAX_CUT_INPUTS: usize = 6;
+static NEXT_PROOF_TRACE: AtomicU64 = AtomicU64::new(0);
+
+struct ProofTrace(PathBuf);
+
+impl ProofTrace {
+    fn new() -> Self {
+        Self(std::env::temp_dir().join(format!(
+            "occam-cadical-proof-{}-{}.drat",
+            std::process::id(),
+            NEXT_PROOF_TRACE.fetch_add(1, Ordering::Relaxed)
+        )))
+    }
+}
+
+impl Drop for ProofTrace {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.0);
+    }
+}
+
+#[derive(Debug)]
+pub enum SatResult {
+    Sat(Circuit),
+    Unsat,
+    Timeout,
+    Unknown(String),
+}
+
+#[derive(Clone, Copy)]
+enum RowValue {
+    Constant(bool),
+    Variable(Var),
+}
+
+struct GateVariables {
+    xor: Var,
+    left_select: Vec<Var>,
+    left_inverted: Var,
+    left_values: Vec<Var>,
+    right_select: Vec<Var>,
+    right_inverted: Var,
+    right_values: Vec<Var>,
+    values: Vec<Var>,
+}
+
+struct OutputVariables {
+    select: Vec<Var>,
+    inverted: Var,
+}
+
+struct Encoding {
+    clauses: Vec<Vec<SatLit>>,
+    next_variable: u32,
+    gates: Vec<GateVariables>,
+    outputs: Vec<OutputVariables>,
+}
+
+impl Encoding {
+    fn new() -> Self {
+        Self {
+            clauses: Vec::new(),
+            next_variable: 0,
+            gates: Vec::new(),
+            outputs: Vec::new(),
+        }
+    }
+
+    fn variable(&mut self) -> Var {
+        let variable = Var::new(self.next_variable);
+        self.next_variable += 1;
+        variable
+    }
+
+    fn variables(&mut self, count: usize) -> Vec<Var> {
+        (0..count).map(|_| self.variable()).collect()
+    }
+
+    fn clause(&mut self, literals: impl IntoIterator<Item = SatLit>) {
+        self.clauses.push(literals.into_iter().collect());
+    }
+
+    fn exactly_one(&mut self, variables: &[Var]) {
+        self.clause(variables.iter().map(|variable| variable.pos_lit()));
+        for left in 0..variables.len() {
+            for right in left + 1..variables.len() {
+                self.clause([variables[left].neg_lit(), variables[right].neg_lit()]);
+            }
+        }
+    }
+
+    fn encode_selected_value(
+        &mut self,
+        selector: Var,
+        source: RowValue,
+        inverted: Var,
+        value: Var,
+    ) {
+        match source {
+            RowValue::Constant(source) => {
+                for polarity in [false, true] {
+                    let expected = source ^ polarity;
+                    self.clause([
+                        selector.neg_lit(),
+                        forbid_assignment(inverted, polarity),
+                        forbid_assignment(value, !expected),
+                    ]);
+                }
+            }
+            RowValue::Variable(source) => {
+                for source_value in [false, true] {
+                    for polarity in [false, true] {
+                        let expected = source_value ^ polarity;
+                        self.clause([
+                            selector.neg_lit(),
+                            forbid_assignment(source, source_value),
+                            forbid_assignment(inverted, polarity),
+                            forbid_assignment(value, !expected),
+                        ]);
+                    }
+                }
+            }
+        }
+    }
+
+    fn encode_selected_output(
+        &mut self,
+        selector: Var,
+        source: RowValue,
+        inverted: Var,
+        expected: bool,
+    ) {
+        match source {
+            RowValue::Constant(source) => {
+                let required_polarity = source ^ expected;
+                self.clause([
+                    selector.neg_lit(),
+                    forbid_assignment(inverted, !required_polarity),
+                ]);
+            }
+            RowValue::Variable(source) => {
+                for source_value in [false, true] {
+                    let required_polarity = source_value ^ expected;
+                    self.clause([
+                        selector.neg_lit(),
+                        forbid_assignment(source, source_value),
+                        forbid_assignment(inverted, !required_polarity),
+                    ]);
+                }
+            }
+        }
+    }
+
+    fn encode_gate_truth(&mut self, xor: Var, left: Var, right: Var, output: Var) {
+        for is_xor in [false, true] {
+            for left_value in [false, true] {
+                for right_value in [false, true] {
+                    let expected = if is_xor {
+                        left_value ^ right_value
+                    } else {
+                        left_value & right_value
+                    };
+                    self.clause([
+                        forbid_assignment(xor, is_xor),
+                        forbid_assignment(left, left_value),
+                        forbid_assignment(right, right_value),
+                        forbid_assignment(output, !expected),
+                    ]);
+                }
+            }
+        }
+    }
+
+    fn dimacs_bytes(&self) -> Vec<u8> {
+        let mut bytes =
+            format!("p cnf {} {}\n", self.next_variable, self.clauses.len()).into_bytes();
+        for clause in &self.clauses {
+            for literal in clause {
+                bytes.extend_from_slice(literal.to_ipasir().to_string().as_bytes());
+                bytes.push(b' ');
+            }
+            bytes.extend_from_slice(b"0\n");
+        }
+        bytes
+    }
+}
+
+fn forbid_assignment(variable: Var, value: bool) -> SatLit {
+    variable.lit(value)
+}
+
+fn validate_table(table: &CompleteTable) -> Result<(), String> {
+    if table.ninputs > MAX_CUT_INPUTS {
+        return Err(format!(
+            "SAT synthesis supports at most {MAX_CUT_INPUTS} inputs"
+        ));
+    }
+    if table.noutputs == 0 {
+        return Err("SAT synthesis requires at least one output".into());
+    }
+    let expected_rows = 1usize
+        .checked_shl(table.ninputs as u32)
+        .ok_or_else(|| "truth-table dimensions overflow".to_string())?;
+    if table.outputs.len() != expected_rows {
+        return Err(format!(
+            "complete table has {} rows, expected {expected_rows}",
+            table.outputs.len()
+        ));
+    }
+    if table
+        .outputs
+        .iter()
+        .any(|output| output.len() != table.noutputs)
+    {
+        return Err("complete table row has the wrong output width".into());
+    }
+    Ok(())
+}
+
+pub fn assert_exhaustive_equivalence(
+    table: &CompleteTable,
+    circuit: &Circuit,
+) -> Result<(), String> {
+    validate_table(table)?;
+    let actual = circuit.evaluate_all()?;
+    if actual.len() != table.outputs.len() {
+        return Err("circuit input width does not match complete table".into());
+    }
+    if actual != table.outputs {
+        let row = actual
+            .iter()
+            .zip(&table.outputs)
+            .position(|(actual, expected)| actual != expected)
+            .expect("unequal tables have a differing row");
+        return Err(format!("circuit differs from complete table at row {row}"));
+    }
+    Ok(())
+}
+
+pub fn synthesize_xag_at_most(
+    table: &CompleteTable,
+    gates: usize,
+    deadline: Instant,
+) -> Result<SatResult, String> {
+    Ok(synthesize_xag_at_most_with_diagnostics(table, gates, deadline, usize::MAX)?.result)
+}
+
+#[doc(hidden)]
+pub struct SynthesisDiagnostics {
+    pub result: SatResult,
+    pub dimacs: Vec<u8>,
+    pub proof: Vec<u8>,
+    pub encoded_bound: Option<usize>,
+    pub solver_calls: usize,
+}
+
+#[doc(hidden)]
+pub fn synthesize_xag_at_most_with_diagnostics(
+    table: &CompleteTable,
+    gates: usize,
+    deadline: Instant,
+    max_solver_calls: usize,
+) -> Result<SynthesisDiagnostics, String> {
+    if Instant::now() >= deadline {
+        return Ok(SynthesisDiagnostics {
+            result: SatResult::Timeout,
+            dimacs: Vec::new(),
+            proof: Vec::new(),
+            encoded_bound: None,
+            solver_calls: 0,
+        });
+    }
+    validate_table(table)?;
+    let mut last_dimacs = Vec::new();
+    let mut last_proof = Vec::new();
+    for (calls, exact_gates) in (0..=gates).enumerate() {
+        if Instant::now() >= deadline {
+            return Ok(SynthesisDiagnostics {
+                result: SatResult::Timeout,
+                dimacs: last_dimacs,
+                proof: last_proof,
+                encoded_bound: exact_gates.checked_sub(1),
+                solver_calls: calls,
+            });
+        }
+        if calls == max_solver_calls {
+            return Ok(SynthesisDiagnostics {
+                result: SatResult::Unknown("frozen solver-call budget exhausted".into()),
+                dimacs: last_dimacs,
+                proof: last_proof,
+                encoded_bound: exact_gates.checked_sub(1),
+                solver_calls: calls,
+            });
+        }
+        let exact = synthesize_xag_exactly(table, exact_gates, deadline)?;
+        last_dimacs = exact.dimacs;
+        last_proof = exact.proof;
+        match exact.result {
+            SatResult::Unsat if exact_gates < gates => {}
+            result => {
+                return Ok(SynthesisDiagnostics {
+                    result,
+                    dimacs: last_dimacs,
+                    proof: last_proof,
+                    encoded_bound: Some(exact_gates),
+                    solver_calls: calls + 1,
+                });
+            }
+        }
+    }
+    unreachable!("inclusive exact-bound loop always returns at its final bound")
+}
+
+struct ExactSynthesis {
+    result: SatResult,
+    dimacs: Vec<u8>,
+    proof: Vec<u8>,
+}
+
+fn synthesize_xag_exactly(
+    table: &CompleteTable,
+    gates: usize,
+    deadline: Instant,
+) -> Result<ExactSynthesis, String> {
+    if Instant::now() >= deadline {
+        return Ok(ExactSynthesis {
+            result: SatResult::Timeout,
+            dimacs: Vec::new(),
+            proof: Vec::new(),
+        });
+    }
+    let encoding = match build_encoding(table, gates, deadline) {
+        Ok(encoding) => encoding,
+        Err(_) if Instant::now() >= deadline => {
+            return Ok(ExactSynthesis {
+                result: SatResult::Timeout,
+                dimacs: Vec::new(),
+                proof: Vec::new(),
+            });
+        }
+        Err(error) => return Err(error),
+    };
+    let dimacs = encoding.dimacs_bytes();
+    if Instant::now() >= deadline {
+        return Ok(ExactSynthesis {
+            result: SatResult::Timeout,
+            dimacs,
+            proof: Vec::new(),
+        });
+    }
+
+    let mut solver = CaDiCaL::default();
+    let proof_trace = ProofTrace::new();
+    solver
+        .trace_proof(&proof_trace.0, ProofFormat::Drat { binary: false })
+        .map_err(|error| format!("attach CaDiCaL proof trace: {error}"))?;
+    if encoding.next_variable > 0 {
+        if let Err(error) = solver.reserve(Var::new(encoding.next_variable - 1)) {
+            return Ok(ExactSynthesis {
+                result: SatResult::Unknown(format!("CaDiCaL variable reservation failed: {error}")),
+                dimacs,
+                proof: Vec::new(),
+            });
+        }
+    }
+    for clause in &encoding.clauses {
+        if Instant::now() >= deadline {
+            return Ok(ExactSynthesis {
+                result: SatResult::Timeout,
+                dimacs,
+                proof: Vec::new(),
+            });
+        }
+        if let Err(error) = solver.add_clause(clause.iter().copied().collect::<Clause>()) {
+            return Ok(ExactSynthesis {
+                result: SatResult::Unknown(format!("CaDiCaL clause insertion failed: {error}")),
+                dimacs,
+                proof: Vec::new(),
+            });
+        }
+    }
+    let deadline_fired = Arc::new(AtomicBool::new(false));
+    let callback_fired = Arc::clone(&deadline_fired);
+    solver.attach_terminator(move || {
+        if Instant::now() >= deadline {
+            callback_fired.store(true, Ordering::Relaxed);
+            ControlSignal::Terminate
+        } else {
+            ControlSignal::Continue
+        }
+    });
+    let solved = match solver.solve() {
+        Ok(result) => result,
+        Err(error) => {
+            return Ok(ExactSynthesis {
+                result: SatResult::Unknown(format!("CaDiCaL solve error: {error}")),
+                dimacs,
+                proof: Vec::new(),
+            });
+        }
+    };
+    let result = match solved {
+        SolverResult::Unsat => SatResult::Unsat,
+        SolverResult::Interrupted => classify_interruption(deadline_fired.load(Ordering::Relaxed)),
+        SolverResult::Sat => match decode_model(table, gates, &encoding, &solver) {
+            Ok(circuit) => SatResult::Sat(circuit),
+            Err(error) => SatResult::Unknown(format!("invalid SAT model: {error}")),
+        },
+    };
+    drop(solver);
+    let proof = if solved == SolverResult::Unsat {
+        fs::read(&proof_trace.0).map_err(|error| format!("read CaDiCaL proof trace: {error}"))?
+    } else {
+        Vec::new()
+    };
+    Ok(ExactSynthesis {
+        result,
+        dimacs,
+        proof,
+    })
+}
+
+fn classify_interruption(deadline_fired: bool) -> SatResult {
+    if deadline_fired {
+        SatResult::Timeout
+    } else {
+        SatResult::Unknown("CaDiCaL interrupted before the absolute deadline".into())
+    }
+}
+
+fn build_encoding(
+    table: &CompleteTable,
+    gate_count: usize,
+    deadline: Instant,
+) -> Result<Encoding, String> {
+    let mut encoding = Encoding::new();
+    let rows = table.outputs.len();
+
+    for gate in 0..gate_count {
+        if Instant::now() >= deadline {
+            return Err("deadline expired while encoding SAT instance".into());
+        }
+        let source_count = 1 + table.ninputs + gate;
+        let variables = GateVariables {
+            xor: encoding.variable(),
+            left_select: encoding.variables(source_count),
+            left_inverted: encoding.variable(),
+            left_values: encoding.variables(rows),
+            right_select: encoding.variables(source_count),
+            right_inverted: encoding.variable(),
+            right_values: encoding.variables(rows),
+            values: encoding.variables(rows),
+        };
+        encoding.exactly_one(&variables.left_select);
+        encoding.exactly_one(&variables.right_select);
+
+        // Constant fanins and two fanins from the same source would simplify,
+        // contradicting this exact-bound gate's required reachability.
+        encoding.clause([variables.left_select[0].neg_lit()]);
+        encoding.clause([variables.right_select[0].neg_lit()]);
+        for source in 0..source_count {
+            encoding.clause([
+                variables.left_select[source].neg_lit(),
+                variables.right_select[source].neg_lit(),
+            ]);
+        }
+        // Canonical commutative fanin order.
+        for left in 0..source_count {
+            for right in 0..left {
+                encoding.clause([
+                    variables.left_select[left].neg_lit(),
+                    variables.right_select[right].neg_lit(),
+                ]);
+            }
+        }
+        // XOR input negation can be moved to its output for free.
+        encoding.clause([variables.xor.neg_lit(), variables.left_inverted.neg_lit()]);
+
+        for row in 0..rows {
+            for source in 0..source_count {
+                let source_value = row_source(table, &encoding.gates, source, row);
+                encoding.encode_selected_value(
+                    variables.left_select[source],
+                    source_value,
+                    variables.left_inverted,
+                    variables.left_values[row],
+                );
+                encoding.encode_selected_value(
+                    variables.right_select[source],
+                    source_value,
+                    variables.right_inverted,
+                    variables.right_values[row],
+                );
+            }
+            encoding.encode_gate_truth(
+                variables.xor,
+                variables.left_values[row],
+                variables.right_values[row],
+                variables.values[row],
+            );
+        }
+        encoding.gates.push(variables);
+    }
+
+    let output_source_count = 1 + table.ninputs + gate_count;
+    for output in 0..table.noutputs {
+        let variables = OutputVariables {
+            select: encoding.variables(output_source_count),
+            inverted: encoding.variable(),
+        };
+        encoding.exactly_one(&variables.select);
+        for row in 0..rows {
+            for source in 0..output_source_count {
+                let source_value = row_source(table, &encoding.gates, source, row);
+                encoding.encode_selected_output(
+                    variables.select[source],
+                    source_value,
+                    variables.inverted,
+                    table.outputs[row][output],
+                );
+            }
+        }
+        encoding.outputs.push(variables);
+    }
+
+    // Each allocated gate has an immediate later consumer or an output.
+    // Acyclicity then guarantees a path from every gate to some output.
+    for gate in 0..gate_count {
+        let source = 1 + table.ninputs + gate;
+        let mut consumers = Vec::new();
+        for later in gate + 1..gate_count {
+            consumers.push(encoding.gates[later].left_select[source].pos_lit());
+            consumers.push(encoding.gates[later].right_select[source].pos_lit());
+        }
+        for output in &encoding.outputs {
+            consumers.push(output.select[source].pos_lit());
+        }
+        encoding.clause(consumers);
+    }
+
+    // Forbid duplicate decoded gates. XOR polarity is canonicalized by Xag,
+    // so equal XOR source pairs are duplicate regardless of right polarity.
+    for earlier in 0..gate_count {
+        for later in earlier + 1..gate_count {
+            let common_sources = 1 + table.ninputs + earlier;
+            for left in 1..common_sources {
+                for right in left + 1..common_sources {
+                    encoding.clause([
+                        encoding.gates[earlier].xor.neg_lit(),
+                        encoding.gates[later].xor.neg_lit(),
+                        encoding.gates[earlier].left_select[left].neg_lit(),
+                        encoding.gates[later].left_select[left].neg_lit(),
+                        encoding.gates[earlier].right_select[right].neg_lit(),
+                        encoding.gates[later].right_select[right].neg_lit(),
+                    ]);
+                    for left_polarity in [false, true] {
+                        for right_polarity in [false, true] {
+                            encoding.clause([
+                                encoding.gates[earlier].xor.pos_lit(),
+                                encoding.gates[later].xor.pos_lit(),
+                                encoding.gates[earlier].left_select[left].neg_lit(),
+                                encoding.gates[later].left_select[left].neg_lit(),
+                                encoding.gates[earlier].right_select[right].neg_lit(),
+                                encoding.gates[later].right_select[right].neg_lit(),
+                                forbid_assignment(
+                                    encoding.gates[earlier].left_inverted,
+                                    left_polarity,
+                                ),
+                                forbid_assignment(
+                                    encoding.gates[later].left_inverted,
+                                    left_polarity,
+                                ),
+                                forbid_assignment(
+                                    encoding.gates[earlier].right_inverted,
+                                    right_polarity,
+                                ),
+                                forbid_assignment(
+                                    encoding.gates[later].right_inverted,
+                                    right_polarity,
+                                ),
+                            ]);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(encoding)
+}
+
+fn row_source(
+    table: &CompleteTable,
+    gates: &[GateVariables],
+    source: usize,
+    row: usize,
+) -> RowValue {
+    if source == 0 {
+        RowValue::Constant(false)
+    } else if source <= table.ninputs {
+        RowValue::Constant(((row >> (source - 1)) & 1) != 0)
+    } else {
+        RowValue::Variable(gates[source - 1 - table.ninputs].values[row])
+    }
+}
+
+fn decode_model(
+    table: &CompleteTable,
+    gate_count: usize,
+    encoding: &Encoding,
+    solver: &CaDiCaL<'_, '_>,
+) -> Result<Circuit, String> {
+    let mut graph = Xag::new(table.ninputs);
+    let mut sources: Vec<Lit> = std::iter::once(graph.f())
+        .chain((0..table.ninputs).map(|input| graph.input(input)))
+        .collect();
+    for gate in 0..gate_count {
+        let variables = &encoding.gates[gate];
+        let left_source = selected_source(solver, &variables.left_select)?;
+        let right_source = selected_source(solver, &variables.right_select)?;
+        let mut left = sources[left_source];
+        let mut right = sources[right_source];
+        if model_value(solver, variables.left_inverted)? {
+            left = left.not();
+        }
+        if model_value(solver, variables.right_inverted)? {
+            right = right.not();
+        }
+        let literal = if model_value(solver, variables.xor)? {
+            graph.xor(left, right)?
+        } else {
+            graph.and(left, right)?
+        };
+        sources.push(literal);
+    }
+    let mut outputs = Vec::with_capacity(table.noutputs);
+    for variables in &encoding.outputs {
+        let source = selected_source(solver, &variables.select)?;
+        let mut literal = sources[source];
+        if model_value(solver, variables.inverted)? {
+            literal = literal.not();
+        }
+        outputs.push(literal);
+    }
+    let circuit = Circuit::new(graph, outputs)?;
+    if circuit.reachable_gate_count()? != gate_count {
+        return Err(format!(
+            "decoded exact-{gate_count} model does not contain {gate_count} reachable gates"
+        ));
+    }
+    assert_exhaustive_equivalence(table, &circuit)?;
+    Ok(circuit)
+}
+
+fn selected_source(solver: &CaDiCaL<'_, '_>, selectors: &[Var]) -> Result<usize, String> {
+    let selected: Vec<_> = selectors
+        .iter()
+        .enumerate()
+        .filter_map(|(source, variable)| {
+            model_value(solver, *variable)
+                .ok()
+                .and_then(|value| value.then_some(source))
+        })
+        .collect();
+    if selected.len() != 1 {
+        return Err(format!(
+            "expected exactly one selected source, got {}",
+            selected.len()
+        ));
+    }
+    Ok(selected[0])
+}
+
+fn model_value(solver: &CaDiCaL<'_, '_>, variable: Var) -> Result<bool, String> {
+    solver
+        .var_val(variable)
+        .map(|value| match value {
+            TernaryVal::True => true,
+            TernaryVal::False | TernaryVal::DontCare => false,
+        })
+        .map_err(|error| format!("read CaDiCaL model: {error}"))
+}
+
+pub fn complete_table_from_rows(
+    ninputs: usize,
+    rows: Vec<Vec<bool>>,
+) -> Result<CompleteTable, String> {
+    let noutputs = rows
+        .first()
+        .map(Vec::len)
+        .ok_or_else(|| "complete table requires at least one row".to_string())?;
+    let table = CompleteTable {
+        ninputs,
+        noutputs,
+        outputs: rows,
+    };
+    validate_table(&table)?;
+    Ok(table)
+}
+
+pub fn input_for_row(row: usize, ninputs: usize) -> Vec<bool> {
+    encode_lsb(row as u64, ninputs)
+}
+
+#[derive(Debug)]
+pub enum ResynthesisStatus {
+    Sat,
+    Unsat,
+    Timeout,
+    Unknown(String),
+}
+
+#[doc(hidden)]
+pub struct NetlistResynthesis {
+    pub replacement: Option<Circuit>,
+    pub status: ResynthesisStatus,
+    pub cuts_considered: usize,
+    pub solver_calls: usize,
+    pub encoded_bound: Option<usize>,
+    pub requested_bound: Option<usize>,
+    pub dimacs: Vec<u8>,
+    pub proof: Vec<u8>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum LocalNode {
+    Input(usize),
+    Gate(usize),
+}
+
+#[derive(Clone, Copy)]
+struct LocalLit {
+    node: LocalNode,
+    inverted: bool,
+}
+
+#[derive(Clone, Copy)]
+enum LocalOp {
+    And,
+    Or,
+    Xor,
+    Nand,
+    Nor,
+    Xnor,
+}
+
+#[derive(Clone, Copy)]
+struct LocalGate {
+    op: LocalOp,
+    left: LocalLit,
+    right: LocalLit,
+}
+
+struct LocalCircuit {
+    ninputs: usize,
+    gates: Vec<LocalGate>,
+    outputs: Vec<LocalLit>,
+}
+
+struct Cut {
+    root: usize,
+    leaves: Vec<LocalNode>,
+    internal_gates: usize,
+}
+
+pub fn resynthesize_local_cuts(
+    text: &str,
+    deadline: Instant,
+    cut_budget: usize,
+    solver_call_budget: usize,
+) -> Result<NetlistResynthesis, String> {
+    Netlist::parse(text).map_err(|error| format!("parse input netlist: {error}"))?;
+    let local = parse_local_circuit(text)?;
+    if Instant::now() >= deadline {
+        return Ok(NetlistResynthesis {
+            replacement: None,
+            status: ResynthesisStatus::Timeout,
+            cuts_considered: 0,
+            solver_calls: 0,
+            encoded_bound: None,
+            requested_bound: None,
+            dimacs: Vec::new(),
+            proof: Vec::new(),
+        });
+    }
+    let cuts = match enumerate_cuts(&local, MAX_CUT_INPUTS, cut_budget, deadline) {
+        Ok(cuts) => cuts,
+        Err(_) if Instant::now() >= deadline => {
+            return Ok(NetlistResynthesis {
+                replacement: None,
+                status: ResynthesisStatus::Timeout,
+                cuts_considered: 0,
+                solver_calls: 0,
+                encoded_bound: None,
+                requested_bound: None,
+                dimacs: Vec::new(),
+                proof: Vec::new(),
+            });
+        }
+        Err(error) => return Err(error),
+    };
+    let original_rows = evaluate_local_all(&local)?;
+    let mut calls = 0usize;
+    let mut considered = 0usize;
+    let mut last_dimacs = Vec::new();
+    let mut last_proof = Vec::new();
+    let mut encoded_bound = None;
+    let mut requested_bound = None;
+
+    for cut in cuts {
+        if Instant::now() >= deadline {
+            return Ok(NetlistResynthesis {
+                replacement: None,
+                status: ResynthesisStatus::Timeout,
+                cuts_considered: considered,
+                solver_calls: calls,
+                encoded_bound,
+                requested_bound,
+                dimacs: last_dimacs,
+                proof: last_proof,
+            });
+        }
+        if calls == solver_call_budget {
+            return Ok(NetlistResynthesis {
+                replacement: None,
+                status: ResynthesisStatus::Unknown("frozen solver-call budget exhausted".into()),
+                cuts_considered: considered,
+                solver_calls: calls,
+                encoded_bound,
+                requested_bound,
+                dimacs: last_dimacs,
+                proof: last_proof,
+            });
+        }
+        considered += 1;
+        let table = cut_table(&local, &cut)?;
+        let bound = cut
+            .internal_gates
+            .checked_sub(1)
+            .expect("enumerated cuts contain their root gate");
+        requested_bound = Some(bound);
+        let first = synthesize_xag_at_most_with_diagnostics(
+            &table,
+            bound,
+            deadline,
+            solver_call_budget - calls,
+        )?;
+        calls += first.solver_calls;
+        encoded_bound = first.encoded_bound;
+        last_dimacs = first.dimacs;
+        last_proof = first.proof;
+        let candidate = match first.result {
+            SatResult::Unsat => continue,
+            SatResult::Timeout => {
+                return Ok(NetlistResynthesis {
+                    replacement: None,
+                    status: ResynthesisStatus::Timeout,
+                    cuts_considered: considered,
+                    solver_calls: calls,
+                    encoded_bound,
+                    requested_bound,
+                    dimacs: last_dimacs,
+                    proof: last_proof,
+                });
+            }
+            SatResult::Unknown(reason) => {
+                return Ok(NetlistResynthesis {
+                    replacement: None,
+                    status: ResynthesisStatus::Unknown(reason),
+                    cuts_considered: considered,
+                    solver_calls: calls,
+                    encoded_bound,
+                    requested_bound,
+                    dimacs: last_dimacs,
+                    proof: last_proof,
+                });
+            }
+            SatResult::Sat(candidate) => candidate,
+        };
+        if candidate.reachable_gate_count()? >= cut.internal_gates {
+            return Err("SAT cut replacement did not reduce reachable challenge gates".into());
+        }
+        assert_exhaustive_equivalence(&table, &candidate)?;
+
+        let second = synthesize_xag_at_most_with_diagnostics(
+            &table,
+            bound,
+            deadline,
+            solver_call_budget - calls,
+        )?;
+        calls += second.solver_calls;
+        encoded_bound = second.encoded_bound;
+        last_dimacs = second.dimacs;
+        last_proof = second.proof;
+        let rerun = match second.result {
+            SatResult::Sat(rerun) => rerun,
+            SatResult::Timeout => {
+                return Ok(NetlistResynthesis {
+                    replacement: None,
+                    status: ResynthesisStatus::Timeout,
+                    cuts_considered: considered,
+                    solver_calls: calls,
+                    encoded_bound,
+                    requested_bound,
+                    dimacs: last_dimacs,
+                    proof: last_proof,
+                });
+            }
+            SatResult::Unknown(reason) => {
+                return Ok(NetlistResynthesis {
+                    replacement: None,
+                    status: ResynthesisStatus::Unknown(reason),
+                    cuts_considered: considered,
+                    solver_calls: calls,
+                    encoded_bound,
+                    requested_bound,
+                    dimacs: last_dimacs,
+                    proof: last_proof,
+                });
+            }
+            SatResult::Unsat => {
+                return Ok(NetlistResynthesis {
+                    replacement: None,
+                    status: ResynthesisStatus::Unknown(
+                        "deterministic rerun changed SAT to UNSAT".into(),
+                    ),
+                    cuts_considered: considered,
+                    solver_calls: calls,
+                    encoded_bound,
+                    requested_bound,
+                    dimacs: last_dimacs,
+                    proof: last_proof,
+                });
+            }
+        };
+        if rerun.to_netlist()? != candidate.to_netlist()? {
+            return Ok(NetlistResynthesis {
+                replacement: None,
+                status: ResynthesisStatus::Unknown("deterministic SAT rerun bytes differ".into()),
+                cuts_considered: considered,
+                solver_calls: calls,
+                encoded_bound,
+                requested_bound,
+                dimacs: last_dimacs,
+                proof: last_proof,
+            });
+        }
+
+        let rewritten = reinsert_cut(&local, &cut, &candidate)?;
+        if rewritten.evaluate_all()? != original_rows {
+            return Err("reinserted whole circuit failed exhaustive equivalence".into());
+        }
+        let rewritten_bytes = rewritten.to_netlist()?;
+        let rerun_rewritten = reinsert_cut(&local, &cut, &rerun)?.to_netlist()?;
+        if rewritten_bytes != rerun_rewritten {
+            return Ok(NetlistResynthesis {
+                replacement: None,
+                status: ResynthesisStatus::Unknown(
+                    "deterministic rewrite serialization differs".into(),
+                ),
+                cuts_considered: considered,
+                solver_calls: calls,
+                encoded_bound,
+                requested_bound,
+                dimacs: last_dimacs,
+                proof: last_proof,
+            });
+        }
+        if Netlist::parse(&rewritten_bytes)?.gate_count() >= reachable_local_gates(&local) {
+            continue;
+        }
+        return Ok(NetlistResynthesis {
+            replacement: Some(rewritten),
+            status: ResynthesisStatus::Sat,
+            cuts_considered: considered,
+            solver_calls: calls,
+            encoded_bound,
+            requested_bound,
+            dimacs: last_dimacs,
+            proof: last_proof,
+        });
+    }
+
+    Ok(NetlistResynthesis {
+        replacement: None,
+        status: ResynthesisStatus::Unsat,
+        cuts_considered: considered,
+        solver_calls: calls,
+        encoded_bound,
+        requested_bound,
+        dimacs: last_dimacs,
+        proof: last_proof,
+    })
+}
+
+fn parse_local_circuit(text: &str) -> Result<LocalCircuit, String> {
+    let mut lines = text.lines();
+    let ninputs = lines
+        .next()
+        .and_then(|line| line.strip_prefix("INPUTS "))
+        .and_then(|value| value.parse::<usize>().ok())
+        .ok_or_else(|| "invalid INPUTS header".to_string())?;
+    let mut gates = Vec::new();
+    let mut outputs = None;
+    for line in lines {
+        let fields: Vec<_> = line.split_whitespace().collect();
+        if fields.first() == Some(&"OUTPUTS") {
+            outputs = Some(
+                fields[1..]
+                    .iter()
+                    .map(|field| parse_local_literal(field, ninputs))
+                    .collect::<Result<Vec<_>, _>>()?,
+            );
+            continue;
+        }
+        let op = match fields.get(2).copied() {
+            Some("AND") => LocalOp::And,
+            Some("OR") => LocalOp::Or,
+            Some("XOR") => LocalOp::Xor,
+            Some("NAND") => LocalOp::Nand,
+            Some("NOR") => LocalOp::Nor,
+            Some("XNOR") => LocalOp::Xnor,
+            _ => return Err("unsupported local gate operation".into()),
+        };
+        gates.push(LocalGate {
+            op,
+            left: parse_local_literal(fields[3], ninputs)?,
+            right: parse_local_literal(fields[4], ninputs)?,
+        });
+    }
+    Ok(LocalCircuit {
+        ninputs,
+        gates,
+        outputs: outputs.ok_or_else(|| "missing OUTPUTS line".to_string())?,
+    })
+}
+
+fn parse_local_literal(text: &str, ninputs: usize) -> Result<LocalLit, String> {
+    let (inverted, name) = text
+        .strip_prefix('~')
+        .map_or((false, text), |name| (true, name));
+    let node = if let Some(index) = name.strip_prefix('x') {
+        LocalNode::Input(
+            index
+                .parse::<usize>()
+                .map_err(|_| "invalid local input".to_string())?
+                - 1,
+        )
+    } else if let Some(index) = name.strip_prefix('w') {
+        LocalNode::Gate(
+            index
+                .parse::<usize>()
+                .map_err(|_| "invalid local gate".to_string())?
+                - 1,
+        )
+    } else {
+        return Err(format!("invalid local literal {text}"));
+    };
+    if matches!(node, LocalNode::Input(index) if index >= ninputs) {
+        return Err("local input is out of range".into());
+    }
+    Ok(LocalLit { node, inverted })
+}
+
+fn enumerate_cuts(
+    circuit: &LocalCircuit,
+    max_leaves: usize,
+    limit: usize,
+    deadline: Instant,
+) -> Result<Vec<Cut>, String> {
+    let live = live_local_gate_bitmap(circuit);
+    let mut cuts = Vec::new();
+    for (root, is_live) in live.iter().copied().enumerate() {
+        if !is_live {
+            continue;
+        }
+        let initial = vec![LocalNode::Gate(root)];
+        let mut queue = VecDeque::from([initial.clone()]);
+        let mut seen = BTreeSet::from([initial]);
+        while let Some(leaves) = queue.pop_front() {
+            if Instant::now() >= deadline {
+                return Err("deadline expired during cut enumeration".into());
+            }
+            for position in 0..leaves.len() {
+                let LocalNode::Gate(gate) = leaves[position] else {
+                    continue;
+                };
+                let mut expanded = leaves.clone();
+                expanded.remove(position);
+                expanded.push(circuit.gates[gate].left.node);
+                expanded.push(circuit.gates[gate].right.node);
+                expanded.sort_unstable();
+                expanded.dedup();
+                if expanded.len() > max_leaves || !seen.insert(expanded.clone()) {
+                    continue;
+                }
+                let internal_gates = internal_gate_count(circuit, root, &expanded);
+                if internal_gates > 0 {
+                    cuts.push(Cut {
+                        root,
+                        leaves: expanded.clone(),
+                        internal_gates,
+                    });
+                    if cuts.len() == limit {
+                        return Ok(cuts);
+                    }
+                }
+                queue.push_back(expanded);
+            }
+        }
+    }
+    Ok(cuts)
+}
+
+fn internal_gate_count(circuit: &LocalCircuit, root: usize, leaves: &[LocalNode]) -> usize {
+    let leaves: BTreeSet<_> = leaves.iter().copied().collect();
+    let mut seen = BTreeSet::new();
+    let mut stack = vec![LocalNode::Gate(root)];
+    while let Some(node) = stack.pop() {
+        if leaves.contains(&node) {
+            continue;
+        }
+        if let LocalNode::Gate(gate) = node
+            && seen.insert(gate)
+        {
+            stack.push(circuit.gates[gate].left.node);
+            stack.push(circuit.gates[gate].right.node);
+        }
+    }
+    seen.len()
+}
+
+fn cut_table(circuit: &LocalCircuit, cut: &Cut) -> Result<CompleteTable, String> {
+    let rows = 1usize << cut.leaves.len();
+    let mut outputs = Vec::with_capacity(rows);
+    for row in 0..rows {
+        let mut memo = vec![None; circuit.gates.len()];
+        let value = evaluate_cut_node(circuit, cut, LocalNode::Gate(cut.root), row, &mut memo)?;
+        outputs.push(vec![value]);
+    }
+    complete_table_from_rows(cut.leaves.len(), outputs)
+}
+
+fn evaluate_cut_node(
+    circuit: &LocalCircuit,
+    cut: &Cut,
+    node: LocalNode,
+    assignment: usize,
+    memo: &mut [Option<bool>],
+) -> Result<bool, String> {
+    if let Ok(leaf) = cut.leaves.binary_search(&node) {
+        return Ok(((assignment >> leaf) & 1) != 0);
+    }
+    match node {
+        LocalNode::Input(_) => Err("cut traversal reached a non-leaf input".into()),
+        LocalNode::Gate(gate) => {
+            if let Some(value) = memo[gate] {
+                return Ok(value);
+            }
+            let definition = circuit.gates[gate];
+            let left = evaluate_cut_literal(circuit, cut, definition.left, assignment, memo)?;
+            let right = evaluate_cut_literal(circuit, cut, definition.right, assignment, memo)?;
+            let value = apply_local_op(definition.op, left, right);
+            memo[gate] = Some(value);
+            Ok(value)
+        }
+    }
+}
+
+fn evaluate_cut_literal(
+    circuit: &LocalCircuit,
+    cut: &Cut,
+    literal: LocalLit,
+    assignment: usize,
+    memo: &mut [Option<bool>],
+) -> Result<bool, String> {
+    Ok(evaluate_cut_node(circuit, cut, literal.node, assignment, memo)? ^ literal.inverted)
+}
+
+fn apply_local_op(op: LocalOp, left: bool, right: bool) -> bool {
+    match op {
+        LocalOp::And => left & right,
+        LocalOp::Or => left | right,
+        LocalOp::Xor => left ^ right,
+        LocalOp::Nand => !(left & right),
+        LocalOp::Nor => !(left | right),
+        LocalOp::Xnor => !(left ^ right),
+    }
+}
+
+fn evaluate_local_all(circuit: &LocalCircuit) -> Result<Vec<Vec<bool>>, String> {
+    let rows = 1usize
+        .checked_shl(circuit.ninputs as u32)
+        .ok_or_else(|| "input dimensions overflow".to_string())?;
+    let mut outputs = Vec::with_capacity(rows);
+    for row in 0..rows {
+        let inputs = encode_lsb(row as u64, circuit.ninputs);
+        let mut gates = Vec::with_capacity(circuit.gates.len());
+        for gate in &circuit.gates {
+            let left = local_literal_value(gate.left, &inputs, &gates);
+            let right = local_literal_value(gate.right, &inputs, &gates);
+            gates.push(apply_local_op(gate.op, left, right));
+        }
+        outputs.push(
+            circuit
+                .outputs
+                .iter()
+                .map(|literal| local_literal_value(*literal, &inputs, &gates))
+                .collect(),
+        );
+    }
+    Ok(outputs)
+}
+
+fn local_literal_value(literal: LocalLit, inputs: &[bool], gates: &[bool]) -> bool {
+    let value = match literal.node {
+        LocalNode::Input(input) => inputs[input],
+        LocalNode::Gate(gate) => gates[gate],
+    };
+    value ^ literal.inverted
+}
+
+fn reinsert_cut(
+    circuit: &LocalCircuit,
+    cut: &Cut,
+    replacement: &Circuit,
+) -> Result<Circuit, String> {
+    let mut graph = Xag::new(circuit.ninputs);
+    let inputs: Vec<_> = (0..circuit.ninputs)
+        .map(|input| graph.input(input))
+        .collect();
+    let mut gates = Vec::with_capacity(circuit.gates.len());
+    for gate in 0..circuit.gates.len() {
+        let literal = if gate == cut.root {
+            let leaf_literals = cut
+                .leaves
+                .iter()
+                .map(|leaf| match *leaf {
+                    LocalNode::Input(input) => Ok(inputs[input]),
+                    LocalNode::Gate(gate) => gates
+                        .get(gate)
+                        .copied()
+                        .ok_or_else(|| "cut leaf gate is not available".to_string()),
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            insert_replacement(&mut graph, replacement, &leaf_literals)?
+        } else {
+            let definition = circuit.gates[gate];
+            let left = remap_local_literal(definition.left, &inputs, &gates)?;
+            let right = remap_local_literal(definition.right, &inputs, &gates)?;
+            match definition.op {
+                LocalOp::And => graph.and(left, right)?,
+                LocalOp::Or => graph.or(left, right)?,
+                LocalOp::Xor => graph.xor(left, right)?,
+                LocalOp::Nand => graph.and(left, right)?.not(),
+                LocalOp::Nor => graph.or(left, right)?.not(),
+                LocalOp::Xnor => graph.xor(left, right)?.not(),
+            }
+        };
+        gates.push(literal);
+    }
+    let outputs = circuit
+        .outputs
+        .iter()
+        .map(|literal| remap_local_literal(*literal, &inputs, &gates))
+        .collect::<Result<Vec<_>, _>>()?;
+    Circuit::new(graph, outputs)
+}
+
+fn remap_local_literal(literal: LocalLit, inputs: &[Lit], gates: &[Lit]) -> Result<Lit, String> {
+    let mut mapped = match literal.node {
+        LocalNode::Input(input) => inputs[input],
+        LocalNode::Gate(gate) => gates
+            .get(gate)
+            .copied()
+            .ok_or_else(|| "gate literal is not available".to_string())?,
+    };
+    if literal.inverted {
+        mapped = mapped.not();
+    }
+    Ok(mapped)
+}
+
+fn insert_replacement(
+    target: &mut Xag,
+    replacement: &Circuit,
+    inputs: &[Lit],
+) -> Result<Lit, String> {
+    if replacement.graph.input_count() != inputs.len() || replacement.outputs.len() != 1 {
+        return Err("replacement cut dimensions do not match".into());
+    }
+    let mut sources = std::iter::once(target.f())
+        .chain(inputs.iter().copied())
+        .collect::<Vec<_>>();
+    for gate in replacement.graph.gates() {
+        let left = remap_replacement_literal(&replacement.graph, gate.left, &sources)?;
+        let right = remap_replacement_literal(&replacement.graph, gate.right, &sources)?;
+        sources.push(match gate.op {
+            Op::And => target.and(left, right)?,
+            Op::Xor => target.xor(left, right)?,
+        });
+    }
+    remap_replacement_literal(&replacement.graph, replacement.outputs[0], &sources)
+}
+
+fn remap_replacement_literal(graph: &Xag, literal: Lit, sources: &[Lit]) -> Result<Lit, String> {
+    let formatted = graph.format_literal(literal)?;
+    let (inverted, name) = formatted
+        .strip_prefix('~')
+        .map_or((false, formatted.as_str()), |name| (true, name));
+    let source = if name == "0" {
+        0
+    } else if let Some(input) = name.strip_prefix('x') {
+        input
+            .parse::<usize>()
+            .map_err(|_| "invalid replacement input literal".to_string())?
+    } else if let Some(gate) = name.strip_prefix('w') {
+        graph.input_count()
+            + gate
+                .parse::<usize>()
+                .map_err(|_| "invalid replacement gate literal".to_string())?
+    } else {
+        return Err("invalid replacement literal".into());
+    };
+    let mut mapped = sources[source];
+    if inverted {
+        mapped = mapped.not();
+    }
+    Ok(mapped)
+}
+
+fn live_local_gate_bitmap(circuit: &LocalCircuit) -> Vec<bool> {
+    let mut live = vec![false; circuit.gates.len()];
+    let mut stack: Vec<_> = circuit.outputs.iter().map(|literal| literal.node).collect();
+    while let Some(node) = stack.pop() {
+        if let LocalNode::Gate(gate) = node {
+            if live[gate] {
+                continue;
+            }
+            live[gate] = true;
+            stack.push(circuit.gates[gate].left.node);
+            stack.push(circuit.gates[gate].right.node);
+        }
+    }
+    live
+}
+
+fn reachable_local_gates(circuit: &LocalCircuit) -> usize {
+    live_local_gate_bitmap(circuit)
+        .into_iter()
+        .filter(|live| *live)
+        .count()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{SatResult, classify_interruption};
+
+    #[test]
+    fn interrupted_solver_is_unknown_without_the_deadline_signal() {
+        assert!(matches!(
+            classify_interruption(false),
+            SatResult::Unknown(reason) if reason.contains("before the absolute deadline")
+        ));
+        assert!(matches!(classify_interruption(true), SatResult::Timeout));
+    }
+}
