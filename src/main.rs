@@ -4,7 +4,10 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use occam_circuit_hmyuuu::arithmetic::synthesize_family;
-use occam_circuit_hmyuuu::bits::encode_lsb;
+use occam_circuit_hmyuuu::baseline::{
+    FrozenBaseline, complete_frozen_baseline, complete_frozen_table,
+};
+use occam_circuit_hmyuuu::bits::{encode_bits, encode_lsb};
 use occam_circuit_hmyuuu::instances::{
     InstanceSpec, MYSTERY_INSTANCES, complete_table, instance_by_slug,
 };
@@ -14,13 +17,16 @@ use occam_circuit_hmyuuu::order::{
 };
 #[cfg(feature = "oxidd-oracle")]
 use occam_circuit_hmyuuu::oxidd_oracle::OxiddForest;
+use occam_circuit_hmyuuu::reblind::PublicSuite;
 use occam_circuit_hmyuuu::table::{
     CompleteTable, InputTable, PartialTable, prediction_csv_bytes, row_index, sha256_hex,
 };
 
 const USAGE: &str = "usage:
   occam-circuit-hmyuuu solve-v1 DATA_ROOT OUTPUT_ROOT
-  occam-circuit-hmyuuu search-order DATA_ROOT EXACT_SLUG --beam N --rounds N";
+  occam-circuit-hmyuuu search-order DATA_ROOT EXACT_SLUG --beam N --rounds N
+  occam-circuit-hmyuuu frozen-baseline PUBLIC_ROOT OPAQUE_ID OUTPUT_DIR --method zero-fill|hamming-1nn --metrics-json OUTPUT_DIR/metrics.json
+  occam-circuit-hmyuuu export-visible PUBLIC_ROOT OPAQUE_ID OUTPUT_DIR --seed 64LOWERHEX --folds 5";
 
 struct Candidate {
     spec: &'static InstanceSpec,
@@ -69,7 +75,306 @@ fn run(arguments: Vec<std::ffi::OsString>) -> Result<(), String> {
             solve_v1(Path::new(&arguments[1]), Path::new(&arguments[2]))
         }
         Some("search-order") => search_order(&arguments[1..]),
+        Some("frozen-baseline") => frozen_baseline(&arguments[1..]),
+        Some("export-visible") => export_visible(&arguments[1..]),
         _ => Err(USAGE.into()),
+    }
+}
+
+fn frozen_baseline(arguments: &[std::ffi::OsString]) -> Result<(), String> {
+    if arguments.len() != 7 || arguments[3] != "--method" || arguments[5] != "--metrics-json" {
+        return Err(USAGE.into());
+    }
+    let root = Path::new(&arguments[0]);
+    let opaque_id = arguments[1]
+        .to_str()
+        .ok_or_else(|| "opaque ID is not valid UTF-8".to_string())?;
+    let output_dir = Path::new(&arguments[2]);
+    let method = match arguments[4].to_str() {
+        Some("zero-fill") => FrozenBaseline::ZeroFill,
+        Some("hamming-1nn") => FrozenBaseline::HammingOneNearest,
+        _ => return Err("--method must be zero-fill or hamming-1nn".into()),
+    };
+    let metrics_path = Path::new(&arguments[6]);
+    if metrics_path != output_dir.join("metrics.json") {
+        return Err("--metrics-json must equal OUTPUT_DIR/metrics.json".into());
+    }
+    let suite = PublicSuite::load_frozen(root)?;
+    let instance = suite.instance(opaque_id)?;
+    let commitment = tracked_public_commitment()?;
+    let method_name = match method {
+        FrozenBaseline::ZeroFill => "zero-fill",
+        FrozenBaseline::HammingOneNearest => "hamming-1nn",
+    };
+    let seed = sha256_hex(format!("{commitment}{method_name}{opaque_id}").as_bytes());
+    let (visible_exact, visible_bit_accuracy) = baseline_visible_scores(instance, method, &seed)?;
+    let (completed, circuit) = complete_frozen_baseline(&instance.train, method)?;
+    instance.train.validate_against(&completed)?;
+    let completed_bytes = completed_table_csv_bytes(&completed);
+    let circuit_bytes = circuit.to_netlist()?.into_bytes();
+    let gates = verify_emitted_circuit(&circuit_bytes, &completed)?;
+    let completed_sha256 = sha256_hex(&completed_bytes);
+    let circuit_sha256 = sha256_hex(&circuit_bytes);
+    let metrics = format!(
+        "{{\"completed_table_sha256\":\"{completed_sha256}\",\"gates\":{gates},\"train_exact\":1.0,\"verifier\":\"pass\",\"visible_cv_bit_accuracy\":{},\"visible_cv_exact\":{}}}\n",
+        decimal(visible_bit_accuracy),
+        decimal(visible_exact),
+    );
+    let artifact = format!(
+        "{{\"circuit_path\":\"circuit.txt\",\"circuit_sha256\":\"{circuit_sha256}\",\"completed_table_path\":\"completed-table.csv\",\"completed_table_sha256\":\"{completed_sha256}\",\"equivalence\":\"pass\",\"schema_version\":1}}\n"
+    );
+    atomic_output(output_dir, |stage| {
+        fs::write(stage.join("completed-table.csv"), &completed_bytes)
+            .map_err(|error| format!("write completed-table.csv: {error}"))?;
+        fs::write(stage.join("circuit.txt"), &circuit_bytes)
+            .map_err(|error| format!("write circuit.txt: {error}"))?;
+        fs::write(stage.join("artifact.json"), artifact.as_bytes())
+            .map_err(|error| format!("write artifact.json: {error}"))?;
+        fs::write(
+            stage.join(metrics_path.file_name().unwrap()),
+            metrics.as_bytes(),
+        )
+        .map_err(|error| format!("write metrics.json: {error}"))
+    })
+}
+
+fn export_visible(arguments: &[std::ffi::OsString]) -> Result<(), String> {
+    if arguments.len() != 7 || arguments[3] != "--seed" || arguments[5] != "--folds" {
+        return Err(USAGE.into());
+    }
+    let root = Path::new(&arguments[0]);
+    let opaque_id = arguments[1]
+        .to_str()
+        .ok_or_else(|| "opaque ID is not valid UTF-8".to_string())?;
+    let output_dir = Path::new(&arguments[2]);
+    let seed = arguments[4]
+        .to_str()
+        .ok_or_else(|| "--seed is not valid UTF-8".to_string())?;
+    let folds = arguments[6]
+        .to_str()
+        .ok_or_else(|| "--folds is not valid UTF-8".to_string())?
+        .parse::<usize>()
+        .map_err(|_| "--folds must be a positive integer".to_string())?;
+    if folds != 5 {
+        return Err("--folds must equal the frozen value 5".into());
+    }
+    let suite = PublicSuite::load_frozen(root)?;
+    let instance = suite.instance(opaque_id)?;
+    let assignments = instance.visible_folds(seed, folds)?;
+    let mut fold_for_row = vec![0usize; instance.train.rows.len()];
+    for (fold, rows) in assignments.iter().enumerate() {
+        for row in rows {
+            fold_for_row[*row] = fold;
+        }
+    }
+    let mut rows = String::from("input,output,fold\n");
+    for (row, (input, output)) in instance.train.rows.iter().enumerate() {
+        rows.push_str(&encode_bits(input));
+        rows.push(',');
+        rows.push_str(&encode_bits(output));
+        rows.push(',');
+        rows.push_str(&fold_for_row[row].to_string());
+        rows.push('\n');
+    }
+    let rows = rows.into_bytes();
+    let manifest = format!(
+        "{{\"folds\":5,\"opaque_id\":\"{}\",\"rows_sha256\":\"{}\",\"seed\":\"{}\"}}\n",
+        instance.opaque_id,
+        sha256_hex(&rows),
+        seed,
+    );
+    atomic_output(output_dir, |stage| {
+        fs::write(stage.join("visible-rows.csv"), &rows)
+            .map_err(|error| format!("write visible-rows.csv: {error}"))?;
+        fs::write(stage.join("manifest.json"), manifest.as_bytes())
+            .map_err(|error| format!("write manifest.json: {error}"))
+    })
+}
+
+fn baseline_visible_scores(
+    instance: &occam_circuit_hmyuuu::reblind::PublicInstance,
+    method: FrozenBaseline,
+    seed: &str,
+) -> Result<(f64, f64), String> {
+    let folds = instance.visible_folds(seed, 5)?;
+    let mut exact = 0usize;
+    let mut bits = 0usize;
+    let mut rows = 0usize;
+    for held_out in folds {
+        let held_out: std::collections::BTreeSet<_> = held_out.into_iter().collect();
+        let train = PartialTable {
+            ninputs: instance.input_bits,
+            noutputs: instance.output_bits,
+            rows: instance
+                .train
+                .rows
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| !held_out.contains(index))
+                .map(|(_, row)| row.clone())
+                .collect(),
+        };
+        let completed = complete_frozen_table(&train, method)?;
+        for row in held_out {
+            let (input, expected) = &instance.train.rows[row];
+            let actual = &completed.outputs[row_index(input)];
+            exact += usize::from(actual == expected);
+            bits += actual
+                .iter()
+                .zip(expected)
+                .filter(|(actual, expected)| actual == expected)
+                .count();
+            rows += 1;
+        }
+    }
+    if rows == 0 {
+        return Err("visible folds did not contain any rows".into());
+    }
+    Ok((
+        exact as f64 / rows as f64,
+        bits as f64 / (rows * instance.output_bits) as f64,
+    ))
+}
+
+fn completed_table_csv_bytes(table: &CompleteTable) -> Vec<u8> {
+    let mut csv = String::from("input,output\n");
+    for (mask, output) in table.outputs.iter().enumerate() {
+        csv.push_str(&encode_bits(&encode_lsb(mask as u64, table.ninputs)));
+        csv.push(',');
+        csv.push_str(&encode_bits(output));
+        csv.push('\n');
+    }
+    csv.into_bytes()
+}
+
+fn verify_emitted_circuit(
+    circuit_bytes: &[u8],
+    completed: &CompleteTable,
+) -> Result<usize, String> {
+    let text = std::str::from_utf8(circuit_bytes)
+        .map_err(|_| "emitted circuit is not valid UTF-8".to_string())?;
+    let emitted =
+        Netlist::parse(text).map_err(|error| format!("parse emitted circuit: {error}"))?;
+    let actual = emitted
+        .evaluate_all()
+        .map_err(|error| format!("evaluate emitted circuit: {error}"))?;
+    if actual != completed.outputs {
+        let mask = actual
+            .iter()
+            .zip(&completed.outputs)
+            .position(|(actual, expected)| actual != expected)
+            .unwrap_or_else(|| actual.len().min(completed.outputs.len()));
+        return Err(format!(
+            "emitted circuit differs from completed table at input mask {mask}"
+        ));
+    }
+    Ok(emitted.gate_count())
+}
+
+fn decimal(value: f64) -> String {
+    if value == 1.0 {
+        "1.0".into()
+    } else if value == 0.0 {
+        "0.0".into()
+    } else {
+        value.to_string()
+    }
+}
+
+fn tracked_public_commitment() -> Result<String, String> {
+    let commitment = include_str!("../reblind/COMMITMENT.txt")
+        .strip_suffix('\n')
+        .ok_or_else(|| "tracked COMMITMENT.txt must have a final LF".to_string())?;
+    if commitment.len() != 64
+        || !commitment
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err("tracked COMMITMENT.txt is invalid".into());
+    }
+    Ok(commitment.to_string())
+}
+
+fn atomic_output(
+    output_dir: &Path,
+    write: impl FnOnce(&Path) -> Result<(), String>,
+) -> Result<(), String> {
+    let stage = create_sibling_directory(output_dir, "stage")?;
+    let mut cleanup = CleanupDir::new(stage.clone());
+    write(&stage)?;
+
+    let mut staged = Vec::new();
+    for entry in fs::read_dir(&stage).map_err(|error| format!("inspect staged output: {error}"))? {
+        let entry = entry.map_err(|error| format!("inspect staged output entry: {error}"))?;
+        let metadata = fs::symlink_metadata(entry.path())
+            .map_err(|error| format!("inspect staged artifact: {error}"))?;
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            return Err("staged output must contain only regular non-symlink files".into());
+        }
+        staged.push(entry.file_name());
+    }
+    staged.sort_by_key(|name| {
+        let name_text = name.to_string_lossy();
+        (name_text.ends_with("metrics.json"), name.clone())
+    });
+
+    match fs::symlink_metadata(output_dir) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            fs::rename(&stage, output_dir)
+                .map_err(|error| format!("atomically publish OUTPUT_DIR: {error}"))?;
+            cleanup.disarm();
+            Ok(())
+        }
+        Err(error) => Err(format!("inspect OUTPUT_DIR: {error}")),
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+            Err("OUTPUT_DIR must be a real directory, not a symlink".into())
+        }
+        Ok(_) => {
+            for entry in fs::read_dir(output_dir)
+                .map_err(|error| format!("inspect existing OUTPUT_DIR: {error}"))?
+            {
+                let entry =
+                    entry.map_err(|error| format!("inspect existing output entry: {error}"))?;
+                let metadata = fs::symlink_metadata(entry.path())
+                    .map_err(|error| format!("inspect existing output artifact: {error}"))?;
+                if metadata.file_type().is_symlink() || !metadata.is_file() {
+                    return Err(
+                        "existing OUTPUT_DIR must contain only regular non-symlink files".into(),
+                    );
+                }
+            }
+            for name in &staged {
+                match fs::symlink_metadata(output_dir.join(name)) {
+                    Ok(_) => {
+                        return Err(format!(
+                            "output artifact {} already exists",
+                            output_dir.join(name).display()
+                        ));
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(format!("inspect output artifact: {error}")),
+                }
+            }
+
+            let mut installed = Vec::new();
+            for name in &staged {
+                let destination = output_dir.join(name);
+                if let Err(error) = fs::hard_link(stage.join(name), &destination) {
+                    for installed_path in installed.iter().rev() {
+                        let _ = fs::remove_file(installed_path);
+                    }
+                    return Err(format!(
+                        "atomically publish output artifact {}: {error}",
+                        destination.display()
+                    ));
+                }
+                installed.push(destination);
+            }
+            fs::remove_dir_all(&stage)
+                .map_err(|error| format!("remove completed output stage: {error}"))?;
+            cleanup.disarm();
+            Ok(())
+        }
     }
 }
 
@@ -668,5 +973,106 @@ mod tests {
             leaked.is_empty(),
             "transaction directories leaked: {leaked:?}"
         );
+    }
+
+    #[test]
+    fn emitted_netlist_verification_rejects_a_wrong_serialized_table() {
+        let table = CompleteTable::from_fn(1, 1, |_| 0);
+
+        let error = verify_emitted_circuit(b"INPUTS 1\nOUTPUTS ~x1\n", &table).unwrap_err();
+
+        assert!(error.contains("emitted circuit differs"));
+    }
+
+    #[test]
+    fn emitted_netlist_gate_count_includes_a_materialized_constant() {
+        let table = CompleteTable::from_fn(1, 1, |_| 0);
+        let emitted = b"INPUTS 1\nw1 = XOR x1 x1\nOUTPUTS w1\n";
+
+        assert_eq!(verify_emitted_circuit(emitted, &table).unwrap(), 1);
+    }
+
+    #[test]
+    fn atomic_output_publishes_into_runner_owned_cell_without_replacing_logs() {
+        let temporary = TempDir::new();
+        let cell = temporary.0.join("cells").join("cell-001");
+        fs::create_dir_all(&cell).unwrap();
+        fs::write(cell.join("stdout.log"), b"runner stdout\n").unwrap();
+        fs::write(cell.join("stderr.log"), b"runner stderr\n").unwrap();
+
+        atomic_output(&cell, |stage| {
+            fs::write(stage.join("completed-table.csv"), b"input,output\n")
+                .map_err(|error| error.to_string())?;
+            fs::write(stage.join("circuit.txt"), b"INPUTS 0\nOUTPUTS 0\n")
+                .map_err(|error| error.to_string())?;
+            fs::write(stage.join("artifact.json"), b"{}\n").map_err(|error| error.to_string())?;
+            fs::write(stage.join("metrics.json"), b"{}\n").map_err(|error| error.to_string())
+        })
+        .unwrap();
+
+        assert_eq!(
+            fs::read(cell.join("stdout.log")).unwrap(),
+            b"runner stdout\n"
+        );
+        assert_eq!(
+            fs::read(cell.join("stderr.log")).unwrap(),
+            b"runner stderr\n"
+        );
+        assert_eq!(
+            fs::read(cell.join("completed-table.csv")).unwrap(),
+            b"input,output\n"
+        );
+        assert_eq!(
+            fs::read(cell.join("circuit.txt")).unwrap(),
+            b"INPUTS 0\nOUTPUTS 0\n"
+        );
+        assert_eq!(fs::read(cell.join("artifact.json")).unwrap(), b"{}\n");
+        assert_eq!(fs::read(cell.join("metrics.json")).unwrap(), b"{}\n");
+    }
+
+    #[test]
+    fn atomic_output_rejects_non_directory_and_symlink_outputs() {
+        let temporary = TempDir::new();
+        let file = temporary.0.join("cell-file");
+        fs::write(&file, b"not a directory\n").unwrap();
+        let error = atomic_output(&file, |_| Ok(())).unwrap_err();
+        assert!(error.contains("real directory"));
+
+        #[cfg(unix)]
+        {
+            let real = temporary.0.join("real-cell");
+            let link = temporary.0.join("linked-cell");
+            fs::create_dir(&real).unwrap();
+            std::os::unix::fs::symlink(&real, &link).unwrap();
+            let error = atomic_output(&link, |_| Ok(())).unwrap_err();
+            assert!(error.contains("real directory"));
+        }
+    }
+
+    #[test]
+    fn atomic_output_refuses_to_overwrite_a_candidate_artifact() {
+        let temporary = TempDir::new();
+        let cell = temporary.0.join("cell");
+        fs::create_dir(&cell).unwrap();
+        fs::write(cell.join("stdout.log"), b"runner stdout\n").unwrap();
+        fs::write(cell.join("artifact.json"), b"existing artifact\n").unwrap();
+
+        let error = atomic_output(&cell, |stage| {
+            fs::write(stage.join("completed-table.csv"), b"new table\n")
+                .map_err(|error| error.to_string())?;
+            fs::write(stage.join("artifact.json"), b"replacement\n")
+                .map_err(|error| error.to_string())?;
+            fs::write(stage.join("metrics.json"), b"new metrics\n")
+                .map_err(|error| error.to_string())
+        })
+        .unwrap_err();
+
+        assert!(error.contains("already exists"));
+        assert_eq!(
+            fs::read(cell.join("artifact.json")).unwrap(),
+            b"existing artifact\n"
+        );
+        assert!(!cell.join("completed-table.csv").exists());
+        assert!(!cell.join("metrics.json").exists());
     }
 }

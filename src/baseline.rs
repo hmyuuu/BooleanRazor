@@ -19,6 +19,21 @@ pub fn complete_frozen_baseline(
     table: &PartialTable,
     method: FrozenBaseline,
 ) -> Result<(CompleteTable, Circuit), String> {
+    let completed = complete_frozen_table(table, method)?;
+    let grouped = extract_verified(&completed, grouped_order(table.ninputs))?;
+    let interleaved = extract_verified(&completed, interleaved_order(table.ninputs))?;
+    let selected = if interleaved.reachable_gate_count()? < grouped.reachable_gate_count()? {
+        interleaved
+    } else {
+        grouped
+    };
+    Ok((completed, selected))
+}
+
+pub fn complete_frozen_table(
+    table: &PartialTable,
+    method: FrozenBaseline,
+) -> Result<CompleteTable, String> {
     let row_count = validate_partial_table(table)?;
     let outputs = match method {
         FrozenBaseline::ZeroFill => zero_fill(table, row_count),
@@ -30,15 +45,7 @@ pub fn complete_frozen_baseline(
         outputs,
     };
     table.validate_against(&completed)?;
-
-    let grouped = extract_verified(&completed, grouped_order(table.ninputs))?;
-    let interleaved = extract_verified(&completed, interleaved_order(table.ninputs))?;
-    let selected = if interleaved.reachable_gate_count()? < grouped.reachable_gate_count()? {
-        interleaved
-    } else {
-        grouped
-    };
-    Ok((completed, selected))
+    Ok(completed)
 }
 
 fn validate_partial_table(table: &PartialTable) -> Result<usize, String> {

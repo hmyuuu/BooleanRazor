@@ -6,6 +6,7 @@ pub mod netlist;
 pub mod order;
 #[cfg(feature = "oxidd-oracle")]
 pub mod oxidd_oracle;
+pub mod reblind;
 pub mod robdd;
 pub mod table;
 pub mod xag;

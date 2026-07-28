@@ -1,4 +1,6 @@
-use occam_circuit_hmyuuu::baseline::{FrozenBaseline, complete_frozen_baseline};
+use occam_circuit_hmyuuu::baseline::{
+    FrozenBaseline, complete_frozen_baseline, complete_frozen_table,
+};
 use occam_circuit_hmyuuu::bits::encode_lsb;
 #[cfg(feature = "oxidd-oracle")]
 use occam_circuit_hmyuuu::oxidd_oracle::OxiddForest;
@@ -67,6 +69,16 @@ fn zero_fill_restores_observations_and_zeros_every_unseen_row() {
         assert_eq!(completed.outputs[mask], expected);
     }
     assert_eq!(circuit.evaluate_all().unwrap(), completed.outputs);
+}
+
+#[test]
+fn table_only_completion_matches_the_table_returned_after_synthesis() {
+    let source = partial(3, 2, &[(0, 1), (3, 2)]);
+    for method in [FrozenBaseline::ZeroFill, FrozenBaseline::HammingOneNearest] {
+        let table_only = complete_frozen_table(&source, method).unwrap();
+        let (with_circuit, _) = complete_frozen_baseline(&source, method).unwrap();
+        assert_eq!(table_only, with_circuit);
+    }
 }
 
 #[test]

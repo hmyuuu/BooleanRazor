@@ -55,6 +55,43 @@ that exact extraction only through `OCCAM_REBLIND_PUBLIC_ROOT`, and only after
 its hypothesis and synthetic-test-only implementation commit is recorded. HPC
 staging copies this public directory, never a custodian root.
 
+## Public importer and learner boundary
+
+Production code accepts a public bundle only when the positional `PUBLIC_ROOT`
+and `OCCAM_REBLIND_PUBLIC_ROOT` both name the same canonical directory whose
+basename is the tracked commitment. Its `manifest.csv` must be byte-identical
+to this tracked manifest. The extraction contains exactly that manifest and
+`instances/<opaque-id>/train.csv` files: UTF-8, LF-terminated canonical CSV
+with no extra fields, executable files, symlinks, or metadata names that could
+disclose a family, generator, seed, sealed value, or evaluator output. Each
+visible table is digest-checked before any learner receives it.
+
+All benchmark-facing learners must enter through this importer. The frozen
+baseline dialect is deliberately closed:
+
+```text
+occam-circuit-hmyuuu frozen-baseline PUBLIC_ROOT OPAQUE_ID OUTPUT_DIR \
+  --method zero-fill|hamming-1nn \
+  --metrics-json OUTPUT_DIR/metrics.json
+```
+
+It rejects caller-provided raw CSV paths and widths, validates the public
+bundle before completion, derives its selection seed internally, and atomically
+publishes only `completed-table.csv`, `circuit.txt`, `artifact.json`, and the
+Task 10 `metrics.json`. The completed table is canonical `input,output` CSV in
+increasing numeric LSB-mask order and must restore every visible row.
+
+Visible-only consumers that need folds must use:
+
+```text
+occam-circuit-hmyuuu export-visible PUBLIC_ROOT OPAQUE_ID OUTPUT_DIR \
+  --seed <64-lowercase-hex> --folds 5
+```
+
+This export reuses the importer validation, assigns rows by the documented
+SHA-256 round-robin ranking, and writes only the validated visible rows with a
+hash manifest. It never opens a custodian path or exposes hidden outputs.
+
 The committed manifest must contain 180 opaque rows and no family, generator,
 secret seed, label, complete-table, sealed-table, or evaluator-derived field.
 The accompanying baseline matrix contains exactly two frozen methods × those

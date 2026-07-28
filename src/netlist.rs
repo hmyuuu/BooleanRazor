@@ -122,6 +122,53 @@ impl Netlist {
             .map(|output| literal_value(*output, inputs, &gate_values))
             .collect())
     }
+
+    pub fn gate_count(&self) -> usize {
+        self.gates.len()
+    }
+
+    pub fn evaluate_all(&self) -> Result<Vec<Vec<bool>>, String> {
+        let shift = u32::try_from(self.ninputs)
+            .map_err(|_| "netlist input dimensions overflow".to_string())?;
+        let row_count = 1usize
+            .checked_shl(shift)
+            .ok_or_else(|| "netlist input dimensions overflow".to_string())?;
+        let mut rows = vec![vec![false; self.outputs.len()]; row_count];
+        let mut input_values = vec![0u64; self.ninputs];
+        let mut gate_values = vec![0u64; self.gates.len()];
+
+        for base in (0..row_count).step_by(u64::BITS as usize) {
+            input_values.fill(0);
+            gate_values.fill(0);
+            let lanes = (row_count - base).min(u64::BITS as usize);
+            for (input, value) in input_values.iter_mut().enumerate() {
+                for lane in 0..lanes {
+                    if (((base + lane) >> input) & 1) != 0 {
+                        *value |= 1u64 << lane;
+                    }
+                }
+            }
+            for (index, gate) in self.gates.iter().enumerate() {
+                let left = word_literal_value(gate.left, &input_values, &gate_values);
+                let right = word_literal_value(gate.right, &input_values, &gate_values);
+                gate_values[index] = match gate.op {
+                    NetOp::And => left & right,
+                    NetOp::Or => left | right,
+                    NetOp::Xor => left ^ right,
+                    NetOp::Nand => !(left & right),
+                    NetOp::Nor => !(left | right),
+                    NetOp::Xnor => !(left ^ right),
+                };
+            }
+            for (output, literal) in self.outputs.iter().enumerate() {
+                let word = word_literal_value(*literal, &input_values, &gate_values);
+                for lane in 0..lanes {
+                    rows[base + lane][output] = ((word >> lane) & 1) != 0;
+                }
+            }
+        }
+        Ok(rows)
+    }
 }
 
 fn parse_op(text: &str) -> Result<NetOp, String> {
@@ -176,6 +223,14 @@ fn literal_value(literal: NetLit, inputs: &[bool], gates: &[bool]) -> bool {
         Base::Gate(index) => gates[index],
     };
     value ^ literal.inverted
+}
+
+fn word_literal_value(literal: NetLit, inputs: &[u64], gates: &[u64]) -> u64 {
+    let value = match literal.base {
+        Base::Input(index) => inputs[index],
+        Base::Gate(index) => gates[index],
+    };
+    value ^ if literal.inverted { u64::MAX } else { 0 }
 }
 
 pub(crate) fn serialize(circuit: &Circuit) -> Result<String, String> {

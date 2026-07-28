@@ -205,6 +205,29 @@ OUTPUTS w1 w2 w3 w4 w5 w6
 }
 
 #[test]
+fn bit_parallel_netlist_evaluation_matches_scalar_across_many_words() {
+    let text = "\
+INPUTS 12
+w1 = AND x1 x12
+w2 = OR x2 x11
+w3 = XOR w1 w2
+w4 = NAND x3 w3
+w5 = NOR x4 w4
+w6 = XNOR x5 w5
+OUTPUTS w1 w2 w3 w4 w5 w6 ~w6
+";
+    let netlist = Netlist::parse(text).unwrap();
+
+    let parallel = netlist.evaluate_all().unwrap();
+
+    assert_eq!(parallel.len(), 1usize << 12);
+    for (mask, actual) in parallel.iter().enumerate() {
+        let inputs = occam_circuit_hmyuuu::bits::encode_lsb(mask as u64, 12);
+        assert_eq!(actual, &netlist.evaluate(&inputs).unwrap(), "mask={mask}");
+    }
+}
+
+#[test]
 fn constant_outputs_materialize_exactly_one_canonical_xor() {
     let g = Xag::new(1);
     let outputs = vec![g.f(), g.t()];
