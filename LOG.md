@@ -102,3 +102,43 @@ Fresh post-resolution `make test` passed:
 No public-data, sealed-evaluation, official-Julia, memory, or benchmark-accuracy
 claim is made by this integration. Any later command loss, contract drift,
 nondeterminism, equivalence failure, or protocol-gate failure rejects it.
+
+## 2026-07-28 decision-diagram scheduling audit
+
+This read-only algorithm audit used the clean integration commit
+`0f62ae2ca29ff861b52ad60d22508ca3a37dd898`; it did not change the frozen
+learner or access public-reblind, sealed, or remote data.
+
+The existing 20-input synthetic calibration was rerun with the frozen
+32-order-evaluation budget:
+
+```text
+rows=104857
+max_order_evals=32
+elapsed_seconds=70.273820
+completed_bytes=45088781
+circuit_bytes=905959
+test_elapsed_seconds=72.77
+result=pass
+```
+
+The current search evaluates eight fixed seeds, retains a four-member beam,
+then serializes every adjacent swap of each beam member. For 20 inputs, each
+seed has 19 distinct adjacent neighbors. An exhaustive structural check of the
+eight seed orders found:
+
+```text
+seed_count=8
+neighbors_per_seed=19
+seed_pairs_at_adjacent_distance=0
+pairwise_neighbor_intersection_sizes={0}
+```
+
+Thus the 32-evaluation cap leaves 24 new evaluations after the seeds and
+allocates them exactly `19 / 5 / 0 / 0` across the four retained beam members.
+This is an order-enumeration artifact, not evidence that the first beam member
+deserves more search. The proposed follow-up keeps the completion policy,
+folds, seeds, beam width, score, and hard budget fixed while interleaving
+spread adjacent boundaries round-robin across beam members. It remains behind
+the human design-ratification gate. OxiDD remains a finalist oracle, and the
+70-second local cell does not justify hpccube use.
