@@ -17,7 +17,7 @@ use occam_circuit_hmyuuu::order::{
 };
 #[cfg(feature = "oxidd-oracle")]
 use occam_circuit_hmyuuu::oxidd_oracle::OxiddForest;
-use occam_circuit_hmyuuu::reblind::PublicSuite;
+use occam_circuit_hmyuuu::reblind::{PublicSuite, validate_selection_seed};
 use occam_circuit_hmyuuu::table::{
     CompleteTable, InputTable, PartialTable, prediction_csv_bytes, row_index, sha256_hex,
 };
@@ -158,6 +158,7 @@ fn export_visible(arguments: &[std::ffi::OsString]) -> Result<(), String> {
     if folds != 5 {
         return Err("--folds must equal the frozen value 5".into());
     }
+    validate_selection_seed(seed)?;
     let suite = PublicSuite::load_frozen(root)?;
     let instance = suite.instance(opaque_id)?;
     let assignments = instance.visible_folds(seed, folds)?;

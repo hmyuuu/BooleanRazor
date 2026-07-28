@@ -115,6 +115,81 @@ fn frozen_baseline_rejects_modified_training_bytes_before_creating_outputs() {
         .unwrap();
 
     assert!(!output.status.success());
-    assert!(String::from_utf8_lossy(&output.stderr).contains("train.csv digest"));
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("train.csv byte length does not match manifest")
+    );
+    assert!(!output_dir.exists());
+}
+
+#[test]
+fn export_visible_rejects_nonfrozen_folds_and_malformed_seed_without_output() {
+    let (temporary_parent, root) = modified_frozen_bundle();
+    let parent = temporary_parent.0.as_path();
+    let binary = env!("CARGO_BIN_EXE_occam-circuit-hmyuuu");
+    let opaque_id = "rb-000000000000000000000000";
+
+    let folds_output = parent.join("bad-folds");
+    let result = Command::new(binary)
+        .env_remove("OCCAM_REBLIND_PUBLIC_ROOT")
+        .args([
+            "export-visible",
+            root.to_str().unwrap(),
+            opaque_id,
+            folds_output.to_str().unwrap(),
+            "--seed",
+            &"00".repeat(32),
+            "--folds",
+            "4",
+        ])
+        .output()
+        .unwrap();
+    assert!(!result.status.success());
+    assert!(String::from_utf8_lossy(&result.stderr).contains("--folds must equal"));
+    assert!(!folds_output.exists());
+
+    let seed_output = parent.join("bad-seed");
+    let result = Command::new(binary)
+        .env_remove("OCCAM_REBLIND_PUBLIC_ROOT")
+        .args([
+            "export-visible",
+            root.to_str().unwrap(),
+            opaque_id,
+            seed_output.to_str().unwrap(),
+            "--seed",
+            "not-a-64-hex-seed",
+            "--folds",
+            "5",
+        ])
+        .output()
+        .unwrap();
+    assert!(!result.status.success());
+    assert!(String::from_utf8_lossy(&result.stderr).contains("64 lowercase hex"));
+    assert!(!seed_output.exists());
+}
+
+#[test]
+fn export_visible_rejects_an_output_override_argument() {
+    let (temporary_parent, root) = modified_frozen_bundle();
+    let output_dir = temporary_parent.0.join("output");
+    let result = Command::new(env!("CARGO_BIN_EXE_occam-circuit-hmyuuu"))
+        .env_remove("OCCAM_REBLIND_PUBLIC_ROOT")
+        .args([
+            "export-visible",
+            root.to_str().unwrap(),
+            "rb-000000000000000000000000",
+            output_dir.to_str().unwrap(),
+            "--seed",
+            &"00".repeat(32),
+            "--folds",
+            "5",
+            "--output",
+            "alternate.csv",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(!result.status.success());
+    assert!(String::from_utf8_lossy(&result.stderr).contains("usage:"));
     assert!(!output_dir.exists());
 }

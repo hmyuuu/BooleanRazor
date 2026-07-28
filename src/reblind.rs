@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::io::{BufRead, BufReader, Cursor};
+use std::io::{BufRead, BufReader, Cursor, Read};
 use std::path::{Path, PathBuf};
 
 use sha2::{Digest, Sha256};
@@ -19,6 +19,8 @@ const FORBIDDEN: [&str; 7] = [
     "seed",
     "sealed",
 ];
+const CSV_HEADER_SCAN_LIMIT: usize = 4096;
+const JSON_SCAN_LIMIT: usize = 64 * 1024;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PublicInstance {
@@ -37,10 +39,7 @@ impl PublicInstance {
         if folds == 0 {
             return Err("fold count must be positive".into());
         }
-        let seed = decode_lower_hex(seed_hex, "selection seed")?;
-        if seed.len() != 32 {
-            return Err("selection seed must be exactly 64 lowercase hex characters".into());
-        }
+        let seed = decode_selection_seed(seed_hex)?;
         let mut ranked: Vec<_> = self
             .train
             .rows
@@ -69,15 +68,25 @@ impl PublicInstance {
         &self,
         mut reader: impl BufRead,
     ) -> Result<CompleteTable, String> {
-        let header = read_canonical_csv_line(&mut reader, "completed-table.csv")?;
+        let header = read_bounded_canonical_csv_line(
+            &mut reader,
+            "completed-table.csv",
+            b"input,output\n".len(),
+        )?;
         if header.as_deref() != Some("input,output") {
             return Err("completed-table.csv must start with input,output".into());
         }
-        let expected_rows = 1usize << self.input_bits;
+        let row_bytes = canonical_table_row_bytes(self.input_bits, self.output_bits)?;
+        let shift = u32::try_from(self.input_bits)
+            .map_err(|_| "completed-table.csv dimensions overflow".to_string())?;
+        let expected_rows = 1usize
+            .checked_shl(shift)
+            .ok_or_else(|| "completed-table.csv dimensions overflow".to_string())?;
         let mut outputs = Vec::with_capacity(expected_rows);
         for expected_mask in 0..expected_rows {
-            let line = read_canonical_csv_line(&mut reader, "completed-table.csv")?
-                .ok_or_else(|| "completed-table.csv has too few rows".to_string())?;
+            let line =
+                read_bounded_canonical_csv_line(&mut reader, "completed-table.csv", row_bytes)?
+                    .ok_or_else(|| "completed-table.csv has too few rows".to_string())?;
             let (input, output) = parse_table_row(&line, self.input_bits, self.output_bits)?;
             if row_index(&input) != expected_mask {
                 return Err(
@@ -86,7 +95,8 @@ impl PublicInstance {
             }
             outputs.push(output);
         }
-        if read_canonical_csv_line(&mut reader, "completed-table.csv")?.is_some() {
+        if read_bounded_canonical_csv_line(&mut reader, "completed-table.csv", row_bytes)?.is_some()
+        {
             return Err("completed-table.csv has too many rows".into());
         }
         let completed = CompleteTable {
@@ -99,16 +109,36 @@ impl PublicInstance {
     }
 }
 
-fn read_canonical_csv_line(
+pub fn validate_selection_seed(seed_hex: &str) -> Result<(), String> {
+    decode_selection_seed(seed_hex).map(|_| ())
+}
+
+fn decode_selection_seed(seed_hex: &str) -> Result<Vec<u8>, String> {
+    let seed = decode_lower_hex(seed_hex, "selection seed")?;
+    if seed.len() != 32 {
+        return Err("selection seed must be exactly 64 lowercase hex characters".into());
+    }
+    Ok(seed)
+}
+
+fn read_bounded_canonical_csv_line(
     reader: &mut impl BufRead,
     label: &str,
+    max_bytes: usize,
 ) -> Result<Option<String>, String> {
-    let mut bytes = Vec::new();
+    let read_limit = max_bytes
+        .checked_add(1)
+        .ok_or_else(|| format!("{label} canonical width overflows"))?;
+    let mut bytes = Vec::with_capacity(read_limit);
     let count = reader
+        .take(read_limit as u64)
         .read_until(b'\n', &mut bytes)
         .map_err(|error| format!("read {label}: {error}"))?;
     if count == 0 {
         return Ok(None);
+    }
+    if bytes.len() > max_bytes {
+        return Err(format!("{label} line exceeds canonical width"));
     }
     if bytes.contains(&b'\r') {
         return Err(format!("{label} must use LF, not CRLF"));
@@ -120,6 +150,13 @@ fn read_canonical_csv_line(
     String::from_utf8(bytes)
         .map(Some)
         .map_err(|_| format!("{label} must be valid UTF-8"))
+}
+
+fn canonical_table_row_bytes(ninputs: usize, noutputs: usize) -> Result<usize, String> {
+    ninputs
+        .checked_add(noutputs)
+        .and_then(|width| width.checked_add(2))
+        .ok_or_else(|| "canonical table row width overflows".to_string())
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -145,7 +182,12 @@ impl PublicSuite {
         if root.file_name().and_then(|name| name.to_str()) != Some(expected_commitment.as_str()) {
             return Err("public root basename does not equal the tracked commitment".into());
         }
-        let manifest = strict_regular_bytes(&root.join("manifest.csv"), "manifest.csv")?;
+        let manifest = strict_regular_bytes_exact(
+            &root.join("manifest.csv"),
+            "manifest.csv",
+            expected_manifest.len(),
+            "tracked manifest",
+        )?;
         if manifest != expected_manifest {
             return Err("public manifest does not match the tracked frozen manifest".into());
         }
@@ -166,7 +208,12 @@ impl PublicSuite {
     #[cfg(test)]
     pub(crate) fn load_with_trust(root: &Path, trust: BundleTrust) -> Result<Self, String> {
         let root = canonical_public_root(root)?;
-        let manifest = strict_regular_bytes(&root.join("manifest.csv"), "manifest.csv")?;
+        let manifest = strict_regular_bytes_exact(
+            &root.join("manifest.csv"),
+            "manifest.csv",
+            trust.manifest.len(),
+            "test trust",
+        )?;
         if manifest != trust.manifest {
             return Err("synthetic manifest does not match its test trust".into());
         }
@@ -203,13 +250,6 @@ fn load_checked(
     _commitment: &str,
     manifest_bytes: &[u8],
 ) -> Result<PublicSuite, String> {
-    let findings = scan_public_bundle(root)?;
-    if !findings.is_empty() {
-        return Err(format!(
-            "public bundle leaks forbidden metadata: {}",
-            findings.join(", ")
-        ));
-    }
     let records = parse_manifest(manifest_bytes)?;
     let expected_paths: BTreeSet<_> = records
         .iter()
@@ -233,6 +273,25 @@ fn load_checked(
     if actual_paths.files != expected_paths || actual_paths.directories != expected_directories {
         return Err("public bundle has missing or extra files".into());
     }
+    for record in &records {
+        let train_path = root
+            .join("instances")
+            .join(&record.opaque_id)
+            .join("train.csv");
+        validate_regular_file_exact_metadata(
+            &train_path,
+            "train.csv",
+            canonical_train_file_bytes(record)?,
+            "manifest",
+        )?;
+    }
+    let findings = scan_public_bundle(root)?;
+    if !findings.is_empty() {
+        return Err(format!(
+            "public bundle leaks forbidden metadata: {}",
+            findings.join(", ")
+        ));
+    }
 
     let mut strata = BTreeMap::new();
     let mut instances = Vec::with_capacity(records.len());
@@ -241,7 +300,9 @@ fn load_checked(
             .join("instances")
             .join(&record.opaque_id)
             .join("train.csv");
-        let bytes = strict_regular_bytes(&train_path, "train.csv")?;
+        let expected_bytes = canonical_train_file_bytes(&record)?;
+        let bytes =
+            strict_regular_bytes_exact(&train_path, "train.csv", expected_bytes, "manifest")?;
         if public_digest(&record.fields(), &bytes) != record.public_sha256 {
             return Err(format!(
                 "{} train.csv digest does not match manifest",
@@ -501,7 +562,43 @@ fn canonical_public_root(root: &Path) -> Result<PathBuf, String> {
     fs::canonicalize(root).map_err(|error| format!("canonicalize public root: {error}"))
 }
 
-fn strict_regular_bytes(path: &Path, label: &str) -> Result<Vec<u8>, String> {
+fn canonical_train_file_bytes(record: &ManifestRecord) -> Result<usize, String> {
+    let row_bytes = canonical_table_row_bytes(record.input_bits, record.output_bits)?;
+    record
+        .train_rows
+        .checked_mul(row_bytes)
+        .and_then(|rows| rows.checked_add(b"input,output\n".len()))
+        .ok_or_else(|| format!("{} train.csv byte length overflows", record.opaque_id))
+}
+
+fn strict_regular_bytes_exact(
+    path: &Path,
+    label: &str,
+    expected_len: usize,
+    authority: &str,
+) -> Result<Vec<u8>, String> {
+    validate_regular_file_exact_metadata(path, label, expected_len, authority)?;
+    let file = fs::File::open(path).map_err(|error| format!("{label}: {error}"))?;
+    let mut bytes = Vec::with_capacity(expected_len);
+    file.take(
+        expected_len
+            .checked_add(1)
+            .ok_or_else(|| format!("{label} byte length overflows"))? as u64,
+    )
+    .read_to_end(&mut bytes)
+    .map_err(|error| format!("{label}: {error}"))?;
+    if bytes.len() != expected_len {
+        return Err(format!("{label} byte length does not match {authority}"));
+    }
+    Ok(bytes)
+}
+
+fn validate_regular_file_exact_metadata(
+    path: &Path,
+    label: &str,
+    expected_len: usize,
+    authority: &str,
+) -> Result<(), String> {
     let metadata = fs::symlink_metadata(path).map_err(|error| format!("{label}: {error}"))?;
     if metadata.file_type().is_symlink() || !metadata.is_file() {
         return Err(format!("{label} must be a regular non-symlink file"));
@@ -510,7 +607,10 @@ fn strict_regular_bytes(path: &Path, label: &str) -> Result<Vec<u8>, String> {
     if std::os::unix::fs::PermissionsExt::mode(&metadata.permissions()) & 0o111 != 0 {
         return Err(format!("{label} must not be executable"));
     }
-    fs::read(path).map_err(|error| format!("{label}: {error}"))
+    if metadata.len() != expected_len as u64 {
+        return Err(format!("{label} byte length does not match {authority}"));
+    }
+    Ok(())
 }
 
 #[derive(Default)]
@@ -584,14 +684,38 @@ fn scan_directory(root: &Path, directory: &Path, findings: &mut Vec<String>) -> 
             if std::os::unix::fs::PermissionsExt::mode(&metadata.permissions()) & 0o111 != 0 {
                 findings.push(format!("{} is executable", relative.display()));
             }
-            let bytes = fs::read(&path).map_err(|error| format!("scan file: {error}"))?;
-            let text = std::str::from_utf8(&bytes).unwrap_or("");
             if path.extension().is_some_and(|ext| ext == "csv") {
-                if let Some(header) = text.lines().next() {
+                let file =
+                    fs::File::open(&path).map_err(|error| format!("scan CSV file: {error}"))?;
+                let mut reader = BufReader::new(file);
+                if let Some(header) = read_bounded_canonical_csv_line(
+                    &mut reader,
+                    "public CSV header",
+                    CSV_HEADER_SCAN_LIMIT,
+                )? {
                     scan_keys(header.split(','), relative, findings);
                 }
             }
             if path.extension().is_some_and(|ext| ext == "json") {
+                if metadata.len() > JSON_SCAN_LIMIT as u64 {
+                    return Err(format!(
+                        "{} exceeds the JSON scan limit",
+                        relative.display()
+                    ));
+                }
+                let file =
+                    fs::File::open(&path).map_err(|error| format!("scan JSON file: {error}"))?;
+                let mut bytes = Vec::with_capacity(metadata.len() as usize);
+                file.take((JSON_SCAN_LIMIT + 1) as u64)
+                    .read_to_end(&mut bytes)
+                    .map_err(|error| format!("scan JSON file: {error}"))?;
+                if bytes.len() > JSON_SCAN_LIMIT {
+                    return Err(format!(
+                        "{} exceeds the JSON scan limit",
+                        relative.display()
+                    ));
+                }
+                let text = std::str::from_utf8(&bytes).unwrap_or("");
                 scan_jsonish_keys(text, relative, findings);
             }
         } else {
@@ -780,6 +904,55 @@ mod tests {
     }
 
     #[test]
+    fn completed_table_reader_rejects_a_row_exceeding_canonical_width() {
+        let root = synthetic_public_bundle();
+        let instance = PublicSuite::load_with_trust(root.path(), root.trust())
+            .unwrap()
+            .instances()[0]
+            .clone();
+        let oversized = format!("input,output\n{},{}\n", "0".repeat(12), "0".repeat(1024));
+
+        let error = instance.import_completed_table(oversized).unwrap_err();
+
+        assert!(error.contains("exceeds canonical width"), "{error}");
+    }
+
+    #[test]
+    fn bundle_rejects_noncanonical_train_length_from_metadata() {
+        let train = b"input,output\n\
+000000000000,0000000000000\n\
+010000000000,0000000000000\n\
+110000000000,0000000000000\n";
+        let root = synthetic_public_bundle_with_train(train);
+
+        let error = PublicSuite::load_with_trust(root.path(), root.trust()).unwrap_err();
+
+        assert!(
+            error.contains("byte length does not match manifest"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn public_scan_bounds_json_files_and_csv_headers() {
+        let json_root = synthetic_public_bundle();
+        fs::write(
+            json_root.path().join("metadata.json"),
+            vec![b' '; 64 * 1024 + 1],
+        )
+        .unwrap();
+        let error = scan_public_bundle(json_root.path()).unwrap_err();
+        assert!(error.contains("JSON scan limit"), "{error}");
+
+        let csv_root = synthetic_public_bundle();
+        let mut oversized_header = vec![b'x'; 4097];
+        oversized_header.push(b'\n');
+        fs::write(csv_root.path().join("metadata.csv"), oversized_header).unwrap();
+        let error = scan_public_bundle(csv_root.path()).unwrap_err();
+        assert!(error.contains("exceeds canonical width"), "{error}");
+    }
+
+    #[test]
     fn visible_folds_are_reproducible_and_use_every_visible_row_once() {
         let root = synthetic_public_bundle();
         let instance = PublicSuite::load_with_trust(root.path(), root.trust())
@@ -798,15 +971,15 @@ mod tests {
     fn recovered_csv_boundaries_reject_noncanonical_bytes_columns_and_order() {
         let invalid_trains: &[(&[u8], &str)] = &[
             (
-                b"input,output\r\n000000000000,0000000000000\r\n010000000000,0000000000000\r\n",
+                b"input,output\r\n00000000000,0000000000000\n010000000000,0000000000000\n",
                 "CRLF",
             ),
             (
-                b"input,output\n000000000000,0000000000000\n010000000000,0000000000000",
+                b"input,output\n000000000000,0000000000000\n010000000000,00000000000000",
                 "end with one LF",
             ),
             (
-                b"input,output\n000000000000,0000000000000,extra\n010000000000,0000000000000\n",
+                b"input,output\n00000000000,,0000000000000\n010000000000,0000000000000\n",
                 "one comma",
             ),
             (
