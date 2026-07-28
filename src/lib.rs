@@ -1,6 +1,7 @@
 pub mod arithmetic;
 pub mod baseline;
 pub mod bits;
+pub mod care_bdd;
 pub mod instances;
 pub mod netlist;
 pub mod order;

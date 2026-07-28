@@ -4,6 +4,9 @@ use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use occam_circuit_hmyuuu::reblind::PublicSuite;
+use occam_circuit_hmyuuu::table::sha256_hex;
+
+const CARE_METHOD: &str = "care-bdd-reuse-sibling";
 
 struct TempRoot(PathBuf);
 
@@ -37,6 +40,11 @@ fn modified_frozen_bundle() -> (TempRoot, PathBuf) {
     (TempRoot(parent), root)
 }
 
+fn frozen_care_seed(opaque_id: &str) -> String {
+    let commitment = include_str!("../reblind/COMMITMENT.txt").trim();
+    sha256_hex(format!("{commitment}{CARE_METHOD}{opaque_id}").as_bytes())
+}
+
 #[test]
 fn frozen_loader_rejects_an_untrusted_root_before_reading_any_bundle() {
     let missing = Path::new("/definitely-not-an-occam-public-bundle");
@@ -62,6 +70,89 @@ fn frozen_baseline_rejects_a_raw_training_csv_argument() {
 
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("OCCAM_REBLIND_PUBLIC_ROOT"));
+}
+
+#[test]
+fn learn_care_rejects_raw_paths_and_nonfrozen_flags_before_output() {
+    let temporary = TempRoot(std::env::temp_dir().join(format!(
+        "occam-learn-care-rejections-{}",
+        std::process::id()
+    )));
+    let output_dir = temporary.0.join("output");
+    let binary = env!("CARGO_BIN_EXE_occam-circuit-hmyuuu");
+    let opaque_id = "rb-000000000000000000000000";
+    let seed = frozen_care_seed(opaque_id);
+    let base = [
+        "learn-care",
+        "train.csv",
+        opaque_id,
+        output_dir.to_str().unwrap(),
+        "--folds",
+        "5",
+        "--seed",
+        &seed,
+        "--policy",
+        "reuse-sibling",
+        "--max-order-evals",
+        "32",
+    ];
+    let raw = Command::new(binary).args(base).output().unwrap();
+    assert!(!raw.status.success());
+    assert!(String::from_utf8_lossy(&raw.stderr).contains("OCCAM_REBLIND_PUBLIC_ROOT"));
+    assert!(!output_dir.exists());
+
+    for (tail, expected) in [
+        (vec!["--folds", "4"], "--folds must equal"),
+        (vec!["--seed", "bad"], "64 lowercase hex"),
+        (
+            vec!["--seed", &"00".repeat(32)],
+            "--seed must equal the frozen algorithm seed",
+        ),
+        (vec!["--policy", "guess"], "--policy must be"),
+        (
+            vec!["--policy", "zero"],
+            "--policy must equal the frozen value reuse-sibling",
+        ),
+        (
+            vec!["--max-order-evals", "0"],
+            "--max-order-evals must be positive",
+        ),
+        (
+            vec!["--max-order-evals", "31"],
+            "--max-order-evals must equal the frozen value 32",
+        ),
+        (vec!["--input-bits", "12"], "unknown flag"),
+        (vec!["--train-csv", "train.csv"], "unknown flag"),
+    ] {
+        let mut arguments = vec![
+            "learn-care",
+            "missing-public-root",
+            opaque_id,
+            output_dir.to_str().unwrap(),
+            "--folds",
+            "5",
+            "--seed",
+            &seed,
+            "--policy",
+            "reuse-sibling",
+            "--max-order-evals",
+            "32",
+        ];
+        let flag = tail[0];
+        if let Some(position) = arguments.iter().position(|argument| *argument == flag) {
+            arguments[position + 1] = tail[1];
+        } else {
+            arguments.extend(tail);
+        }
+        let result = Command::new(binary).args(arguments).output().unwrap();
+        assert!(!result.status.success());
+        assert!(
+            String::from_utf8_lossy(&result.stderr).contains(expected),
+            "stderr did not contain {expected:?}: {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        assert!(!output_dir.exists());
+    }
 }
 
 #[test]

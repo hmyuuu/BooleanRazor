@@ -94,37 +94,46 @@ impl Builder<'_> {
         self.mk(var, low, high)
     }
 
-    fn mk(&mut self, var: usize, mut low: BddEdge, mut high: BddEdge) -> Result<BddEdge, String> {
-        if low == high {
-            return Ok(low);
-        }
-
-        let output_inverted = low.inverted;
-        if output_inverted {
-            low = !low;
-            high = !high;
-        }
-        let key = NodeKey { var, low, high };
-        let node = if let Some(node) = self.unique.get(&key) {
-            *node
-        } else {
-            let raw_id = self
-                .nodes
-                .len()
-                .checked_add(1)
-                .ok_or_else(|| "ROBDD node dimensions overflow".to_string())?;
-            let raw_id =
-                u32::try_from(raw_id).map_err(|_| "ROBDD node dimensions overflow".to_string())?;
-            let node = NodeId(raw_id);
-            self.nodes.push(BddNode { var, low, high });
-            self.unique.insert(key, node);
-            node
-        };
-        Ok(BddEdge {
-            node,
-            inverted: output_inverted,
-        })
+    fn mk(&mut self, var: usize, low: BddEdge, high: BddEdge) -> Result<BddEdge, String> {
+        canonical_mk(&mut self.nodes, &mut self.unique, var, low, high)
     }
+}
+
+fn canonical_mk(
+    nodes: &mut Vec<BddNode>,
+    unique: &mut HashMap<NodeKey, NodeId>,
+    var: usize,
+    mut low: BddEdge,
+    mut high: BddEdge,
+) -> Result<BddEdge, String> {
+    if low == high {
+        return Ok(low);
+    }
+
+    let output_inverted = low.inverted;
+    if output_inverted {
+        low = !low;
+        high = !high;
+    }
+    let key = NodeKey { var, low, high };
+    let node = if let Some(node) = unique.get(&key) {
+        *node
+    } else {
+        let raw_id = nodes
+            .len()
+            .checked_add(1)
+            .ok_or_else(|| "ROBDD node dimensions overflow".to_string())?;
+        let raw_id =
+            u32::try_from(raw_id).map_err(|_| "ROBDD node dimensions overflow".to_string())?;
+        let node = NodeId(raw_id);
+        nodes.push(BddNode { var, low, high });
+        unique.insert(key, node);
+        node
+    };
+    Ok(BddEdge {
+        node,
+        inverted: output_inverted,
+    })
 }
 
 impl SharedRobdd {
@@ -173,6 +182,39 @@ impl SharedRobdd {
         Ok(forest)
     }
 
+    pub(crate) fn new_care(nvars: usize, order: Vec<usize>) -> Result<Self, String> {
+        validate_order(nvars, &order)?;
+        Ok(Self {
+            nvars,
+            order,
+            nodes: Vec::new(),
+            unique: HashMap::new(),
+            roots: Vec::new(),
+        })
+    }
+
+    pub(crate) const fn care_constant(value: bool) -> BddEdge {
+        BddEdge::constant(value)
+    }
+
+    pub(crate) fn mk_care_node(
+        &mut self,
+        var: usize,
+        low: BddEdge,
+        high: BddEdge,
+    ) -> Result<BddEdge, String> {
+        canonical_mk(&mut self.nodes, &mut self.unique, var, low, high)
+    }
+
+    pub(crate) fn finish_care(mut self, roots: Vec<BddEdge>) -> Result<Self, String> {
+        if roots.is_empty() {
+            return Err("care ROBDD must contain at least one output root".into());
+        }
+        self.roots = roots;
+        self.validate_invariants()?;
+        Ok(self)
+    }
+
     pub fn roots(&self) -> &[BddEdge] {
         &self.roots
     }
@@ -203,7 +245,11 @@ impl SharedRobdd {
                 input.len()
             ));
         }
-        self.evaluate_mask(row_index(input))
+        let logical_mask = row_index(input);
+        self.roots
+            .iter()
+            .map(|root| self.evaluate_edge(*root, logical_mask))
+            .collect()
     }
 
     pub fn evaluate_mask(&self, logical_mask: usize) -> Result<Vec<bool>, String> {
