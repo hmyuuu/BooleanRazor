@@ -319,3 +319,51 @@ The three exact reproductions were:
 
 No dependency installation, public or sealed rows, public baseline outcomes,
 private digests, remote compute, or HPC was used.
+
+## Task 12 whole-branch review pass
+
+The Critical verifier-honesty finding and four Important findings in
+`.superpowers/sdd/task-12-branch-review.md` were resolved:
+
+- Runner-facing metrics now record `verifier:"not_run"`, consistently with
+  `sat-report.json`. The Julia verifier was not invoked, and this result cannot
+  be classified as verified success; the frozen runner maps it to
+  `VERIFIER_NOT_RUN` with exit 67.
+- Every deadline-aware validation after the first solver result preserves the
+  live cut count, solver-call count, requested/encoded bounds, DIMACS, and
+  proof evidence when it converts to `Timeout`.
+- A first SAT result that consumes the final solver call now returns a precise
+  deterministic-rerun `Unknown` without invoking a zero-budget rerun or
+  replacing the first solver diagnostics.
+- Whole-circuit exhaustive evaluation rejects more than 16 primary inputs
+  before row allocation and uses checked exact reservation within the frozen
+  width.
+- Evidence publication rechecks expiry after the parent-directory sync,
+  removes a committed evidence directory on expiry, and syncs that rollback.
+
+Strict RED evidence:
+
+- The command regression found `verifier:"pass"` instead of `not_run`.
+- The injected evidence-preservation test did not compile before the common
+  post-solver deadline conversion existed.
+- The final-call fixture returned the zero-budget rerun result instead of the
+  first solver diagnostics.
+- A 17-input fixture exhaustively allocated and evaluated 131072 rows instead
+  of returning the frozen-width error.
+- Injected expiry after the parent sync returned success with the output still
+  committed.
+
+Fresh GREEN verification:
+
+- Release all-feature library tests: 30 passed.
+- Release all-feature SAT integration tests: 9 passed.
+- Frozen runner verifier-status regression: 1 test plus 2 subtests passed.
+- Locked all-feature release Rust suite: all unit and integration tests passed.
+- `make test`: 29 protocol tests plus 29 subtests; 181 runner/cluster tests plus
+  56 subtests; 30 library tests and every Rust integration; formatting; and
+  the protocol gate all passed.
+- `git diff --check`: passed before the documentation update.
+
+This pass remained synthetic-only. No public or sealed rows, public baseline
+outcomes, private digests, dependency installation, remote compute, or HPC
+were used. No Julia-verification claim is made.

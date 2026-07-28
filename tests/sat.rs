@@ -267,6 +267,8 @@ fn resynthesize_command_compacts_dead_gates_before_metrics_and_output() {
     assert_eq!(selected.gate_count(), 1);
     let metrics = fs::read_to_string(output.join("metrics.json")).unwrap();
     assert!(metrics.contains("\"gates\":1"));
+    assert!(metrics.contains("\"verifier\":\"not_run\""));
+    assert!(!metrics.contains("\"verifier\":\"pass\""));
     let report = fs::read_to_string(output.join("sat-report.json")).unwrap();
     assert!(report.contains("\"whole_circuit_gate_delta\":0"));
 }

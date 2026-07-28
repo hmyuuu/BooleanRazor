@@ -842,6 +842,32 @@ struct NetlistResynthesis {
     proof: Vec<u8>,
 }
 
+#[allow(clippy::too_many_arguments)]
+fn preserve_resynthesis_deadline_evidence(
+    error: String,
+    deadline: Instant,
+    cuts_considered: usize,
+    solver_calls: usize,
+    encoded_bound: Option<usize>,
+    requested_bound: Option<usize>,
+    dimacs: Vec<u8>,
+    proof: Vec<u8>,
+) -> Result<NetlistResynthesis, String> {
+    if Instant::now() < deadline {
+        return Err(error);
+    }
+    Ok(NetlistResynthesis {
+        replacement: None,
+        status: ResynthesisStatus::Timeout,
+        cuts_considered,
+        solver_calls,
+        encoded_bound,
+        requested_bound,
+        dimacs,
+        proof,
+    })
+}
+
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 enum LocalNode {
     Input(usize),
@@ -973,6 +999,26 @@ fn resynthesize_local_cuts_with_limits(
     let mut encoded_bound = None;
     let mut requested_bound = None;
 
+    macro_rules! post_solver_phase {
+        ($operation:expr) => {
+            match $operation {
+                Ok(value) => value,
+                Err(error) => {
+                    return preserve_resynthesis_deadline_evidence(
+                        error,
+                        deadline,
+                        considered,
+                        calls,
+                        encoded_bound,
+                        requested_bound,
+                        last_dimacs,
+                        last_proof,
+                    );
+                }
+            }
+        };
+    }
+
     for cut in cuts {
         if Instant::now() >= deadline {
             return Ok(NetlistResynthesis {
@@ -1058,17 +1104,35 @@ fn resynthesize_local_cuts_with_limits(
             }
             SatResult::Sat(candidate) => candidate,
         };
-        if candidate.reachable_gate_count()? >= cut.internal_gates {
+        if post_solver_phase!(candidate.reachable_gate_count()) >= cut.internal_gates {
             return Err("SAT cut replacement did not reduce reachable challenge gates".into());
         }
-        assert_exhaustive_equivalence_before(&table, &candidate, Some(deadline))?;
+        post_solver_phase!(assert_exhaustive_equivalence_before(
+            &table,
+            &candidate,
+            Some(deadline)
+        ));
 
-        let second = synthesize_xag_at_most_with_diagnostics(
+        if calls == solver_call_budget {
+            return Ok(NetlistResynthesis {
+                replacement: None,
+                status: ResynthesisStatus::Unknown(
+                    "deterministic rerun requires another solver call".into(),
+                ),
+                cuts_considered: considered,
+                solver_calls: calls,
+                encoded_bound,
+                requested_bound,
+                dimacs: last_dimacs,
+                proof: last_proof,
+            });
+        }
+        let second = post_solver_phase!(synthesize_xag_at_most_with_diagnostics(
             &table,
             bound,
             deadline,
             solver_call_budget - calls,
-        )?;
+        ));
         calls += second.solver_calls;
         encoded_bound = second.encoded_bound;
         last_dimacs = second.dimacs;
@@ -1114,8 +1178,8 @@ fn resynthesize_local_cuts_with_limits(
                 });
             }
         };
-        if serialize_before_deadline(&rerun, deadline)?
-            != serialize_before_deadline(&candidate, deadline)?
+        if post_solver_phase!(serialize_before_deadline(&rerun, deadline))
+            != post_solver_phase!(serialize_before_deadline(&candidate, deadline))
         {
             return Ok(NetlistResynthesis {
                 replacement: None,
@@ -1129,15 +1193,16 @@ fn resynthesize_local_cuts_with_limits(
             });
         }
 
-        let rewritten = reinsert_cut(&local, &cut, &candidate, deadline)?;
-        let rewritten_text = serialize_before_deadline(&rewritten, deadline)?;
-        let rewritten_local = parse_local_circuit(&rewritten_text)?;
-        if evaluate_local_all(&rewritten_local, deadline)? != original_rows {
+        let rewritten = post_solver_phase!(reinsert_cut(&local, &cut, &candidate, deadline));
+        let rewritten_text = post_solver_phase!(serialize_before_deadline(&rewritten, deadline));
+        let rewritten_local = post_solver_phase!(parse_local_circuit(&rewritten_text));
+        if post_solver_phase!(evaluate_local_all(&rewritten_local, deadline)) != original_rows {
             return Err("reinserted whole circuit failed exhaustive equivalence".into());
         }
         let rewritten_bytes = rewritten_text;
+        let rerun_replacement = post_solver_phase!(reinsert_cut(&local, &cut, &rerun, deadline));
         let rerun_rewritten =
-            serialize_before_deadline(&reinsert_cut(&local, &cut, &rerun, deadline)?, deadline)?;
+            post_solver_phase!(serialize_before_deadline(&rerun_replacement, deadline));
         if rewritten_bytes != rerun_rewritten {
             return Ok(NetlistResynthesis {
                 replacement: None,
@@ -1152,7 +1217,7 @@ fn resynthesize_local_cuts_with_limits(
                 proof: last_proof,
             });
         }
-        let rewritten_gates = Netlist::parse(&rewritten_bytes)?.gate_count();
+        let rewritten_gates = post_solver_phase!(Netlist::parse(&rewritten_bytes)).gate_count();
         if Instant::now() >= deadline {
             return Ok(NetlistResynthesis {
                 replacement: None,
@@ -1165,7 +1230,7 @@ fn resynthesize_local_cuts_with_limits(
                 proof: last_proof,
             });
         }
-        if rewritten_gates >= reachable_local_gates(&local, deadline)? {
+        if rewritten_gates >= post_solver_phase!(reachable_local_gates(&local, deadline)) {
             continue;
         }
         return Ok(NetlistResynthesis {
@@ -1426,13 +1491,23 @@ fn apply_local_op(op: LocalOp, left: bool, right: bool) -> bool {
 }
 
 fn evaluate_local_all(circuit: &LocalCircuit, deadline: Instant) -> Result<Vec<Vec<bool>>, String> {
+    const MAX_WHOLE_INPUTS: usize = 16;
+
     if Instant::now() >= deadline {
         return Err("deadline expired during whole-circuit evaluation".into());
+    }
+    if circuit.ninputs > MAX_WHOLE_INPUTS {
+        return Err(format!(
+            "whole-circuit exhaustive evaluation supports at most {MAX_WHOLE_INPUTS} inputs"
+        ));
     }
     let rows = 1usize
         .checked_shl(circuit.ninputs as u32)
         .ok_or_else(|| "input dimensions overflow".to_string())?;
-    let mut outputs = Vec::with_capacity(rows);
+    let mut outputs = Vec::new();
+    outputs
+        .try_reserve_exact(rows)
+        .map_err(|_| "whole-circuit truth table allocation failed".to_string())?;
     for row in 0..rows {
         if Instant::now() >= deadline {
             return Err("deadline expired during whole-circuit evaluation".into());
@@ -1865,7 +1940,7 @@ fn publish_verified_resynthesis(
     )
     .into_bytes();
     let metrics = format!(
-        "{{\"completed_table_sha256\":\"{completed_sha256}\",\"gates\":{selected_gates},\"train_exact\":1.0,\"verifier\":\"pass\",\"visible_cv_bit_accuracy\":1.0,\"visible_cv_exact\":1.0}}\n"
+        "{{\"completed_table_sha256\":\"{completed_sha256}\",\"gates\":{selected_gates},\"train_exact\":1.0,\"verifier\":\"not_run\",\"visible_cv_bit_accuracy\":1.0,\"visible_cv_exact\":1.0}}\n"
     )
     .into_bytes();
     let dimacs_digest = if outcome.dimacs.is_empty() {
@@ -2113,6 +2188,19 @@ fn publish_artifacts_atomically_with_controls(
         let _ = fs::remove_dir_all(output_dir);
         return Err(format!("sync evidence parent directory: {error}"));
     }
+    if expired() {
+        if let Err(cleanup_error) = fs::remove_dir_all(output_dir) {
+            return Err(format!(
+                "deadline expired after parent directory sync; remove committed evidence: {cleanup_error}"
+            ));
+        }
+        if let Err(cleanup_sync_error) = parent_handle.sync_all() {
+            return Err(format!(
+                "deadline expired after parent directory sync; sync evidence rollback: {cleanup_sync_error}"
+            ));
+        }
+        return Err("deadline expired after parent directory sync".into());
+    }
     Ok(())
 }
 
@@ -2207,9 +2295,10 @@ mod tests {
         classify_command_failure_as_timeout, classify_interruption,
         completed_table_csv_bytes_before_deadline, cut_table, evaluate_local_all,
         finish_post_solver_with_operation, parse_local_circuit,
-        publish_artifacts_atomically_with_controls, publish_artifacts_atomically_with_expiry,
-        publish_censored_resynthesis, publish_command_artifacts, reinsert_cut,
-        resynthesize_local_cuts, resynthesize_local_cuts_with_limits, run_resynthesis_command_at,
+        preserve_resynthesis_deadline_evidence, publish_artifacts_atomically_with_controls,
+        publish_artifacts_atomically_with_expiry, publish_censored_resynthesis,
+        publish_command_artifacts, reinsert_cut, resynthesize_local_cuts,
+        resynthesize_local_cuts_with_limits, run_resynthesis_command_at,
         selected_source_from_results, serialize_before_deadline, sha256_before_deadline,
         sha256_hex,
     };
@@ -2371,6 +2460,61 @@ mod tests {
             .unwrap_err(),
             "deadline expired before artifact publication"
         );
+    }
+
+    #[test]
+    fn whole_circuit_evaluation_rejects_more_than_sixteen_inputs() {
+        let local = parse_local_circuit("INPUTS 17\nOUTPUTS x1\n").unwrap();
+
+        assert_eq!(
+            evaluate_local_all(&local, Instant::now() + Duration::from_secs(5)).unwrap_err(),
+            "whole-circuit exhaustive evaluation supports at most 16 inputs"
+        );
+    }
+
+    #[test]
+    fn deterministic_rerun_without_budget_preserves_first_solver_diagnostics() {
+        let outcome = resynthesize_local_cuts_with_limits(
+            "INPUTS 1\nw1 = XOR x1 x1\nOUTPUTS w1\n",
+            Instant::now() + Duration::from_secs(5),
+            128,
+            1,
+        )
+        .unwrap();
+
+        assert!(matches!(
+            outcome.status,
+            ResynthesisStatus::Unknown(ref reason)
+                if reason == "deterministic rerun requires another solver call"
+        ));
+        assert_eq!(outcome.solver_calls, 1);
+        assert_eq!(outcome.encoded_bound, Some(0));
+        assert!(!outcome.dimacs.is_empty());
+    }
+
+    #[test]
+    fn injected_post_solver_deadline_keeps_resynthesis_evidence() {
+        let dimacs = b"p cnf 2 1\n1 2 0\n".to_vec();
+        let proof = b"0\n".to_vec();
+        let outcome = preserve_resynthesis_deadline_evidence(
+            "deadline expired during injected reachability".into(),
+            Instant::now() - Duration::from_secs(1),
+            6,
+            3,
+            Some(2),
+            Some(4),
+            dimacs.clone(),
+            proof.clone(),
+        )
+        .unwrap();
+
+        assert!(matches!(outcome.status, ResynthesisStatus::Timeout));
+        assert_eq!(outcome.cuts_considered, 6);
+        assert_eq!(outcome.solver_calls, 3);
+        assert_eq!(outcome.encoded_bound, Some(2));
+        assert_eq!(outcome.requested_bound, Some(4));
+        assert_eq!(outcome.dimacs, dimacs);
+        assert_eq!(outcome.proof, proof);
     }
 
     #[test]
@@ -2556,6 +2700,26 @@ mod tests {
         .unwrap_err();
 
         assert!(error.contains("injected write/sync failure"));
+        assert!(!output.exists());
+    }
+
+    #[test]
+    fn atomic_publication_rolls_back_when_deadline_expires_after_parent_sync() {
+        let temporary = TempDir::new();
+        let output = temporary.0.join("post-parent-sync-expiry");
+        let mut checks = 0usize;
+
+        let error = publish_artifacts_atomically_with_expiry(
+            &output,
+            vec![("sat-report.json", b"complete report".to_vec())],
+            || {
+                checks += 1;
+                checks >= 6
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(error, "deadline expired after parent directory sync");
         assert!(!output.exists());
     }
 }
