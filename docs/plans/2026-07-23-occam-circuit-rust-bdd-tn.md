@@ -132,10 +132,11 @@ training-consistent candidates.
 
 ## Current Verified State
 
-As of commit `986d37bc8d0a8c16933975bfcd5e89c38cff7c7c`:
+As of decision-diagram audit commit
+`9f7e2a14eb370a834f1c214e2f139c459c78340e`:
 
-- Tasks 1–8 are implemented and committed in the isolated
-  `codex/issue-71-occam-circuit` worktree.
+- Tasks 1–8 are migrated into the standalone BooleanRazor history and remain
+  implemented.
 - The four v1 prediction commitments match, the semantic circuits exhaustively
   match their full tables, and the official Julia verifier reports exact
   accuracy `1.0`.
@@ -143,9 +144,29 @@ As of commit `986d37bc8d0a8c16933975bfcd5e89c38cff7c7c`:
 - Beam `32×12` order search completed locally in 18.73 seconds total. Its best
   extracted XAG counts were A=58, B=240, C=2,982, and D=879, so none replaces
   the semantic control.
-- Tasks 9–15 below remain: survey/benchmark freeze, experiment runner/firewall,
-  blind care-set learning, bounded SAT, public-bundle import, the TN/HPC branch,
-  and final comparative verification.
+- Task 9's survey, frozen protocol, sealed benchmark commitment, and two
+  baselines are committed in the standalone history. Task 10's bounded runner
+  and proposal/evaluator firewall are implemented through `336f478`.
+- Task 13's digest-checked opaque public importer is implemented through
+  `8562e0f`. The content-addressed public row bundle is not present locally, so
+  no public baseline or blind-candidate cell has run.
+- Task 11 Steps 1–7 are complete in `c757952` plus provenance commit `6946bb4`.
+  All 16 focused care-BDD tests pass, including exhaustive completed-table/XAG
+  equivalence and independent OxiDD finalist checks. Its integration with the
+  bounded SAT core is `0f62ae2`.
+- The frozen 32-evaluation care-BDD search was freshly calibrated on a
+  104,857-row, 20-input synthetic cell in 70.273820 seconds. Its serialized
+  enumeration assigns the 24 post-seed evaluations exactly `19 / 5 / 0 / 0`
+  across the four beam members. A fair `6 / 6 / 6 / 6` scheduling follow-up is
+  proposed but not ratified or implemented.
+- Task 12's bounded local XAG resynthesis is implemented and hardened through
+  `61312ed`; it is integrated with Task 11 at `0f62ae2`.
+- Task 14 has only a precommitted hypothesis and dependency lock through
+  `a56ae6`. Heavy TN packages were not installed and no hpccube job was
+  submitted.
+- Task 15's fail-closed Julia-output wrapper is tested on the separate
+  `codex/task-15-julia-wrapper` branch at `6bf77f1`. Julia is absent locally,
+  so a fresh real-Julia differential remains `not_run`.
 
 The checkbox steps retained under Tasks 1–8 are their original TDD execution
 recipes; the explicit `Status: COMPLETE` lines and commits are authoritative.
@@ -162,10 +183,11 @@ Task 9 protocol/code/commit → Task 10 runner/commit
 → Task 14 public TN/HPC gate → Task 15 sealed evaluation
 ```
 
-In particular, Task 10 Step 9, Task 11 Step 8, and every Task 14 public-data
-cell are blocked until Task 13's digest-checked `PublicSuite` is committed.
-Baseline outcomes remain embargoed until the three candidate hypothesis commits
-exist. Section order never authorizes reading a raw `TRAIN_CSV` directly.
+Task 13's implementation prerequisite is now satisfied. Task 10 Step 9, Task
+11 Step 8, and every Task 14 public-data cell still require the absent
+content-addressed public bundle. Baseline outcomes remain embargoed until all
+three candidate hypothesis commits exist. Section order never authorizes
+reading a raw `TRAIN_CSV` directly.
 
 ## HPC Execution Contract
 
@@ -1603,9 +1625,9 @@ or evaluator logs before the algorithm freeze.
 
 ### Task 10: Enforce the Five-Minute Autoresearch and Sealed-Evaluation Contract
 
-**Status:** STEPS 1–8 COMPLETE in `749bb60`, with independent-review
-hardening in `24dbef4` and `735ec28`; final review PASS. Step 9 remains
-blocked on the committed Task 13 public importer.
+**Status:** STEPS 1–8 COMPLETE in the standalone history through `336f478`.
+Step 9 remains unrun because the content-addressed public bundle is absent;
+the Task 13 importer itself is complete.
 
 **Files:**
 - Create: `scripts/run-experiment.py`
@@ -1943,6 +1965,11 @@ without reading these results.
 
 ### Task 11: Implement the Blind Care-Set ROBDD Learner
 
+**Status:** STEPS 1–7 COMPLETE in `c757952` plus provenance commit `6946bb4`;
+integrated with Task 12 at `0f62ae2`. Step 8 is unrun because the public bundle
+is absent. The fair-order follow-up described in Current Verified State is a
+separate, unratified hypothesis.
+
 **Files:**
 - Create: `src/care_bdd.rs`
 - Create: `tests/care_bdd.rs`
@@ -2157,6 +2184,9 @@ git commit -m "data(qcs): freeze care-BDD comparison before sealed evaluation"
 
 ### Task 12: Add Bounded Exact Local XAG Synthesis with RustSAT/CaDiCaL
 
+**Status:** IMPLEMENTED in `61ea4fa` and hardened through `61312ed`; integrated
+with Task 11 at `0f62ae2`. No global-minimality claim is made.
+
 **Files:**
 - Create: `src/sat.rs`
 - Create: `tests/sat.rs`
@@ -2292,6 +2322,9 @@ whole-circuit gate delta, exhaustive-equivalence result, and verifier status.
 ---
 
 ### Task 13: Import the Frozen Reblinded Benchmark and Enforce the Common Candidate Boundary
+
+**Status:** IMPLEMENTED in `9d9e6f9` and input-boundary hardened in `8562e0f`.
+The importer is tested; the public row bundle itself is absent.
 
 **Files:**
 - Create: `src/reblind.rs`
@@ -2476,6 +2509,9 @@ git commit -m "feat(qcs): import sealed Occam public bundles"
 ---
 
 ### Task 14: Implement the Deterministic JAX MPS Completion Pilot
+
+**Status:** HYPOTHESIS AND LOCK ONLY through `a56ae6`. No heavy package sync,
+public-data cell, container build, or hpccube submission has occurred.
 
 **Files:**
 - Create: `tn/pyproject.toml`
@@ -3130,6 +3166,11 @@ conversion claim.
 ---
 
 ### Task 15: Differential Verification, Research Decision, and Submission README
+
+**Status:** The fail-closed Julia wrapper is implemented and fixture-tested on
+the separate `codex/task-15-julia-wrapper` branch at `6bf77f1`. Remaining Task
+15 analysis, real-Julia execution, public/sealed evaluation, and final research
+decision are incomplete.
 
 **Files:**
 - Create: `scripts/verify-julia.sh`
