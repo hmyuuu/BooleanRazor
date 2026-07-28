@@ -1,48 +1,61 @@
 # Session handoff
 
-Focus: Continue the standalone BooleanRazor implementation, beginning with
-Task 13 after confirming the migrated Task 10 baseline.
+Focus: Ratify, implement, and evaluate the fair-scheduled Rust care-BDD order
+search without changing the frozen blind-learning contract.
 
 State:
 - Repo/path: `/Users/hmyuuu/workspace/BooleanRazor`
-- Branch/commit: `main` / resolve with `git rev-parse HEAD`
+- Branch/commit: `codex/task-11-12-integration` / `7e99409`
+- Main: `main` / `61312ed`
 - PR/issue: QuantumBFS/quantum.harness issue 71
 
 Done:
-- Tasks 1–9: contract/leakage audit, exact disclosed-v1 controls, Rust
-  truth-table/XAG/BDD foundation, survey, frozen two-tier blind protocol, and
-  sealed benchmark commitment.
-- Task 10: Steps 1–8 complete in standalone commits `a824e5a`, `93ffdd2`,
-  and `336f478`; final independent review passed. Step 9 remains blocked on
-  Task 13.
+- Exact disclosed-v1 controls remain A=37, B=49, C=168, D=127 reachable
+  challenge gates; BDD candidates do not replace them.
+- Survey, frozen blind benchmark commitment, two baselines, bounded runner,
+  firewall, and opaque public importer are committed.
+- Care-BDD Steps 1–7: `c757952`, provenance `6946bb4`; 16 focused tests pass,
+  including exhaustive XAG equivalence and OxiDD finalist checks.
+- SAT resynthesis is hardened through `61312ed`; DD/SAT integration is
+  `0f62ae2`.
+- DD audit `9f7e2a1` measured 70.273820 seconds for the synthetic 20-bit,
+  32-evaluation cell and proved scheduler allocation `19/5/0/0`.
+- The authoritative plan was reconciled at `7e99409`.
+- Fail-closed Julia wrapper is separate at `codex/task-15-julia-wrapper`
+  commit `6bf77f1`; fixture/full tests pass.
 
 References:
 - `GOAL.md`
 - `docs/plans/2026-07-23-occam-circuit-rust-bdd-tn.md`
-- `docs/MIGRATION.md`
-- `docs/handoff/MIGRATION_VERIFICATION.md`
-- `docs/handoff/TASK_10_REPORT.md`
-- `docs/handoff/TASK_11_12_PREFLIGHT.md`
+- `LOG.md`
+- `docs/LEADERBOARD.md`
 
 Next:
-1. Run `make setup`, `make skills`, and `make test`; record any migration-only
-   failure.
-2. Confirm Task 10's migrated review report and protocol gate.
-3. Implement and review Task 13 on synthetic data, then freeze the Task 11/12
-   experiment contracts from the preflight notes.
+1. Obtain explicit human ratification for the proposed fair `6/6/6/6`
+   post-seed scheduler.
+2. If approved, create a fresh hypothesis worktree from `7e99409`, add a root
+   `LOG.md`, and use TDD while freezing folds, seeds, completion, beam, score,
+   32-evaluation cap, and OxiDD oracle role.
+3. Run the same synthetic 20-bit calibration and full verification; retain the
+   candidate only if deterministic, exact, inside 300 seconds, and better by
+   the frozen accuracy-first/XAG tie-break.
+4. When the content-addressed public bundle exists, run the frozen baseline and
+   candidate cells before any sealed evaluation.
 
 Suggested Skills:
-- `superpowers:executing-plans`: follow the ratified task order.
-- `superpowers:subagent-driven-development`: preserve implementer/reviewer
-  separation.
-- `superpowers:test-driven-development`: keep every implementation step
-  red/green/refactor.
-- `using-slurm`: only after a promoted `hpccube` cell is ratified.
+- `brainstorming`: preserve the design-ratification gate.
+- `using-git-worktrees`: isolate the DD scheduling hypothesis.
+- `test-driven-development`: require red/green evidence for scheduling.
+- `verification-before-completion`: verify exactness, timing, diff, and tests.
+- `using-slurm`: only for a separately ratified promoted hpccube cell.
 
 Do Not Assume:
-- No public training archive, sealed evaluation data, private custodian state,
-  publishable blind advantage, or HPC authorization is present.
+- The fair scheduler is approved, the public reblind bundle is present, Julia
+  is installed, TN packages are installed, or any HPC submission is
+  authorized.
+- Synthetic cross-validation or leaked-v1 recovery demonstrates blind
+  benchmark accuracy.
 
 Ask Human If:
-- Before attaching restricted data, installing a heavy dependency, changing
-  the frozen evaluation contract, or submitting any `hpccube` job.
+- Before implementing the fair scheduler, installing Julia/TN dependencies,
+  attaching nonpublic data, or submitting any hpccube job.
