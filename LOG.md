@@ -162,3 +162,54 @@ results remain tool evidence only. Any later benchmark cell must compose this
 rewriter inside a `PublicSuite`-backed learner and satisfy the Task 10 artifact,
 training-consistency, visible-CV, and verifier contract without changing these
 budgets.
+
+## Task 12 review-fix pass
+
+The five Important findings in `.superpowers/sdd/task-12-review.md` were
+addressed without changing the benchmark, evaluator, or evidence boundary:
+
+- The SAT module now exposes only `SatResult`, `synthesize_xag_at_most`, and
+  the narrow documented library-to-binary command bridge. Diagnostics and cut
+  machinery are private. The production bridge fixes the 128-cut and
+  64-solver-call limits internally; its callers cannot select them.
+- The single 285-second operation deadline is threaded through CNF and DIMACS
+  construction, model decoding, exhaustive checks, proof retrieval, cut
+  construction, whole-table evaluation, canonicalization, reinsertion,
+  deterministic serialization, hashing, completed-table serialization, and
+  rollback-aware artifact publication. Deadline-phase errors are converted to
+  a censored timeout outcome, never a successful artifact set.
+- Timeout and unknown outcomes write only `sat-report.json` within the
+  15-second cleanup reserve, omit success metrics/artifact claims, and return a
+  failing command status. Unknown reports bind the reason by digest.
+- Input and selected circuits are replayed through the production XAG and
+  serialized canonically before gate metrics and output. Dead definitions are
+  therefore absent from both sides of `whole_circuit_gate_delta`.
+- Selector model-read errors are propagated into the existing invalid-model
+  `Unknown` path instead of being treated as false selector values.
+
+Strict review-fix RED evidence:
+
+- The injected selector-read test initially failed because
+  `selected_source_from_results` did not exist.
+- The internal budget test initially showed that 129 cuts were accepted.
+- The expired-phase test initially failed because deadline-aware
+  canonicalization and serialization helpers did not exist.
+- The timeout evidence test initially failed because no command-at-deadline
+  bridge wrote a censored report.
+- The dead-definition command test initially emitted and scored two gates
+  instead of one.
+
+Fresh review-fix verification:
+
+- Focused debug SAT integration: 9 passed, 0 failed.
+- Focused SAT unit regressions: 6 passed, 0 failed.
+- Focused release SAT integration: 9 passed, 0 failed.
+- `make test`: 29 protocol tests plus 29 subtests passed; 181 runner/cluster
+  tests plus 56 subtests passed; 20 library tests and every Rust integration
+  test passed; formatting and the protocol gate passed.
+- `git diff --check`: passed.
+
+The first `make test` attempt could not open the existing shared uv cache under
+the workspace sandbox. The identical command was rerun with access to that
+cache and passed. No dependency installation, private data, public benchmark
+rows, sealed data, remote compute, or HPC was used.

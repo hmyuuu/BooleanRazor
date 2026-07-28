@@ -7,10 +7,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use occam_circuit_hmyuuu::netlist::Netlist;
-use occam_circuit_hmyuuu::sat::{
-    ResynthesisStatus, SatResult, assert_exhaustive_equivalence, resynthesize_local_cuts,
-    synthesize_xag_at_most,
-};
+use occam_circuit_hmyuuu::sat::{SatResult, synthesize_xag_at_most};
 use occam_circuit_hmyuuu::table::CompleteTable;
 
 static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
@@ -64,7 +61,7 @@ fn exact_synthesis_distinguishes_zero_and_one_gate_functions() {
         panic!("XOR must have a one-gate solution");
     };
     assert_eq!(circuit.reachable_gate_count().unwrap(), 1);
-    assert_exhaustive_equivalence(&xor, &circuit).unwrap();
+    assert_eq!(circuit.evaluate_all().unwrap(), xor.outputs);
 
     let zero = CompleteTable::from_fn(2, 1, |_| 0);
     let SatResult::Sat(zero_circuit) = synthesize_xag_at_most(&zero, 1, deadline).unwrap() else {
@@ -84,20 +81,6 @@ fn expired_deadline_returns_timeout_before_solver_work() {
 }
 
 #[test]
-fn expired_rewrite_deadline_is_classified_as_timeout_during_cut_enumeration() {
-    let outcome = resynthesize_local_cuts(
-        "INPUTS 2\nw1 = XOR x1 x2\nOUTPUTS w1\n",
-        Instant::now() - Duration::from_secs(1),
-        128,
-        64,
-    )
-    .unwrap();
-
-    assert!(matches!(outcome.status, ResynthesisStatus::Timeout));
-    assert_eq!(outcome.solver_calls, 0);
-}
-
-#[test]
 fn multi_output_solution_shares_a_reachable_gate_and_uses_the_exact_lower_bound() {
     let table = CompleteTable::from_fn(3, 2, |mask| {
         let product = (mask & 1) & ((mask >> 1) & 1);
@@ -113,7 +96,7 @@ fn multi_output_solution_shares_a_reachable_gate_and_uses_the_exact_lower_bound(
         panic!("the shared two-output function must have an exact two-gate solution");
     };
     assert_eq!(circuit.reachable_gate_count().unwrap(), 2);
-    assert_exhaustive_equivalence(&table, &circuit).unwrap();
+    assert_eq!(circuit.evaluate_all().unwrap(), table.outputs);
 }
 
 #[test]
@@ -260,4 +243,30 @@ fn resynthesize_command_preserves_an_unchecked_trace_for_unsat_encoding() {
     assert!(report.contains("\"proof_checked\":false"));
     assert!(!report.contains("\"proof_sha256\":null"));
     assert!(!report.contains("certificate"));
+}
+
+#[test]
+fn resynthesize_command_compacts_dead_gates_before_metrics_and_output() {
+    let temporary = TempDir::new();
+    let input = temporary.0.join("dead-gate.txt");
+    fs::write(
+        &input,
+        "INPUTS 2\nw1 = XOR x1 x2\nw2 = AND x1 x2\nOUTPUTS w1\n",
+    )
+    .unwrap();
+    let output = temporary.0.join("output");
+
+    let run = run_resynthesize(&input, &output, "6", "285");
+    assert!(
+        run.status.success(),
+        "{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let selected =
+        Netlist::parse(&fs::read_to_string(output.join("circuit.txt")).unwrap()).unwrap();
+    assert_eq!(selected.gate_count(), 1);
+    let metrics = fs::read_to_string(output.join("metrics.json")).unwrap();
+    assert!(metrics.contains("\"gates\":1"));
+    let report = fs::read_to_string(output.join("sat-report.json")).unwrap();
+    assert!(report.contains("\"whole_circuit_gate_delta\":0"));
 }
