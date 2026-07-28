@@ -213,3 +213,50 @@ The first `make test` attempt could not open the existing shared uv cache under
 the workspace sandbox. The identical command was rerun with access to that
 cache and passed. No dependency installation, private data, public benchmark
 rows, sealed data, remote compute, or HPC was used.
+
+## Task 12 second review-fix pass
+
+The four residual Important findings in
+`.superpowers/sdd/task-12-rereview.md` were resolved:
+
+- `Encoding::exactly_one` now receives the absolute deadline and checks it
+  before allocation and inside both the outer and inner pairwise-clause loops.
+  An injected-expiry regression distinguishes those two loop checkpoints.
+- Censored timeout and unknown reports are built from the actual
+  `NetlistResynthesis`, preserving cuts considered, solver calls,
+  requested/encoded bounds, and cleanup-deadline-bound DIMACS/proof hashes.
+  Nonempty diagnostic bytes are published as `sat-instance.cnf` and
+  `sat-proof.drat`; success metrics, circuit, completed table, and artifact
+  index remain absent.
+- Solver `Unknown` is frozen before evidence handling. Its reason is hashed
+  against the cleanup deadline, and the command classifier cannot reinterpret
+  either a successful or failed unknown-report publication as `Timeout` merely
+  because the 285-second operation deadline has elapsed.
+- The common artifact publisher now stages every file in a create-new
+  temporary path, syncs it, installs with a create-new hard link, and removes
+  the staging names. Deadline expiry, injected write/sync failure, or a
+  final-name collision rolls back every staged path and every final path
+  installed by that transaction without overwriting runner-owned files.
+
+Second-pass strict RED evidence:
+
+- The exactly-one regression failed to compile before the injected-expiry
+  helper existed.
+- The precise censored-evidence regression failed to compile before the
+  `NetlistResynthesis` publisher existed.
+- The frozen-unknown regression failed to compile before the command-failure
+  classifier existed.
+- Atomic rollback regressions failed to compile before the staged publisher
+  and injected write/sync control existed.
+
+Fresh second-pass verification:
+
+- Release SAT integration: 9 passed, 0 failed.
+- Release SAT review unit regressions: 11 passed, 0 failed.
+- `make test`: 29 protocol tests plus 29 subtests passed; 181 runner/cluster
+  tests plus 56 subtests passed; 25 library tests and all Rust integrations
+  passed; formatting and the protocol gate passed.
+- `git diff --check`: passed.
+
+No dependency installation, public or sealed rows, public baseline outcomes,
+private digests, remote compute, or HPC was used.
