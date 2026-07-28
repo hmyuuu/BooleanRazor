@@ -1706,6 +1706,43 @@ fn classify_command_failure_as_timeout(error: &str, deadline: Instant) -> bool {
         && (Instant::now() >= deadline || error.contains("deadline expired"))
 }
 
+fn finish_post_solver_with_operation(
+    output_dir: &Path,
+    mut outcome: NetlistResynthesis,
+    deadline: Instant,
+    cleanup_deadline: Instant,
+    operation: impl FnOnce(&NetlistResynthesis) -> Result<(), String>,
+) -> Result<(), String> {
+    let censored_error = match &outcome.status {
+        ResynthesisStatus::Timeout => Some("resynthesis timed out"),
+        ResynthesisStatus::Unknown(_) => Some("resynthesis solver result is unknown"),
+        ResynthesisStatus::Sat | ResynthesisStatus::Unsat => None,
+    };
+    if let Some(error_prefix) = censored_error {
+        return match publish_censored_resynthesis(output_dir, outcome, cleanup_deadline) {
+            Ok(()) => Err(error_prefix.into()),
+            Err(error) => Err(format!(
+                "{error_prefix}; censored publication failed: {error}"
+            )),
+        };
+    }
+
+    match operation(&outcome) {
+        Ok(()) => Ok(()),
+        Err(error) if classify_command_failure_as_timeout(&error, deadline) => {
+            outcome.status = ResynthesisStatus::Timeout;
+            outcome.replacement = None;
+            match publish_censored_resynthesis(output_dir, outcome, cleanup_deadline) {
+                Ok(()) => Err("resynthesis timed out".into()),
+                Err(publication_error) => Err(format!(
+                    "resynthesis timed out; censored publication failed: {publication_error}"
+                )),
+            }
+        }
+        Err(error) => Err(error),
+    }
+}
+
 fn run_resynthesis_operation_at(
     input_path: &Path,
     output_dir: &Path,
@@ -1772,29 +1809,38 @@ fn run_resynthesis_operation_at(
     }
 
     let outcome = resynthesize_local_cuts(original_text, deadline)?;
-    let censored_error = match &outcome.status {
-        ResynthesisStatus::Timeout => Some("resynthesis timed out"),
-        ResynthesisStatus::Unknown(_) => Some("resynthesis solver result is unknown"),
-        ResynthesisStatus::Sat | ResynthesisStatus::Unsat => None,
-    };
-    if let Some(error_prefix) = censored_error {
-        return match publish_censored_resynthesis(output_dir, outcome, cleanup_deadline) {
-            Ok(()) => Err(error_prefix.into()),
-            Err(error) => Err(format!(
-                "{error_prefix}; censored publication failed: {error}"
-            )),
-        };
-    }
+    finish_post_solver_with_operation(output_dir, outcome, deadline, cleanup_deadline, |outcome| {
+        publish_verified_resynthesis(
+            output_dir,
+            outcome,
+            deadline,
+            &canonical_bytes,
+            &original_rows,
+            &table,
+            original_gates,
+        )
+    })
+}
+
+fn publish_verified_resynthesis(
+    output_dir: &Path,
+    outcome: &NetlistResynthesis,
+    deadline: Instant,
+    canonical_bytes: &[u8],
+    original_rows: &[Vec<bool>],
+    table: &CompleteTable,
+    original_gates: usize,
+) -> Result<(), String> {
     let status = match &outcome.status {
         ResynthesisStatus::Sat => "sat",
         ResynthesisStatus::Unsat => "unsat",
         ResynthesisStatus::Timeout | ResynthesisStatus::Unknown(_) => {
-            unreachable!("censored outcomes returned before success handling")
+            return Err("censored outcome reached success publication".into());
         }
     };
-    let selected_bytes = match outcome.replacement {
-        Some(replacement) => serialize_before_deadline(&replacement, deadline)?.into_bytes(),
-        None => canonical_bytes,
+    let selected_bytes = match &outcome.replacement {
+        Some(replacement) => serialize_before_deadline(replacement, deadline)?.into_bytes(),
+        None => clone_bytes_before_deadline(canonical_bytes, deadline, "canonical circuit")?,
     };
     let selected_text = std::str::from_utf8(&selected_bytes)
         .map_err(|_| "selected circuit is not valid UTF-8".to_string())?;
@@ -1862,12 +1908,33 @@ fn run_resynthesis_operation_at(
         ("sat-report.json", sat_report),
     ];
     if !outcome.dimacs.is_empty() {
-        artifacts.push(("sat-instance.cnf", outcome.dimacs));
+        artifacts.push((
+            "sat-instance.cnf",
+            clone_bytes_before_deadline(&outcome.dimacs, deadline, "DIMACS artifact")?,
+        ));
     }
     if !outcome.proof.is_empty() {
-        artifacts.push(("sat-proof.drat", outcome.proof));
+        artifacts.push((
+            "sat-proof.drat",
+            clone_bytes_before_deadline(&outcome.proof, deadline, "proof artifact")?,
+        ));
     }
     publish_command_artifacts(output_dir, artifacts, deadline)
+}
+
+fn clone_bytes_before_deadline(
+    bytes: &[u8],
+    deadline: Instant,
+    label: &str,
+) -> Result<Vec<u8>, String> {
+    if Instant::now() >= deadline {
+        return Err(format!("deadline expired before cloning {label}"));
+    }
+    let cloned = bytes.to_vec();
+    if Instant::now() >= deadline {
+        return Err(format!("deadline expired while cloning {label}"));
+    }
+    Ok(cloned)
 }
 
 fn sha256_before_deadline(bytes: &[u8], deadline: Instant, label: &str) -> Result<String, String> {
@@ -1943,96 +2010,110 @@ fn publish_artifacts_atomically_with_controls(
         return Err("deadline expired before artifact publication".into());
     }
     match fs::symlink_metadata(output_dir) {
-        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
-            return Err("OUTPUT_DIR must be a real directory, not a symlink".into());
+        Ok(_) => {
+            return Err(format!(
+                "OUTPUT_DIR already exists: {}",
+                output_dir.display()
+            ));
         }
-        Ok(_) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            fs::create_dir_all(output_dir)
-                .map_err(|error| format!("create OUTPUT_DIR: {error}"))?;
-        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(format!("inspect OUTPUT_DIR: {error}")),
-    }
-    if expired() {
-        return Err("deadline expired during artifact publication".into());
     }
 
     let ticket = NEXT_ARTIFACT_PUBLISH.fetch_add(1, Ordering::Relaxed);
-    let mut staged: Vec<(PathBuf, PathBuf)> = Vec::new();
-    let mut installed: Vec<PathBuf> = Vec::new();
-    for (index, (name, bytes)) in artifacts.into_iter().enumerate() {
+    let parent = output_dir
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let output_name = output_dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| "OUTPUT_DIR must have a UTF-8 final component".to_string())?;
+    let stage_dir = parent.join(format!(
+        ".{output_name}.occam-stage-{}-{ticket}",
+        std::process::id()
+    ));
+    fs::create_dir(&stage_dir)
+        .map_err(|error| format!("create evidence staging directory: {error}"))?;
+
+    for (name, bytes) in artifacts {
         if expired() {
-            rollback_artifact_publication(&staged, &installed);
+            let _ = fs::remove_dir_all(&stage_dir);
             return Err("deadline expired during artifact publication".into());
         }
-        let final_path = output_dir.join(name);
-        let temporary_path = output_dir.join(format!(
-            ".occam-publish-{}-{ticket}-{index}.tmp",
-            std::process::id()
-        ));
+        let staged_path = stage_dir.join(name);
         let mut file = match fs::OpenOptions::new()
             .write(true)
             .create_new(true)
-            .open(&temporary_path)
+            .open(&staged_path)
         {
             Ok(file) => file,
             Err(error) => {
-                rollback_artifact_publication(&staged, &installed);
-                return Err(format!("stage {}: {error}", final_path.display()));
+                let _ = fs::remove_dir_all(&stage_dir);
+                return Err(format!("stage {}: {error}", staged_path.display()));
             }
         };
-        staged.push((temporary_path.clone(), final_path.clone()));
         if let Err(error) = write_and_sync(&mut file, &bytes) {
             drop(file);
-            rollback_artifact_publication(&staged, &installed);
-            return Err(format!("stage {}: {error}", final_path.display()));
+            let _ = fs::remove_dir_all(&stage_dir);
+            return Err(format!("stage {}: {error}", staged_path.display()));
         }
         drop(file);
         if expired() {
-            rollback_artifact_publication(&staged, &installed);
+            let _ = fs::remove_dir_all(&stage_dir);
             return Err("deadline expired during artifact publication".into());
         }
     }
 
-    for (temporary_path, final_path) in &staged {
-        if expired() {
-            rollback_artifact_publication(&staged, &installed);
-            return Err("deadline expired during artifact publication".into());
+    let stage_handle = match fs::File::open(&stage_dir) {
+        Ok(handle) => handle,
+        Err(error) => {
+            let _ = fs::remove_dir_all(&stage_dir);
+            return Err(format!("open evidence staging directory: {error}"));
         }
-        if let Err(error) = fs::hard_link(temporary_path, final_path) {
-            rollback_artifact_publication(&staged, &installed);
-            return Err(format!("publish {}: {error}", final_path.display()));
-        }
-        installed.push(final_path.clone());
+    };
+    if let Err(error) = stage_handle.sync_all() {
+        let _ = fs::remove_dir_all(&stage_dir);
+        return Err(format!("sync evidence staging directory: {error}"));
     }
     if expired() {
-        rollback_artifact_publication(&staged, &installed);
-        return Err("deadline expired after artifact publication".into());
+        let _ = fs::remove_dir_all(&stage_dir);
+        return Err("deadline expired during artifact publication".into());
     }
-
-    for (temporary_path, _) in &staged {
-        if let Err(error) = fs::remove_file(temporary_path) {
-            rollback_artifact_publication(&staged, &installed);
+    if output_dir.exists() {
+        let _ = fs::remove_dir_all(&stage_dir);
+        return Err(format!(
+            "OUTPUT_DIR already exists: {}",
+            output_dir.display()
+        ));
+    }
+    if let Err(error) = fs::rename(&stage_dir, output_dir) {
+        let _ = fs::remove_dir_all(&stage_dir);
+        return Err(format!(
+            "commit evidence directory {}: {error}",
+            output_dir.display()
+        ));
+    }
+    if expired() {
+        if let Err(cleanup_error) = fs::remove_dir_all(output_dir) {
             return Err(format!(
-                "remove staged artifact {}: {error}",
-                temporary_path.display()
+                "deadline expired after artifact publication; remove committed evidence: {cleanup_error}"
             ));
         }
-    }
-    if expired() {
-        rollback_artifact_publication(&staged, &installed);
         return Err("deadline expired after artifact publication".into());
     }
+    let parent_handle = match fs::File::open(parent) {
+        Ok(handle) => handle,
+        Err(error) => {
+            let _ = fs::remove_dir_all(output_dir);
+            return Err(format!("open evidence parent directory: {error}"));
+        }
+    };
+    if let Err(error) = parent_handle.sync_all() {
+        let _ = fs::remove_dir_all(output_dir);
+        return Err(format!("sync evidence parent directory: {error}"));
+    }
     Ok(())
-}
-
-fn rollback_artifact_publication(staged: &[(PathBuf, PathBuf)], installed: &[PathBuf]) {
-    for path in installed.iter().rev() {
-        let _ = fs::remove_file(path);
-    }
-    for (temporary_path, _) in staged.iter().rev() {
-        let _ = fs::remove_file(temporary_path);
-    }
 }
 
 fn write_censored_timeout_report(
@@ -2125,10 +2206,10 @@ mod tests {
         assert_exhaustive_equivalence_before, canonicalize_local_circuit,
         classify_command_failure_as_timeout, classify_interruption,
         completed_table_csv_bytes_before_deadline, cut_table, evaluate_local_all,
-        parse_local_circuit, publish_artifacts_atomically_with_controls,
-        publish_artifacts_atomically_with_expiry, publish_censored_resynthesis,
-        publish_command_artifacts, reinsert_cut, resynthesize_local_cuts,
-        resynthesize_local_cuts_with_limits, run_resynthesis_command_at,
+        finish_post_solver_with_operation, parse_local_circuit,
+        publish_artifacts_atomically_with_controls, publish_artifacts_atomically_with_expiry,
+        publish_censored_resynthesis, publish_command_artifacts, reinsert_cut,
+        resynthesize_local_cuts, resynthesize_local_cuts_with_limits, run_resynthesis_command_at,
         selected_source_from_results, serialize_before_deadline, sha256_before_deadline,
         sha256_hex,
     };
@@ -2353,6 +2434,43 @@ mod tests {
     }
 
     #[test]
+    fn post_solver_deadline_preserves_the_real_solver_outcome() {
+        let temporary = TempDir::new();
+        let output = temporary.0.join("cell");
+        let dimacs = b"p cnf 2 1\n1 2 0\n".to_vec();
+        let proof = b"0\n".to_vec();
+        let outcome = NetlistResynthesis {
+            replacement: None,
+            status: ResynthesisStatus::Sat,
+            cuts_considered: 9,
+            solver_calls: 5,
+            encoded_bound: Some(3),
+            requested_bound: Some(4),
+            dimacs: dimacs.clone(),
+            proof: proof.clone(),
+        };
+
+        let error = finish_post_solver_with_operation(
+            &output,
+            outcome,
+            Instant::now() + Duration::from_secs(5),
+            Instant::now() + Duration::from_secs(10),
+            |_outcome| Err("deadline expired during injected post-solver phase".into()),
+        )
+        .unwrap_err();
+
+        assert_eq!(error, "resynthesis timed out");
+        let report = fs::read_to_string(output.join("sat-report.json")).unwrap();
+        assert!(report.contains("\"sat_status\":\"timeout\""));
+        assert!(report.contains("\"cuts_considered\":9"));
+        assert!(report.contains("\"solver_calls\":5"));
+        assert!(report.contains("\"encoded_bound\":3"));
+        assert!(report.contains("\"requested_bound\":4"));
+        assert_eq!(fs::read(output.join("sat-instance.cnf")).unwrap(), dimacs);
+        assert_eq!(fs::read(output.join("sat-proof.drat")).unwrap(), proof);
+    }
+
+    #[test]
     fn frozen_unknown_uses_cleanup_deadline_and_is_not_reclassified() {
         let temporary = TempDir::new();
         let output = temporary.0.join("cell");
@@ -2401,7 +2519,7 @@ mod tests {
             deadline_error,
             "deadline expired during artifact publication"
         );
-        assert_eq!(fs::read_dir(&expired_output).unwrap().count(), 0);
+        assert!(!expired_output.exists());
 
         let collision_output = temporary.0.join("collision");
         fs::create_dir(&collision_output).unwrap();
@@ -2415,7 +2533,7 @@ mod tests {
             || false,
         )
         .unwrap_err();
-        assert!(collision_error.contains("sat-report.json"));
+        assert!(collision_error.contains("OUTPUT_DIR already exists"));
         assert_eq!(
             fs::read(collision_output.join("sat-report.json")).unwrap(),
             b"runner-owned"
@@ -2438,6 +2556,6 @@ mod tests {
         .unwrap_err();
 
         assert!(error.contains("injected write/sync failure"));
-        assert_eq!(fs::read_dir(output).unwrap().count(), 0);
+        assert!(!output.exists());
     }
 }

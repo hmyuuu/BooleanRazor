@@ -260,3 +260,62 @@ Fresh second-pass verification:
 
 No dependency installation, public or sealed rows, public baseline outcomes,
 private digests, remote compute, or HPC was used.
+
+## Task 12 final narrow review pass
+
+The two residual Important findings in
+`.superpowers/sdd/task-12-final-rereview.md` were addressed:
+
+- The actual `NetlistResynthesis` is now owned by one post-solver guard across
+  selected-circuit serialization, whole-table verification, hashing, report
+  construction, diagnostic copying, and success publication. A shared-deadline
+  failure in any of those phases changes only the outcome status to `Timeout`
+  and publishes the real cuts considered, solver calls, requested/encoded
+  bounds, DIMACS, and proof evidence during the cleanup reserve.
+- Artifact publication now creates a sibling staging directory while
+  `OUTPUT_DIR` remains absent, writes and syncs the complete evidence set
+  there, syncs the staging directory, and exposes the whole set with one
+  directory rename. Deadline, write/sync, existing-output, staging, and rename
+  failures clean up the staging directory and leave no partial final output.
+  The report is therefore never visible without the diagnostic files it
+  references.
+
+Final-pass strict RED evidence:
+
+- The post-solver timeout test failed to compile before the outcome-owning
+  guard existed.
+- The evidence-set rollback test failed because the previous per-file
+  publisher left `OUTPUT_DIR` visible after an injected pre-commit deadline.
+
+Fresh final-pass verification:
+
+- Release SAT integration: 9 passed, 0 failed.
+- Release SAT review unit regressions: 12 passed, 0 failed.
+- `cargo test --locked --all-features --release`: 26 library tests and all
+  Rust integrations passed.
+- `research/check_gate.py --phase protocol`: passed.
+- `git diff --check`: passed.
+
+The full `make test` command was attempted twice after the final code. Its
+protocol suite passed 29 tests plus 29 subtests each time, and 180 of 181
+runner/cluster tests plus all 56 subtests passed. The same unrelated existing
+test,
+`test_sigterm_ignoring_process_tree_is_absent_after_deadline`, failed on both
+full runs and a focused rerun because macOS denied the runner's
+`os.killpg(..., SIGKILL)` with `PermissionError: [Errno 1] Operation not
+permitted`. The Rust and protocol portions were then run independently and
+passed. No runner code was changed; full-suite green proof is therefore
+missing and no contrary claim is made.
+
+The three exact reproductions were:
+
+1. `make test` — failed at that single runner test with the `os.killpg`
+   `PermissionError`.
+2. `uv run --default-index https://pypi.org/simple pytest -q
+   autoresearch/test_run_experiment.py::RunExperimentTests::test_sigterm_ignoring_process_tree_is_absent_after_deadline`
+   — failed identically.
+3. `make test` after the spawned ten-second process had time to exit — failed
+   identically at the same single runner test.
+
+No dependency installation, public or sealed rows, public baseline outcomes,
+private digests, remote compute, or HPC was used.
