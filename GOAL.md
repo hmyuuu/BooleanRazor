@@ -20,7 +20,15 @@ explicitly ratified promoted cell. Stage approved remote work under
 `~/BooleanRazor` in the `hpccube` account home; the configured path is not
 compute authorization. Record the source revision, environment or image
 digest, frozen run specification, monitored execution, fetched artifacts, and
-classified failure evidence. Conclude one of exactly three outcomes: at least
-100× matched-quality improvement over both frozen baselines; a statistically
-supported two-tier scaling advantage; or an honest “advantage not
-demonstrated.”
+classified failure evidence.
+
+Promote every independently verified new SOTA to `main` and push it promptly
+as a small reviewed commit. “SOTA” means an improvement under the frozen
+metric and benchmark with all required reproducibility, exactness, verifier,
+and regression checks—not a provisional or unreviewed experiment. Record the
+promoted commit and evidence in `LOG.md` and the leaderboard documentation
+before beginning the next hypothesis.
+
+Conclude one of exactly three outcomes: at least 100× matched-quality
+improvement over both frozen baselines; a statistically supported two-tier
+scaling advantage; or an honest “advantage not demonstrated.”
