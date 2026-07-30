@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import hashlib
+import os
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -67,6 +68,56 @@ def test_resolve_evidence_path_rejects_absolute_parent_and_symlink_component(
     for value in (str(evidence), "../outside/escaped.json", "./evidence.json", "linked/escaped.json"):
         with pytest.raises(evidence_io.EvidenceError):
             evidence_io.resolve_evidence_path(root, value, "evidence")
+
+
+def _swap_parent_for_symlink(
+    monkeypatch: pytest.MonkeyPatch, root: Path, name: str, target: Path
+) -> None:
+    """Swap one checked ancestor immediately before its first open."""
+    original_open = evidence_io.os.open
+    swapped = False
+
+    def open_with_swap(path: object, *args: object, **kwargs: object) -> int:
+        nonlocal swapped
+        text = os.fspath(path)
+        if not swapped and (text == name or f"/{name}/" in text):
+            swapped = True
+            (root / name).rename(root / f"{name}.checked")
+            (root / name).symlink_to(target, target_is_directory=True)
+        return original_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(evidence_io.os, "open", open_with_swap)
+
+
+def test_stable_read_rejects_ancestor_swap_at_use_boundary(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "root"
+    inside = root / "inside"
+    outside = tmp_path / "outside"
+    inside.mkdir(parents=True)
+    outside.mkdir()
+    (inside / "evidence.txt").write_bytes(b"inside\n")
+    (outside / "evidence.txt").write_bytes(b"outside\n")
+
+    _swap_parent_for_symlink(monkeypatch, root, "inside", outside)
+    with pytest.raises(evidence_io.EvidenceError):
+        evidence_io.read_stable_regular(inside / "evidence.txt", "evidence", 1024)
+
+
+def test_atomic_create_rejects_ancestor_swap_at_publication_boundary(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "root"
+    inside = root / "inside"
+    outside = tmp_path / "outside"
+    inside.mkdir(parents=True)
+    outside.mkdir()
+
+    _swap_parent_for_symlink(monkeypatch, root, "inside", outside)
+    with pytest.raises(evidence_io.EvidenceError):
+        evidence_io.atomic_create(inside / "record.json", b"record\n")
+    assert not (outside / "record.json").exists()
 
 
 def sha256(value: bytes) -> str:
@@ -310,6 +361,74 @@ def test_terminal_loader_rejects_noncanonical_nonzero_exit(candidate_run: Candid
     manifest["exit_code"] = "017"
     candidate_run.write_json(candidate_run.manifest, manifest)
     with pytest.raises(evidence_io.EvidenceError, match="mapping"):
+        candidate_evidence.load_terminal_manifest(candidate_run.manifest)
+
+
+def test_terminal_loader_rejects_candidate_without_all_quality_evidence(
+    candidate_run: CandidateRun,
+) -> None:
+    candidate_evidence = load_module("candidate_evidence", "candidate_evidence.py")
+    manifest = candidate_run.read_json(candidate_run.manifest)
+    manifest["artifact_path"] = "none"
+    candidate_run.write_json(candidate_run.manifest, manifest)
+    with pytest.raises(evidence_io.EvidenceError, match="candidate-bearing"):
+        candidate_evidence.load_terminal_manifest(candidate_run.manifest)
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "terminal"),
+    (
+        ("role", "not-a-role", False),
+        ("blind", "false", False),
+        ("evaluation_scope", "sealed", False),
+        ("method", "", False),
+        ("algorithm_seed", "z" * 64, False),
+        ("repeat", "01", False),
+        ("timeout_seconds", "300.1", False),
+        ("source_commit", "c" * 64, False),
+        ("image_sha256", "bad", False),
+        ("argv", [], False),
+        ("started_utc", "2026-07-30", False),
+        ("elapsed_seconds", "none", False),
+        ("cleanup_seconds", "1.0", False),
+        ("visible_cv_exact", "01.0", False),
+        ("visible_cv_bit_accuracy", "1.1", False),
+        ("gates", "01", False),
+        ("peak_memory_kib", "01", False),
+        ("status", "OOM", True),
+        ("status", "CANCELLED", True),
+    ),
+)
+def test_terminal_loader_rejects_invalid_runner_dialect(
+    candidate_run: CandidateRun, field: str, value: object, terminal: bool
+) -> None:
+    candidate_evidence = load_module("candidate_evidence", "candidate_evidence.py")
+    manifest = candidate_run.read_json(candidate_run.manifest)
+    spec = candidate_run.read_json(candidate_run.run_spec)
+    if field in manifest and field in spec["cells"][0]["params"]:
+        spec["cells"][0]["params"][field] = value
+    elif field in manifest and field in spec["provenance"]:
+        spec["provenance"][field] = value
+    manifest[field] = value
+    if field == "status":
+        manifest.update(
+            {
+                "exit_code": "137" if value == "OOM" else "130",
+                "verifier": "not_run",
+                "train_exact": "none",
+                "visible_cv_exact": "none",
+                "visible_cv_bit_accuracy": "none",
+                "gates": "none",
+                "completed_table_sha256": "none",
+                "circuit_sha256": "none",
+                "artifact_sha256": "none",
+                "artifact_path": "none",
+            }
+        )
+    candidate_run.write_json(candidate_run.run_spec, spec)
+    manifest["run_spec_sha256"] = sha256(candidate_run.run_spec.read_bytes())
+    candidate_run.write_json(candidate_run.manifest, manifest)
+    with pytest.raises(evidence_io.EvidenceError):
         candidate_evidence.load_terminal_manifest(candidate_run.manifest)
 
 

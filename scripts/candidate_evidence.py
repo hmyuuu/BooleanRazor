@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+from datetime import datetime
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
 from evidence_io import (
@@ -44,12 +46,17 @@ ARTIFACT_FIELDS = {
     "completed_table_sha256", "equivalence", "schema_version",
 }
 CANDIDATE_STATES = {"SUCCESS", "VERIFIER_FAILED", "VERIFIER_NOT_RUN"}
-TERMINAL_STATES = CANDIDATE_STATES | {"INVALID_METRICS", "NONZERO_EXIT", "TIMEOUT", "OOM", "CANCELLED"}
+TERMINAL_STATES = CANDIDATE_STATES | {"INVALID_METRICS", "NONZERO_EXIT", "TIMEOUT"}
 SCHEDULER_FIELDS = {
     "scheduler_sha256", "scheduler_job_id", "scheduler_task_index", "scheduler_state",
     "scheduler_exit_code", "scheduler_classification", "scheduler_elapsed_seconds",
 }
 CANONICAL_INTEGER = re.compile(r"(?:0|[1-9][0-9]*)")
+CANONICAL_DECIMAL = re.compile(r"(?:0|[1-9][0-9]*)\.[0-9]+")
+COMMIT_40 = re.compile(r"[0-9a-f]{40}")
+RFC3339_UTC = re.compile(
+    r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]+)?Z"
+)
 
 
 @dataclass(frozen=True)
@@ -132,8 +139,6 @@ def _check_status(manifest: dict[str, object]) -> None:
         "VERIFIER_NOT_RUN": ("not_run", "67"),
         "INVALID_METRICS": ("not_run", "65"),
         "TIMEOUT": ("not_run", "124"),
-        "OOM": ("not_run", "137"),
-        "CANCELLED": ("not_run", "130"),
     }
     if status == "NONZERO_EXIT":
         valid = verifier == "not_run" and CANONICAL_INTEGER.fullmatch(exit_code) and int(exit_code) > 0
@@ -143,6 +148,130 @@ def _check_status(manifest: dict[str, object]) -> None:
         raise EvidenceError("status, verifier, and exit_code do not have the native mapping")
     if _require_string(manifest["timed_out"], "timed_out") != ("true" if status == "TIMEOUT" else "false"):
         raise EvidenceError("timed_out does not match terminal status")
+
+
+def _canonical_integer(value: object, label: str) -> int:
+    text = _require_string(value, label)
+    if not CANONICAL_INTEGER.fullmatch(text):
+        raise EvidenceError(f"{label} must be a canonical nonnegative integer")
+    return int(text)
+
+
+def _canonical_decimal(value: object, label: str, *, maximum: Decimal | None = None) -> Decimal:
+    text = _require_string(value, label)
+    if not CANONICAL_DECIMAL.fullmatch(text):
+        raise EvidenceError(f"{label} must be a canonical decimal")
+    try:
+        number = Decimal(text)
+    except InvalidOperation as exc:
+        raise EvidenceError(f"{label} must be a canonical decimal") from exc
+    if not number.is_finite() or number < 0 or (maximum is not None and number > maximum):
+        raise EvidenceError(f"{label} is out of range")
+    canonical = format(number.normalize(), "f")
+    if "." not in canonical:
+        canonical += ".0"
+    if text != canonical:
+        raise EvidenceError(f"{label} must be a canonical decimal")
+    return number
+
+
+def _canonical_timeout(value: object) -> Decimal:
+    text = _require_string(value, "timeout_seconds")
+    if CANONICAL_INTEGER.fullmatch(text):
+        number = Decimal(text)
+    else:
+        number = _canonical_decimal(text, "timeout_seconds")
+    if number <= 0 or number > Decimal(300):
+        raise EvidenceError("timeout_seconds must be in (0,300]")
+    return number
+
+
+def _timestamp(value: object, label: str) -> None:
+    text = _require_string(value, label)
+    if not RFC3339_UTC.fullmatch(text):
+        raise EvidenceError(f"{label} must be RFC3339 UTC")
+    try:
+        datetime.fromisoformat(text[:-1] + "+00:00")
+    except ValueError as exc:
+        raise EvidenceError(f"{label} must be RFC3339 UTC") from exc
+
+
+def _validate_params(params: dict[str, object], cell_id: str) -> Decimal:
+    if any(not isinstance(value, str) for value in params.values()):
+        raise EvidenceError("run parameters must be strings")
+    if params["comparison_id"] != cell_id:
+        raise EvidenceError("comparison_id must match native cell directory")
+    if params["role"] not in {"baseline", "candidate"}:
+        raise EvidenceError("role must be baseline or candidate")
+    if params["blind"] != "true" or params["evaluation_scope"] != "visible_cv_only":
+        raise EvidenceError("params must preserve blind visible-CV scope")
+    if not HEX_64.fullmatch(params["algorithm_seed"]):
+        raise EvidenceError("algorithm_seed must be 64 lowercase hexadecimal characters")
+    _canonical_integer(params["repeat"], "repeat")
+    for field in PARAM_FIELDS - {"algorithm_seed", "repeat", "timeout_seconds"}:
+        if params[field] == "":
+            raise EvidenceError(f"{field} must be nonempty")
+    return _canonical_timeout(params["timeout_seconds"])
+
+
+def _validate_provenance(provenance: dict[str, object]) -> None:
+    if any(not isinstance(value, str) for value in provenance.values()):
+        raise EvidenceError("provenance values must be strings")
+    for field in ("source_commit", "runner_commit"):
+        if not COMMIT_40.fullmatch(provenance[field]):
+            raise EvidenceError(f"{field} must be 40 lowercase hexadecimal characters")
+    if not HEX_64.fullmatch(provenance["tree_digest"]):
+        raise EvidenceError("tree_digest must be 64 lowercase hexadecimal characters")
+    for field in ("image_sha256", "compiler_digest"):
+        if provenance[field] != "none" and not HEX_64.fullmatch(provenance[field]):
+            raise EvidenceError(f"{field} must be none or 64 lowercase hexadecimal characters")
+
+
+def _validate_metrics(manifest: dict[str, object], timeout: Decimal) -> None:
+    status = _require_string(manifest["status"], "status")
+    if status in CANDIDATE_STATES:
+        if any(manifest[field] == "none" for field in QUALITY_FIELDS):
+            raise EvidenceError("candidate-bearing status lacks candidate evidence")
+        if manifest["train_exact"] != "1.0":
+            raise EvidenceError("candidate train_exact must equal 1.0")
+        _canonical_decimal(manifest["visible_cv_exact"], "visible_cv_exact", maximum=Decimal(1))
+        _canonical_decimal(
+            manifest["visible_cv_bit_accuracy"], "visible_cv_bit_accuracy", maximum=Decimal(1)
+        )
+        _canonical_integer(manifest["gates"], "gates")
+        elapsed = _canonical_decimal(manifest["elapsed_seconds"], "elapsed_seconds")
+        if elapsed > timeout:
+            raise EvidenceError("elapsed_seconds exceeds timeout_seconds")
+        _canonical_integer(manifest["peak_memory_kib"], "peak_memory_kib")
+        return
+    for field in QUALITY_FIELDS:
+        if manifest[field] != "none":
+            raise EvidenceError("noncandidate terminal manifest must not claim candidate evidence")
+    elapsed = manifest["elapsed_seconds"]
+    if status == "TIMEOUT":
+        if elapsed == "none" or _canonical_decimal(elapsed, "elapsed_seconds") != timeout:
+            raise EvidenceError("TIMEOUT must record the declared timeout")
+    elif elapsed != "none":
+        if _canonical_decimal(elapsed, "elapsed_seconds") > timeout:
+            raise EvidenceError("elapsed_seconds exceeds timeout_seconds")
+    if manifest["peak_memory_kib"] != "none":
+        _canonical_integer(manifest["peak_memory_kib"], "peak_memory_kib")
+
+
+def _validate_runner_metadata(manifest: dict[str, object], timeout: Decimal) -> None:
+    if not isinstance(manifest["argv"], list) or not manifest["argv"] or not all(
+        isinstance(arg, str) for arg in manifest["argv"]
+    ):
+        raise EvidenceError("runner argv must be a nonempty string array")
+    _timestamp(manifest["started_utc"], "started_utc")
+    _timestamp(manifest["ended_utc"], "ended_utc")
+    if any(manifest[field] != "none" for field in SCHEDULER_FIELDS):
+        raise EvidenceError("runner scheduler fields must be none")
+    if manifest["status"] == "TIMEOUT":
+        _canonical_decimal(manifest["cleanup_seconds"], "cleanup_seconds")
+    elif manifest["cleanup_seconds"] != "0.0":
+        raise EvidenceError("non-timeout cleanup_seconds must equal 0.0")
+    _validate_metrics(manifest, timeout)
 
 
 def _frame(stdout: bytes, stderr: bytes) -> str:
@@ -157,8 +286,6 @@ def load_terminal_manifest(path: Path, evidence_root: Path | None = None) -> Ter
         raise EvidenceError("manifest has missing or extra fields")
     if manifest["schema_version"] != 1 or manifest["producer"] != "runner":
         raise EvidenceError("manifest must be runner schema version 1")
-    if not isinstance(manifest["argv"], list) or not all(isinstance(arg, str) for arg in manifest["argv"]):
-        raise EvidenceError("manifest argv must be a string array")
     for field in PARAM_FIELDS | PROVENANCE_FIELDS | {"started_utc", "ended_utc", "elapsed_seconds", "cleanup_seconds", "peak_memory_kib"}:
         _require_string(manifest[field], field)
     for field in SCHEDULER_FIELDS:
@@ -186,12 +313,17 @@ def load_terminal_manifest(path: Path, evidence_root: Path | None = None) -> Ter
         selected = cell
     if selected is None or not isinstance(selected["params"], dict) or set(selected["params"]) != PARAM_FIELDS:
         raise EvidenceError("run_spec does not contain the manifest cell")
+    timeout = _validate_params(selected["params"], comparison_id)
+    _validate_provenance(spec["provenance"])
     for field in PARAM_FIELDS:
         if selected["params"][field] != manifest[field]:
             raise EvidenceError("manifest parameters disagree with run_spec")
     for field in PROVENANCE_FIELDS:
         if spec["provenance"][field] != manifest[field]:
             raise EvidenceError("manifest provenance disagrees with run_spec")
+    _validate_params({field: manifest[field] for field in PARAM_FIELDS}, comparison_id)
+    _validate_provenance({field: manifest[field] for field in PROVENANCE_FIELDS})
+    _validate_runner_metadata(manifest, timeout)
     cell_dir = root / "cells" / comparison_id
     stdout = read_stable_regular(cell_dir / "stdout.log", "stdout.log", MAX_ARTIFACT_BYTES)
     stderr = read_stable_regular(cell_dir / "stderr.log", "stderr.log", MAX_ARTIFACT_BYTES)
@@ -201,14 +333,6 @@ def load_terminal_manifest(path: Path, evidence_root: Path | None = None) -> Ter
         raise EvidenceError("stderr digest binding mismatch")
     if _require_digest(manifest["log_sha256"], "log_sha256") != _frame(stdout, stderr):
         raise EvidenceError("combined log digest binding mismatch")
-    if manifest["status"] in CANDIDATE_STATES:
-        for field in QUALITY_FIELDS:
-            if manifest[field] == "none":
-                raise EvidenceError("candidate-bearing status lacks candidate evidence")
-    else:
-        for field in QUALITY_FIELDS:
-            if manifest[field] != "none":
-                raise EvidenceError("noncandidate terminal manifest must not claim candidate evidence")
     return TerminalEvidence(
         manifest_path=path, manifest_sha256=sha256_bytes(manifest_raw), run_root=root,
         run_spec_path=run_spec_path, run_spec_sha256=sha256_bytes(spec_raw),

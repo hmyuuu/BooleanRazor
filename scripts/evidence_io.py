@@ -1,4 +1,4 @@
-"""Strict, canonical, race-resistant evidence file primitives."""
+"""Strict, canonical, descriptor-anchored evidence file primitives."""
 
 from __future__ import annotations
 
@@ -15,6 +15,8 @@ from typing import NoReturn
 HEX_64 = re.compile(r"[0-9a-f]{64}")
 DEFAULT_MAX_BYTES = 16 * 1024 * 1024
 MAX_ARTIFACT_BYTES = 512 * 1024 * 1024
+_DIRECTORY_FLAGS = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+_READ_FLAGS = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
 
 
 class EvidenceError(ValueError):
@@ -45,41 +47,55 @@ def _unique_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
     return value
 
 
-def _absolute_lexical(path: Path) -> Path:
-    return path if path.is_absolute() else Path.cwd() / path
+def _absolute_parts(path: Path, label: str) -> tuple[str, ...]:
+    """Return lexical absolute components without resolving any symlink."""
+    absolute = path if path.is_absolute() else Path.cwd() / path
+    if not absolute.is_absolute():  # defensive for unusual Path implementations
+        raise EvidenceError(f"{label} path must be absolute")
+    parts = absolute.parts
+    if not parts or parts[0] != absolute.anchor:
+        raise EvidenceError(f"{label} path is invalid")
+    components = parts[1:]
+    if not components or any(part in {"", ".", ".."} for part in components):
+        raise EvidenceError(f"{label} path has an invalid component")
+    return components
 
 
-def _reject_symlink_components(path: Path, label: str) -> None:
-    absolute = _absolute_lexical(path)
-    current = Path(absolute.anchor)
-    for part in absolute.parts[1:]:
-        current /= part
-        try:
-            metadata = os.lstat(current)
-        except FileNotFoundError:
-            continue
-        except OSError as exc:
-            raise EvidenceError(f"{label} cannot inspect path component") from exc
-        if stat.S_ISLNK(metadata.st_mode):
-            raise EvidenceError(f"{label} must not traverse a symlink component")
+def _open_directory_components(path: Path, label: str) -> tuple[int, str]:
+    """Open *path*'s parent directory and return its fd plus final filename.
+
+    Every component is opened relative to an already-open directory descriptor.
+    This makes a namespace substitution fail at that component rather than turn a
+    checked name into an unchecked new pathname lookup.
+    """
+    components = _absolute_parts(path, label)
+    descriptor = os.open(Path(path.anchor).anchor or "/", _DIRECTORY_FLAGS)
+    try:
+        for component in components[:-1]:
+            child = os.open(component, _DIRECTORY_FLAGS, dir_fd=descriptor)
+            os.close(descriptor)
+            descriptor = child
+        return descriptor, components[-1]
+    except OSError as exc:
+        os.close(descriptor)
+        raise EvidenceError(f"{label} cannot inspect path component") from exc
+
+
+def _open_regular(path: Path, label: str) -> int:
+    parent, name = _open_directory_components(path, label)
+    try:
+        descriptor = os.open(name, _READ_FLAGS, dir_fd=parent)
+    except OSError as exc:
+        raise EvidenceError(f"{label} must be a regular readable file") from exc
+    finally:
+        os.close(parent)
+    return descriptor
 
 
 def _read_once(path: Path, label: str, max_bytes: int) -> bytes:
     if max_bytes < 0:
         raise EvidenceError(f"{label} maximum size is invalid")
-    try:
-        if stat.S_ISLNK(os.lstat(path).st_mode):
-            raise EvidenceError(f"{label} must be a regular file")
-    except FileNotFoundError:
-        pass
-    except OSError as exc:
-        raise EvidenceError(f"{label} must be a regular readable file") from exc
-    _reject_symlink_components(path, label)
-    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
-    try:
-        descriptor = os.open(path, flags)
-    except OSError as exc:
-        raise EvidenceError(f"{label} must be a regular readable file") from exc
+    descriptor = _open_regular(path, label)
     try:
         before = os.fstat(descriptor)
         if not stat.S_ISREG(before.st_mode):
@@ -147,6 +163,20 @@ def load_canonical_object(
     return value, raw
 
 
+def _open_root(root: Path, label: str) -> int:
+    root_parts = _absolute_parts(root, f"{label} root")
+    descriptor = os.open(Path(root.anchor).anchor or "/", _DIRECTORY_FLAGS)
+    try:
+        for component in root_parts:
+            child = os.open(component, _DIRECTORY_FLAGS, dir_fd=descriptor)
+            os.close(descriptor)
+            descriptor = child
+        return descriptor
+    except OSError as exc:
+        os.close(descriptor)
+        raise EvidenceError(f"{label} root must be an existing directory without symlinks") from exc
+
+
 def resolve_evidence_path(root: Path, value: str, label: str) -> Path:
     if not isinstance(value, str) or not value:
         raise EvidenceError(f"{label} path must be a nonempty relative path")
@@ -155,43 +185,36 @@ def resolve_evidence_path(root: Path, value: str, label: str) -> Path:
     parts = value.split("/")
     if any(part in {"", ".", ".."} for part in parts):
         raise EvidenceError(f"{label} path has an invalid component")
-    _reject_symlink_components(root, f"{label} root")
+    descriptor = _open_root(root, label)
     try:
-        resolved_root = root.resolve(strict=True)
+        for component in parts[:-1]:
+            child = os.open(component, _DIRECTORY_FLAGS, dir_fd=descriptor)
+            os.close(descriptor)
+            descriptor = child
+        final = os.open(parts[-1], _READ_FLAGS, dir_fd=descriptor)
+        try:
+            if not stat.S_ISREG(os.fstat(final).st_mode):
+                raise EvidenceError(f"{label} must be a regular file")
+        finally:
+            os.close(final)
+    except EvidenceError:
+        raise
     except OSError as exc:
-        raise EvidenceError(f"{label} root must exist") from exc
-    if not resolved_root.is_dir():
-        raise EvidenceError(f"{label} root must be a directory")
-    candidate = root.joinpath(*parts)
-    _reject_symlink_components(candidate, label)
-    try:
-        resolved = candidate.resolve(strict=True)
-    except OSError as exc:
-        raise EvidenceError(f"{label} path must exist") from exc
-    try:
-        resolved.relative_to(resolved_root)
-    except ValueError as exc:
-        raise EvidenceError(f"{label} path escapes evidence root") from exc
-    try:
-        metadata = os.lstat(candidate)
-    except OSError as exc:
-        raise EvidenceError(f"{label} must be a regular file") from exc
-    if not stat.S_ISREG(metadata.st_mode):
-        raise EvidenceError(f"{label} must be a regular file")
-    return candidate
+        raise EvidenceError(f"{label} must be an existing regular file under evidence root") from exc
+    finally:
+        os.close(descriptor)
+    # Retain lexical native paths for callers; every later read reopens it securely.
+    return root.joinpath(*parts)
 
 
 def atomic_create(path: Path, data: bytes) -> None:
-    """Publish *data* exactly once without replacing an existing target."""
-    parent = path.parent
-    _reject_symlink_components(parent, "output")
-    if not parent.is_dir():
-        raise EvidenceError("output parent must be a directory")
-    temporary = parent / f".{path.name}.{secrets.token_hex(16)}.tmp"
+    """Publish *data* once through a verified parent directory descriptor."""
+    parent, final_name = _open_directory_components(path, "output")
+    temporary = f".{final_name}.{secrets.token_hex(16)}.tmp"
     descriptor: int | None = None
     try:
         flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
-        descriptor = os.open(temporary, flags, 0o600)
+        descriptor = os.open(temporary, flags, 0o600, dir_fd=parent)
         offset = 0
         while offset < len(data):
             written = os.write(descriptor, data[offset:])
@@ -202,20 +225,28 @@ def atomic_create(path: Path, data: bytes) -> None:
         os.close(descriptor)
         descriptor = None
         try:
-            os.link(temporary, path, follow_symlinks=False)
+            os.link(
+                temporary,
+                final_name,
+                src_dir_fd=parent,
+                dst_dir_fd=parent,
+                follow_symlinks=False,
+            )
         except FileExistsError as exc:
             raise EvidenceError("output already exists") from exc
-        directory = os.open(parent, os.O_RDONLY)
-        try:
-            os.fsync(directory)
-        finally:
-            os.close(directory)
+        os.fsync(parent)
+    except EvidenceError:
+        raise
     except OSError as exc:
         raise EvidenceError("failed to create immutable output") from exc
     finally:
         if descriptor is not None:
             os.close(descriptor)
         try:
-            os.unlink(temporary)
+            os.unlink(temporary, dir_fd=parent)
         except FileNotFoundError:
             pass
+        except OSError as exc:
+            os.close(parent)
+            raise EvidenceError("failed to clean temporary output") from exc
+        os.close(parent)
