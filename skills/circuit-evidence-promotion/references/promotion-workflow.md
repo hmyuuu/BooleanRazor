@@ -174,8 +174,8 @@ and do not infer a family label.
 Run:
 
 ```bash
-make report
-make report-check
+make -C "$REPO_ROOT" report
+make -C "$REPO_ROOT" report-check
 ```
 
 Keep the immutable raw decision inside its authorized evidence boundary when
