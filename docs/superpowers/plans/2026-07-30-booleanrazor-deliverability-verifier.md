@@ -1074,6 +1074,23 @@ git commit -m "feat: bind official verification to candidate evidence"
 - Produces decision keys:
   `schema_version`, `track`, `decision`, `highest_legal_next_step`, `reasons`,
   `input_sha256`.
+- Positive `disclosed_control`, `synthetic`, `blind_visible`, and
+  `sealed_confirmation` decisions additionally require the separately supplied
+  canonical CLI input `--trust-policy PATH` (it is not a request field):
+
+```json
+{"frozen_comparison_sha256":"<64 lowercase hex>","official_verifications":[{"comparison_id":"<left id>","sha256":"<64 lowercase hex>"}],"schema_version":1,"sealed_results_sha256":"none"}
+```
+
+`official_verifications` is a nonempty unique set by `comparison_id` and must
+exactly equal the request's one-record-per-pair-left set, binding each record's
+raw canonical bytes. `frozen_comparison_sha256` binds the raw frozen comparison;
+for a sealed promotion `sealed_results_sha256` must bind the raw sealed result
+(otherwise it is `"none"`). The decision records the policy digest as
+`input_sha256.external_trust_policy`. The policy is an externally selected
+operator/custodian precommit: this checker verifies only byte bindings and does
+not authenticate the operator, establish selection, prove chronology, or make
+a cryptographic-authentication claim.
 - Production types are:
 
 ```python
@@ -1334,6 +1351,10 @@ sealed_baseline_incomplete
 frozen_comparison_digest_mismatch
 control_instance_set_mismatch
 prediction_commitment_mismatch
+native_run_incomplete
+comparison_projection_mismatch
+external_trust_policy_absent
+external_trust_policy_mismatch
 ```
 
 The ordered deterministic pairs must be a perfect partition of all
@@ -1450,6 +1471,7 @@ Generate into a temporary directory and compare:
 
 ```bash
 promotion_tmp=$(mktemp -d)
+promotion_tmp=$(cd "$promotion_tmp" && pwd -P)
 uv run --default-index https://pypi.org/simple python \
   scripts/check-promotion.py \
   --request research/CURRENT_PROMOTION_REQUEST.json \
