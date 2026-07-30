@@ -201,7 +201,7 @@ class PromotionFixture:
                 record = {
                     "bit_accuracy": "1.0", "circuit_sha256": sha256(circuit), "comparison_id": identifier,
                     "dataset_sha256": sha256(b"official input " + identifier.encode()), "exact_accuracy": "1.0",
-                    "gates": int(gates), "julia_version": {"sha256": "d" * 64, "text": "julia version 1.12.4"},
+                    "gates": int(gates), "julia_version": {"sha256": sha256(b"julia version 1.12.4\n"), "text": "julia version 1.12.4"},
                     "manifest_sha256": sha256(manifest_path.read_bytes()), "run_spec_sha256": spec_digest,
                     "samples": 2, "schema_version": 1, "status": "pass", "verify_jl_sha256": "e" * 64,
                 }
@@ -264,7 +264,7 @@ class DisclosedControlFixture:
             write_json(manifest_path, manifest)
             if identifier.endswith("r0"):
                 letter = identifier.split("-")[1]
-                record = {"bit_accuracy": "1.0", "circuit_sha256": manifest["circuit_sha256"], "comparison_id": identifier, "dataset_sha256": commitments[letter], "exact_accuracy": "1.0", "gates": int(manifest["gates"]), "julia_version": {"sha256": "d" * 64, "text": "julia version 1.12.4"}, "manifest_sha256": sha256(manifest_path.read_bytes()), "run_spec_sha256": spec_digest, "samples": 2, "schema_version": 1, "status": "pass", "verify_jl_sha256": "e" * 64}
+                record = {"bit_accuracy": "1.0", "circuit_sha256": manifest["circuit_sha256"], "comparison_id": identifier, "dataset_sha256": commitments[letter], "exact_accuracy": "1.0", "gates": int(manifest["gates"]), "julia_version": {"sha256": sha256(b"julia version 1.12.4\n"), "text": "julia version 1.12.4"}, "manifest_sha256": sha256(manifest_path.read_bytes()), "run_spec_sha256": spec_digest, "samples": 2, "schema_version": 1, "status": "pass", "verify_jl_sha256": "e" * 64}
                 write_json(cell / "official-verification.json", record)
         design = {"cells": [{"comparison_id": identifier, "dataset_id": f"mystery-{identifier.split('-')[1]}"} for identifier in self.ids], "dataset_boundary": "synthetic-fixture", "schema_version": 1}
         write_json(self.root / "visible-design.json", design)
@@ -361,6 +361,17 @@ def test_nonsealed_track_rejects_sealed_path_without_reading_it(promotion_fixtur
     assert not output.exists()
 
 
+def test_nonsealed_track_rejects_private_sealed_digest_in_policy(promotion_fixture: PromotionFixture) -> None:
+    request = promotion_fixture.write_valid_request("synthetic")
+    policy = promotion_fixture.write_trust_policy()
+    value = read_json(policy)
+    value["sealed_results_sha256"] = "a" * 64
+    write_json(policy, value)
+    result, output = promotion_fixture.run_checker(request, policy=policy)
+    assert result.returncode == 2
+    assert not output.exists()
+
+
 def test_same_metadata_other_run_root_is_not_a_complete_native_run(promotion_fixture: PromotionFixture) -> None:
     request = promotion_fixture.write_valid_request("synthetic")
     other = promotion_fixture.root / "other"
@@ -387,7 +398,18 @@ def test_policy_must_bind_exact_official_record_bytes(promotion_fixture: Promoti
     assert "external_trust_policy_mismatch" in read_json(output)["reasons"]
 
 
-@pytest.mark.parametrize("field, value", (("exact_accuracy", "0.9"), ("bit_accuracy", "0.9"), ("samples", True), ("julia_version", {"sha256": "D" * 64, "text": ""})))
+def test_input_digests_match_the_exact_canonical_bytes_parsed(promotion_fixture: PromotionFixture) -> None:
+    request = promotion_fixture.write_valid_request("sealed_confirmation")
+    policy = promotion_fixture.write_trust_policy(sealed=True)
+    result, output = promotion_fixture.run_checker(request, policy=policy)
+    assert result.returncode == 0, result.stderr
+    inputs = read_json(output)["input_sha256"]
+    for relative in read_json(request)["candidate_evidence"] + read_json(request)["official_verifications"] + ["frozen-comparison.json", "visible-design.json", "sealed.json"]:
+        assert inputs[relative] == sha256((promotion_fixture.root / relative).read_bytes())
+    assert inputs["external_trust_policy"] == sha256(policy.read_bytes())
+
+
+@pytest.mark.parametrize("field, value", (("exact_accuracy", "0.9"), ("bit_accuracy", "0.9"), ("samples", True), ("julia_version", {"sha256": "D" * 64, "text": ""}), ("julia_version", {"sha256": "0" * 64, "text": "julia version 1.12.4"})))
 def test_official_pass_record_requires_exact_pass_metrics_and_valid_julia_value(promotion_fixture: PromotionFixture, field: str, value: object) -> None:
     request = promotion_fixture.write_valid_request("synthetic")
     path = promotion_fixture.root / "cells/candidate-r0/official-verification.json"

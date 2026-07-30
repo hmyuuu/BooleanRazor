@@ -107,6 +107,9 @@ def _load_record(path: Path) -> tuple[dict[str, object], bytes]:
         raise EvidenceError("official verification has invalid digest")
     if not isinstance(record["julia_version"], dict) or set(record["julia_version"]) != {"sha256", "text"} or not isinstance(record["julia_version"]["sha256"], str) or not HEX_64.fullmatch(record["julia_version"]["sha256"]) or not isinstance(record["julia_version"]["text"], str) or not record["julia_version"]["text"] or any(ord(char) < 32 or ord(char) > 126 for char in record["julia_version"]["text"]):
         raise EvidenceError("official verification has invalid Julia version")
+    version_bytes = (record["julia_version"]["text"] + "\n").encode("ascii")
+    if record["julia_version"]["sha256"] != sha256_bytes(version_bytes):
+        raise EvidenceError("official verification Julia version digest mismatch")
     return record, raw
 
 
@@ -152,6 +155,7 @@ def quality_key(candidate: CandidateEvidence) -> tuple[Decimal, int]:
 
 def _load_comparison(root: Path, path: Path, track: str, digests: dict[str, str]) -> tuple[dict[str, object], bytes, dict[str, object]]:
     comparison, raw = load_canonical_object(path, "frozen comparison")
+    digests[_relative_key(root, path)] = sha256_bytes(raw)
     _require_exact_fields(comparison, {"baseline_ids", "candidate_ids", "design_path", "design_sha256", "expected_ids", "frozen_candidate_id", "rule", "schema_version"}, "frozen comparison")
     if type(comparison["schema_version"]) is not int or comparison["schema_version"] != 1 or comparison["rule"] != "accuracy_first_then_gates":
         raise EvidenceError("frozen comparison has invalid rule")
@@ -221,6 +225,12 @@ def build_decision(request_path: Path, trust_policy_path: Path | None = None) ->
     root = request_path.parent
     digests: dict[str, str] = {request_path.name: sha256_bytes(request_raw)}
     trust_policy = _load_trust_policy(trust_policy_path, request_raw, digests)
+    if trust_policy is not None:
+        if track == "sealed_confirmation":
+            if not isinstance(trust_policy["sealed_results_sha256"], str) or not HEX_64.fullmatch(trust_policy["sealed_results_sha256"]):
+                raise EvidenceError("sealed_confirmation policy must bind sealed results")
+        elif trust_policy["sealed_results_sha256"] != "none":
+            raise EvidenceError("nonsealed policy must not contain a sealed result digest")
     candidate_paths = _resolve_many(root, request["candidate_evidence"], "candidate evidence", digests)
     verification_paths = _resolve_many(root, request["official_verifications"], "official verifications", digests)
     frozen_path = _resolve_one(root, request["frozen_comparison"], "frozen comparison", digests)
@@ -247,12 +257,18 @@ def build_decision(request_path: Path, trust_policy_path: Path | None = None) ->
         if len(set(endpoints)) != len(endpoints):
             raise EvidenceError("deterministic pair endpoints are duplicated")
     terminals = tuple(load_terminal_manifest(path) for path in candidate_paths)
+    for terminal in terminals:
+        digests[_relative_key(root, terminal.manifest_path)] = terminal.manifest_sha256
     if len({row.comparison_id for row in terminals}) != len(terminals):
         raise EvidenceError("candidate evidence has duplicate comparison_id")
     candidates: list[CandidateEvidence] = []
+    terminals_by_path = {row.manifest_path: row for row in terminals}
     for terminal in terminals:
         if terminal.status in {"SUCCESS", "VERIFIER_FAILED", "VERIFIER_NOT_RUN"}:
-            candidates.append(load_candidate_manifest(terminal.manifest_path))
+            candidate = load_candidate_manifest(terminal.manifest_path)
+            if candidate.manifest_sha256 != terminals_by_path[candidate.manifest_path].manifest_sha256:
+                raise EvidenceError("candidate manifest changed after terminal-first validation")
+            candidates.append(candidate)
     if len({row.comparison_id for row in candidates}) != len(candidates):
         raise EvidenceError("candidate evidence has duplicate candidate comparison_id")
     by_path = {row.manifest_path: row for row in candidates}
@@ -269,6 +285,8 @@ def build_decision(request_path: Path, trust_policy_path: Path | None = None) ->
                 pairs.append(DeterministicPair(left, right, _pair_byte_identical(left, right)))
     records: list[VerificationBinding] = []
     record_rows = [(path, *_load_record(path)) for path in verification_paths]
+    for path, _, raw in record_rows:
+        digests[_relative_key(root, path)] = sha256_bytes(raw)
     lefts = {pair.left.comparison_id: pair.left for pair in pairs}
     record_bad = False
     if record_rows:
@@ -337,7 +355,8 @@ def build_decision(request_path: Path, trust_policy_path: Path | None = None) ->
         if sealed_path is None:
             reasons.add("sealed_results_absent")
         elif comparison is not None and comparison_raw is not None:
-            sealed, _ = load_canonical_object(sealed_path, "sealed result")
+            sealed, sealed_raw = load_canonical_object(sealed_path, "sealed result")
+            digests[_relative_key(root, sealed_path)] = sha256_bytes(sealed_raw)
             _require_exact_fields(sealed, {"analysis_rule", "baseline_methods", "comparison_ids", "failed_cells_normalized", "frozen_comparison_sha256", "matched_100x_against", "scaling_advantage_against", "schema_version"}, "sealed result")
             if type(sealed["schema_version"]) is not int or sealed["schema_version"] != 1 or sealed["analysis_rule"] != "predeclared_100x_or_scaling" or sealed["failed_cells_normalized"] is not True or not all(isinstance(sealed[key], list) and all(isinstance(value, str) for value in sealed[key]) and len(set(sealed[key])) == len(sealed[key]) for key in ("baseline_methods", "comparison_ids", "matched_100x_against", "scaling_advantage_against")):
                 raise EvidenceError("sealed result has invalid schema")
@@ -347,7 +366,7 @@ def build_decision(request_path: Path, trust_policy_path: Path | None = None) ->
                 reasons.add("sealed_baseline_incomplete")
             elif sealed["frozen_comparison_sha256"] != sha256_bytes(comparison_raw):
                 reasons.add("frozen_comparison_digest_mismatch")
-            elif trust_policy is None or trust_policy["sealed_results_sha256"] != sha256_bytes(read_stable_regular(sealed_path, "sealed result", DEFAULT_MAX_BYTES)):
+            elif trust_policy is None or trust_policy["sealed_results_sha256"] != sha256_bytes(sealed_raw):
                 reasons.add("external_trust_policy_mismatch")
             elif not {"hamming-1nn", "zero-fill"}.issubset(set(sealed["baseline_methods"])) or not {"hamming-1nn", "zero-fill"}.issubset(set(sealed["matched_100x_against"]) | set(sealed["scaling_advantage_against"])):
                 reasons.add("sealed_baseline_incomplete")

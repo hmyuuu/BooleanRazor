@@ -1087,9 +1087,11 @@ exactly equal the request's one-record-per-pair-left set, binding each record's
 raw canonical bytes. `frozen_comparison_sha256` binds the raw frozen comparison;
 `request_sha256` binds the exact canonical request bytes and prevents replay
 across tracks or request variants. `sealed_results` is literal `none` outside
-`sealed_confirmation` and is rejected before any path resolution.
-for a sealed promotion `sealed_results_sha256` must bind the raw sealed result
-(otherwise it is `"none"`). The decision records the policy digest as
+`sealed_confirmation` and is rejected before any path resolution. For
+`sealed_confirmation`, `sealed_results_sha256` must be lowercase HEX64 and bind
+the raw sealed result; for every nonsealed track it must be exactly `"none"`.
+Every `input_sha256` entry comes from the exact raw bytes returned by the
+canonical validator that supplied the parsed object. The decision records the policy digest as
 `input_sha256.external_trust_policy`. The policy is an externally selected
 operator/custodian precommit: this checker verifies only byte bindings and does
 not authenticate the operator, establish selection, prove chronology, or make

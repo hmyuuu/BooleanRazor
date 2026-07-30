@@ -446,6 +446,10 @@ authentication remain external duties and are not checker claims.
 `request_sha256` binds the exact canonical request bytes, preventing replay
 across tracks; `sealed_results` is literal `none` outside `sealed_confirmation`
 and is rejected before the checker resolves or reads a path.
+Nonsealed policies likewise require `sealed_results_sha256` exactly `none`;
+sealed policies require lowercase HEX64 bound to the exact parsed sealed bytes.
+Decision input digests come from validated raw snapshots that supplied the
+parsed objects.
 
 ### 11.2 Common gates
 
