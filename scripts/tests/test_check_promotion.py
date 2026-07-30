@@ -445,6 +445,46 @@ def test_sealed_result_requires_one_uniform_outcome_against_both_baselines(
     assert "sealed_baseline_incomplete" in decision["reasons"]
 
 
+def test_sealed_baseline_names_must_match_frozen_baseline_manifests(
+    promotion_fixture: PromotionFixture,
+) -> None:
+    request = promotion_fixture.write_valid_request("sealed_confirmation")
+    spec_path = promotion_fixture.root / "run_spec.json"
+    spec = read_json(spec_path)
+    replacements = {
+        "baseline-1nn-r0": "not-hamming",
+        "baseline-1nn-r1": "not-hamming",
+        "baseline-zero-r0": "not-zero-fill",
+        "baseline-zero-r1": "not-zero-fill",
+    }
+    for cell in spec["cells"]:
+        identifier = cell["cell_id"]
+        if identifier in replacements:
+            cell["params"]["method"] = replacements[identifier]
+    write_json(spec_path, spec)
+    spec_digest = sha256(spec_path.read_bytes())
+    for identifier in promotion_fixture.ids:
+        manifest_path = promotion_fixture.manifest(identifier)
+        manifest = read_json(manifest_path)
+        manifest["run_spec_sha256"] = spec_digest
+        if identifier in replacements:
+            manifest["method"] = replacements[identifier]
+        write_json(manifest_path, manifest)
+        record_path = manifest_path.with_name("official-verification.json")
+        if record_path.exists():
+            record = read_json(record_path)
+            record["manifest_sha256"] = sha256(manifest_path.read_bytes())
+            record["run_spec_sha256"] = spec_digest
+            write_json(record_path, record)
+
+    result, output = promotion_fixture.run_checker(request)
+
+    assert result.returncode == 0, result.stderr
+    decision = read_json(output)
+    assert decision["decision"] == "blocked"
+    assert "sealed_baseline_incomplete" in decision["reasons"]
+
+
 @pytest.mark.parametrize("field, value", (("exact_accuracy", "0.9"), ("bit_accuracy", "0.9"), ("samples", True), ("julia_version", {"sha256": "D" * 64, "text": ""}), ("julia_version", {"sha256": "0" * 64, "text": "julia version 1.12.4"})))
 def test_official_pass_record_requires_exact_pass_metrics_and_valid_julia_value(promotion_fixture: PromotionFixture, field: str, value: object) -> None:
     request = promotion_fixture.write_valid_request("synthetic")

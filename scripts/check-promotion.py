@@ -371,6 +371,12 @@ def build_decision(request_path: Path, trust_policy_path: Path | None = None) ->
             elif not isinstance(sealed["frozen_comparison_sha256"], str) or not HEX_64.fullmatch(sealed["frozen_comparison_sha256"]):
                 raise EvidenceError("sealed result has invalid digest")
             required_baselines = {"hamming-1nn", "zero-fill"}
+            frozen_baseline_ids = set(comparison["baseline_ids"])
+            actual_baseline_methods = {
+                candidate.method
+                for candidate in candidates
+                if candidate.comparison_id in frozen_baseline_ids
+            }
             matched_100x = set(sealed["matched_100x_against"])
             scaling_advantage = set(sealed["scaling_advantage_against"])
             uniform_outcome = (
@@ -378,7 +384,7 @@ def build_decision(request_path: Path, trust_policy_path: Path | None = None) ->
             ) or (
                 scaling_advantage == required_baselines and not matched_100x
             )
-            if set(sealed["comparison_ids"]) != set(comparison["expected_ids"]) or set(sealed["baseline_methods"]) != required_baselines or not uniform_outcome:
+            if set(sealed["comparison_ids"]) != set(comparison["expected_ids"]) or set(sealed["baseline_methods"]) != required_baselines or actual_baseline_methods != required_baselines or not uniform_outcome:
                 reasons.add("sealed_baseline_incomplete")
             elif sealed["frozen_comparison_sha256"] != sha256_bytes(comparison_raw):
                 reasons.add("frozen_comparison_digest_mismatch")

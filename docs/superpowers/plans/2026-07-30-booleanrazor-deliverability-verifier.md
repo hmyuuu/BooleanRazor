@@ -1440,7 +1440,8 @@ timestamp, hostname, absolute path, or environment value. A sealed positive
 requires one uniform outcome: `matched_100x_against` equals both frozen
 baselines and `scaling_advantage_against` is empty, or the scaling set equals
 both baselines and the `100×` set is empty. A one-baseline/one-baseline hybrid
-is `sealed_baseline_incomplete`.
+is `sealed_baseline_incomplete`. The declared `baseline_methods` must also
+equal the `method` set read from the frozen baseline manifests.
 
 - [ ] **Step 7: Run the promotion tests**
 

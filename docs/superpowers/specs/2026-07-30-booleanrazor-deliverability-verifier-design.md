@@ -514,6 +514,8 @@ inputs produce byte-identical output.
 - can promote only when one uniform outcome passes against both baseline
   curves: `100×` against both or scaling advantage against both; a hybrid split
   across the two outcomes is not promotable;
+- requires the sealed baseline names to equal the methods in the frozen
+  baseline manifests, not merely a hard-coded label set;
 - otherwise emits `no_change`, `reject`, or `blocked` with exact reasons.
 
 The absent public bundle and sealed results mean the current repository should
