@@ -108,6 +108,10 @@ def _require_string(value: object, label: str) -> str:
     return value
 
 
+def _schema_version_one(value: object) -> bool:
+    return type(value) is int and value == 1
+
+
 def _require_digest(value: object, label: str) -> str:
     text = _require_string(value, label)
     if not HEX_64.fullmatch(text):
@@ -229,6 +233,10 @@ def _validate_provenance(provenance: dict[str, object]) -> None:
 
 def _validate_metrics(manifest: dict[str, object], timeout: Decimal) -> None:
     status = _require_string(manifest["status"], "status")
+    elapsed = _canonical_decimal(manifest["elapsed_seconds"], "elapsed_seconds")
+    if elapsed > timeout:
+        raise EvidenceError("elapsed_seconds exceeds timeout_seconds")
+    _canonical_integer(manifest["peak_memory_kib"], "peak_memory_kib")
     if status in CANDIDATE_STATES:
         if any(manifest[field] == "none" for field in QUALITY_FIELDS):
             raise EvidenceError("candidate-bearing status lacks candidate evidence")
@@ -239,23 +247,13 @@ def _validate_metrics(manifest: dict[str, object], timeout: Decimal) -> None:
             manifest["visible_cv_bit_accuracy"], "visible_cv_bit_accuracy", maximum=Decimal(1)
         )
         _canonical_integer(manifest["gates"], "gates")
-        elapsed = _canonical_decimal(manifest["elapsed_seconds"], "elapsed_seconds")
-        if elapsed > timeout:
-            raise EvidenceError("elapsed_seconds exceeds timeout_seconds")
-        _canonical_integer(manifest["peak_memory_kib"], "peak_memory_kib")
         return
     for field in QUALITY_FIELDS:
         if manifest[field] != "none":
             raise EvidenceError("noncandidate terminal manifest must not claim candidate evidence")
-    elapsed = manifest["elapsed_seconds"]
     if status == "TIMEOUT":
-        if elapsed == "none" or _canonical_decimal(elapsed, "elapsed_seconds") != timeout:
+        if elapsed != timeout:
             raise EvidenceError("TIMEOUT must record the declared timeout")
-    elif elapsed != "none":
-        if _canonical_decimal(elapsed, "elapsed_seconds") > timeout:
-            raise EvidenceError("elapsed_seconds exceeds timeout_seconds")
-    if manifest["peak_memory_kib"] != "none":
-        _canonical_integer(manifest["peak_memory_kib"], "peak_memory_kib")
 
 
 def _validate_runner_metadata(manifest: dict[str, object], timeout: Decimal) -> None:
@@ -284,7 +282,7 @@ def load_terminal_manifest(path: Path, evidence_root: Path | None = None) -> Ter
     manifest, manifest_raw = load_canonical_object(path, "manifest.json")
     if set(manifest) != MANIFEST_FIELDS:
         raise EvidenceError("manifest has missing or extra fields")
-    if manifest["schema_version"] != 1 or manifest["producer"] != "runner":
+    if not _schema_version_one(manifest["schema_version"]) or manifest["producer"] != "runner":
         raise EvidenceError("manifest must be runner schema version 1")
     for field in PARAM_FIELDS | PROVENANCE_FIELDS | {"started_utc", "ended_utc", "elapsed_seconds", "cleanup_seconds", "peak_memory_kib"}:
         _require_string(manifest[field], field)
@@ -296,7 +294,7 @@ def load_terminal_manifest(path: Path, evidence_root: Path | None = None) -> Ter
     root = _run_root_for_manifest(path, comparison_id, evidence_root)
     run_spec_path = root / "run_spec.json"
     spec, spec_raw = load_canonical_object(run_spec_path, "run_spec.json")
-    if set(spec) != {"schema_version", "cells", "provenance"} or spec["schema_version"] != 1:
+    if set(spec) != {"schema_version", "cells", "provenance"} or not _schema_version_one(spec["schema_version"]):
         raise EvidenceError("run_spec.json has an invalid native schema")
     if _require_digest(manifest["run_spec_sha256"], "run_spec_sha256") != sha256_bytes(spec_raw):
         raise EvidenceError("run_spec digest binding mismatch")
@@ -352,7 +350,9 @@ def load_candidate_manifest(path: Path, evidence_root: Path | None = None) -> Ca
     terminal = load_terminal_manifest(path, evidence_root)
     if terminal.status not in CANDIDATE_STATES:
         raise EvidenceError("terminal manifest is not candidate-bearing")
-    manifest, _ = load_canonical_object(path, "manifest.json")
+    manifest, manifest_raw = load_canonical_object(path, "manifest.json")
+    if sha256_bytes(manifest_raw) != terminal.manifest_sha256:
+        raise EvidenceError("manifest changed after terminal validation")
     if manifest["train_exact"] != "1.0":
         raise EvidenceError("candidate train_exact must equal 1.0")
     gates_text = _require_string(manifest["gates"], "gates")
@@ -363,7 +363,7 @@ def load_candidate_manifest(path: Path, evidence_root: Path | None = None) -> Ca
         raise EvidenceError("candidate artifact path is not native")
     artifact_path = resolve_evidence_path(terminal.run_root, artifact_value, "artifact")
     artifact, artifact_raw = load_canonical_object(artifact_path, "artifact.json")
-    if set(artifact) != ARTIFACT_FIELDS or artifact.get("schema_version") != 1:
+    if set(artifact) != ARTIFACT_FIELDS or not _schema_version_one(artifact.get("schema_version")):
         raise EvidenceError("artifact has missing or extra fields")
     if artifact.get("equivalence") != "pass":
         raise EvidenceError("artifact equivalence must equal pass")

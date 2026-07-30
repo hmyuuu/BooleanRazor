@@ -197,6 +197,42 @@ class CandidateRun:
         )
         self.write_json(self.manifest, manifest)
 
+    def replace_with_terminal_status(self, status: str) -> None:
+        manifest = self.read_json(self.manifest)
+        mappings = {
+            "SUCCESS": ("pass", "0", "false"),
+            "VERIFIER_FAILED": ("fail", "66", "false"),
+            "VERIFIER_NOT_RUN": ("not_run", "67", "false"),
+            "INVALID_METRICS": ("not_run", "65", "false"),
+            "NONZERO_EXIT": ("not_run", "17", "false"),
+            "TIMEOUT": ("not_run", "124", "true"),
+        }
+        verifier, exit_code, timed_out = mappings[status]
+        manifest.update(
+            {
+                "status": status,
+                "verifier": verifier,
+                "exit_code": exit_code,
+                "timed_out": timed_out,
+            }
+        )
+        if status not in {"SUCCESS", "VERIFIER_FAILED", "VERIFIER_NOT_RUN"}:
+            manifest.update(
+                {
+                    "train_exact": "none",
+                    "visible_cv_exact": "none",
+                    "visible_cv_bit_accuracy": "none",
+                    "gates": "none",
+                    "completed_table_sha256": "none",
+                    "circuit_sha256": "none",
+                    "artifact_sha256": "none",
+                    "artifact_path": "none",
+                }
+            )
+        if status == "TIMEOUT":
+            manifest["elapsed_seconds"] = manifest["timeout_seconds"] + ".0"
+        self.write_json(self.manifest, manifest)
+
 
 @pytest.fixture
 def candidate_run(tmp_path: Path) -> CandidateRun:
@@ -320,6 +356,29 @@ def test_candidate_loader_binds_manifest_run_spec_and_artifacts(
     assert loaded.completed_table_sha256 == sha256(candidate_run.dataset)
 
 
+def test_candidate_loader_rejects_transient_manifest_replacement(
+    candidate_run: CandidateRun, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    candidate_evidence = load_module("candidate_evidence", "candidate_evidence.py")
+    original_load = candidate_evidence.load_canonical_object
+    manifest_reads = 0
+
+    def replace_before_second_manifest_read(path: Path, *args: object, **kwargs: object):
+        nonlocal manifest_reads
+        if path == candidate_run.manifest:
+            manifest_reads += 1
+            if manifest_reads == 2:
+                replacement = candidate_run.read_json(candidate_run.manifest)
+                replacement["gates"] = "2"
+                replacement["visible_cv_exact"] = "0.9"
+                candidate_run.write_json(candidate_run.manifest, replacement)
+        return original_load(path, *args, **kwargs)
+
+    monkeypatch.setattr(candidate_evidence, "load_canonical_object", replace_before_second_manifest_read)
+    with pytest.raises(evidence_io.EvidenceError, match="manifest changed"):
+        candidate_evidence.load_candidate_manifest(candidate_run.manifest)
+
+
 @pytest.mark.parametrize(
     "mutation",
     (
@@ -373,6 +432,61 @@ def test_terminal_loader_rejects_candidate_without_all_quality_evidence(
     candidate_run.write_json(candidate_run.manifest, manifest)
     with pytest.raises(evidence_io.EvidenceError, match="candidate-bearing"):
         candidate_evidence.load_terminal_manifest(candidate_run.manifest)
+
+
+@pytest.mark.parametrize(
+    "status",
+    (
+        "SUCCESS",
+        "VERIFIER_FAILED",
+        "VERIFIER_NOT_RUN",
+        "INVALID_METRICS",
+        "NONZERO_EXIT",
+        "TIMEOUT",
+    ),
+)
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("elapsed_seconds", "none"),
+        ("elapsed_seconds", "300.1"),
+        ("elapsed_seconds", "01.0"),
+        ("peak_memory_kib", "none"),
+        ("peak_memory_kib", "-1"),
+        ("peak_memory_kib", "01"),
+    ),
+)
+def test_terminal_loader_requires_measured_canonical_resources_for_every_runner_terminal(
+    candidate_run: CandidateRun, status: str, field: str, value: str
+) -> None:
+    candidate_evidence = load_module("candidate_evidence", "candidate_evidence.py")
+    candidate_run.replace_with_terminal_status(status)
+    manifest = candidate_run.read_json(candidate_run.manifest)
+    manifest[field] = value
+    candidate_run.write_json(candidate_run.manifest, manifest)
+    with pytest.raises(evidence_io.EvidenceError):
+        candidate_evidence.load_terminal_manifest(candidate_run.manifest)
+
+
+@pytest.mark.parametrize("document", ("manifest", "run_spec", "artifact"))
+def test_candidate_loader_rejects_boolean_schema_version(
+    candidate_run: CandidateRun, document: str
+) -> None:
+    candidate_evidence = load_module("candidate_evidence", "candidate_evidence.py")
+    path = getattr(candidate_run, document)
+    payload = candidate_run.read_json(path)
+    payload["schema_version"] = True
+    candidate_run.write_json(path, payload)
+    if document == "run_spec":
+        manifest = candidate_run.read_json(candidate_run.manifest)
+        manifest["run_spec_sha256"] = sha256(candidate_run.run_spec.read_bytes())
+        candidate_run.write_json(candidate_run.manifest, manifest)
+    elif document == "artifact":
+        manifest = candidate_run.read_json(candidate_run.manifest)
+        manifest["artifact_sha256"] = sha256(candidate_run.artifact.read_bytes())
+        candidate_run.write_json(candidate_run.manifest, manifest)
+    with pytest.raises(evidence_io.EvidenceError):
+        candidate_evidence.load_candidate_manifest(candidate_run.manifest)
 
 
 @pytest.mark.parametrize(
