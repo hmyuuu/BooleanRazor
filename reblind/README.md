@@ -121,7 +121,7 @@ Julia version:
 
 ```bash
 repo_root=$(git rev-parse --show-toplevel)
-python "$repo_root/scripts/record-verification.py" \
+"$repo_root/.venv/bin/python" "$repo_root/scripts/record-verification.py" \
   --manifest "$MANIFEST" \
   --julia-bin "$JULIA_BIN" \
   --verify-jl "$VERIFY_JL" \
@@ -136,7 +136,7 @@ overwrite, or upgrade runner evidence.
 Promotion is then computed from a canonical evidence request:
 
 ```bash
-python "$repo_root/scripts/check-promotion.py" \
+"$repo_root/.venv/bin/python" "$repo_root/scripts/check-promotion.py" \
   --request "$PROMOTION_REQUEST" \
   --output "$PROMOTION_DECISION"
 ```

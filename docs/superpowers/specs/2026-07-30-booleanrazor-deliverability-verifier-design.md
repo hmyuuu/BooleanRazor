@@ -414,7 +414,7 @@ current-HEAD rerun.
 Add `scripts/record-verification.py`:
 
 ```text
-python scripts/record-verification.py \
+.venv/bin/python scripts/record-verification.py \
   --manifest RUN/cells/CELL/manifest.json \
   --julia-bin /absolute/path/to/julia \
   --verify-jl /absolute/path/to/verify.jl \
@@ -510,7 +510,7 @@ candidate evidence or success.
 Add `scripts/check-promotion.py` with:
 
 ```text
-python scripts/check-promotion.py \
+.venv/bin/python scripts/check-promotion.py \
   --request promotion-request.json \
   --output promotion-decision.json
 ```

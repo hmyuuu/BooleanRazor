@@ -138,7 +138,7 @@ runs in its cell directory:
 ```bash
 repo_root=$(git rev-parse --show-toplevel)
 run_root="$repo_root/results/$RUN_ID"
-python "$repo_root/scripts/run-experiment.py" \
+"$repo_root/.venv/bin/python" "$repo_root/scripts/run-experiment.py" \
   --run-root "$run_root" --cell-id "$CELL_ID" \
   --metrics-json "$run_root/cells/$CELL_ID/metrics.json" -- \
   "$repo_root/target/release/occam-circuit-hmyuuu" \
@@ -158,7 +158,7 @@ Fail-closed Julia wrapper:
 Immutable official-verification record:
 
 ```bash
-python "$REPO_ROOT/scripts/record-verification.py" \
+"$REPO_ROOT/.venv/bin/python" "$REPO_ROOT/scripts/record-verification.py" \
   --manifest "$MANIFEST" --julia-bin "$JULIA_BIN" \
   --verify-jl "$VERIFY_JL" --dataset "$DATASET" \
   --output "$OFFICIAL_RECORD"
@@ -167,7 +167,7 @@ python "$REPO_ROOT/scripts/record-verification.py" \
 Evidence-bounded promotion decision:
 
 ```bash
-python "$REPO_ROOT/scripts/check-promotion.py" \
+"$REPO_ROOT/.venv/bin/python" "$REPO_ROOT/scripts/check-promotion.py" \
   --request "$PROMOTION_REQUEST" --output "$PROMOTION_DECISION"
 ```
 

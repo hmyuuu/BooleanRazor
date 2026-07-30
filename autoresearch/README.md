@@ -41,7 +41,7 @@ public_root=${OCCAM_REBLIND_PUBLIC_ROOT:?supply an absolute reviewed public root
 cell_dir="$run_root/cells/$cell_id"
 
 cargo build --locked --release --manifest-path "$repo_root/Cargo.toml"
-python "$repo_root/scripts/run-experiment.py" \
+"$repo_root/.venv/bin/python" "$repo_root/scripts/run-experiment.py" \
   --run-root "$run_root" \
   --cell-id "$cell_id" \
   --metrics-json "$cell_dir/metrics.json" -- \
