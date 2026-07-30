@@ -309,7 +309,7 @@ class CheckerReviewTests(unittest.TestCase):
             "verifier": verifier,
             **operational,
         }
-        if status == "SUCCESS":
+        if status in gate.CANDIDATE_EVIDENCE_STATES:
             payload.update(
                 {
                     "train_exact": "1.0",
@@ -895,6 +895,7 @@ class CheckerReviewTests(unittest.TestCase):
         cases = [
             ("SUCCESS", "not_run", "SUCCESS requires verifier=pass"),
             ("VERIFIER_FAILED", "not_run", "VERIFIER_FAILED requires verifier=fail"),
+            ("VERIFIER_NOT_RUN", "pass", "VERIFIER_NOT_RUN requires verifier=not_run"),
             ("TIMEOUT", "fail", "TIMEOUT requires verifier=not_run"),
         ]
         for status, verifier, expected in cases:
@@ -917,6 +918,25 @@ class CheckerReviewTests(unittest.TestCase):
                 errors: list[str] = []
                 gate.check_baseline_rows([row], [matrix_row()], errors)
                 self.assertTrue(any(expected in error for error in errors), errors)
+
+    def test_candidate_bearing_terminal_states_require_native_artifacts(self) -> None:
+        for status in ("SUCCESS", "VERIFIER_FAILED", "VERIFIER_NOT_RUN"):
+            with self.subTest(status=status):
+                params = params_row()
+                expected, run = self.write_expected_json(
+                    cells=[{"cell_id": "cell-a", "params": params}]
+                )
+                path = self.write_manifest(run, params, status=status)
+                self.assertEqual(self.manifest_errors(run, expected), [])
+
+                payload = json.loads(path.read_bytes())
+                payload["artifact_sha256"] = "none"
+                path.write_bytes(json_bytes(payload))
+                errors = self.manifest_errors(run, expected)
+                self.assertTrue(
+                    any("artifact" in error for error in errors),
+                    errors,
+                )
 
     def test_success_metrics_are_finite_ranged_and_canonical(self) -> None:
         row = baseline_row()

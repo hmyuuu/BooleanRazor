@@ -304,10 +304,11 @@ fn frozen_baseline(arguments: &[std::ffi::OsString]) -> Result<(), String> {
     let gates = verify_emitted_circuit(&circuit_bytes, &completed)?;
     let completed_sha256 = sha256_hex(&completed_bytes);
     let circuit_sha256 = sha256_hex(&circuit_bytes);
-    let metrics = format!(
-        "{{\"completed_table_sha256\":\"{completed_sha256}\",\"gates\":{gates},\"train_exact\":1.0,\"verifier\":\"pass\",\"visible_cv_bit_accuracy\":{},\"visible_cv_exact\":{}}}\n",
-        decimal(visible_bit_accuracy),
-        decimal(visible_exact),
+    let metrics = baseline_metrics_json(
+        &completed_sha256,
+        gates,
+        visible_bit_accuracy,
+        visible_exact,
     );
     let artifact = format!(
         "{{\"circuit_path\":\"circuit.txt\",\"circuit_sha256\":\"{circuit_sha256}\",\"completed_table_path\":\"completed-table.csv\",\"completed_table_sha256\":\"{completed_sha256}\",\"equivalence\":\"pass\",\"schema_version\":1}}\n"
@@ -319,11 +320,8 @@ fn frozen_baseline(arguments: &[std::ffi::OsString]) -> Result<(), String> {
             .map_err(|error| format!("write circuit.txt: {error}"))?;
         fs::write(stage.join("artifact.json"), artifact.as_bytes())
             .map_err(|error| format!("write artifact.json: {error}"))?;
-        fs::write(
-            stage.join(metrics_path.file_name().unwrap()),
-            metrics.as_bytes(),
-        )
-        .map_err(|error| format!("write metrics.json: {error}"))
+        fs::write(stage.join(metrics_path.file_name().unwrap()), &metrics)
+            .map_err(|error| format!("write metrics.json: {error}"))
     })
 }
 
@@ -469,6 +467,22 @@ fn decimal(value: f64) -> String {
     } else {
         value.to_string()
     }
+}
+
+fn baseline_metrics_json(
+    completed_sha256: &str,
+    gates: usize,
+    visible_bit_accuracy: f64,
+    visible_exact: f64,
+) -> Vec<u8> {
+    format!(
+        "{{\"completed_table_sha256\":\"{completed_sha256}\",\
+\"gates\":{gates},\"train_exact\":1.0,\"verifier\":\"not_run\",\
+\"visible_cv_bit_accuracy\":{},\"visible_cv_exact\":{}}}\n",
+        decimal(visible_bit_accuracy),
+        decimal(visible_exact),
+    )
+    .into_bytes()
 }
 
 fn decimal_ratio(numerator: usize, denominator: usize, label: &str) -> Result<String, String> {
@@ -1189,6 +1203,23 @@ mod tests {
         let emitted = b"INPUTS 1\nw1 = XOR x1 x1\nOUTPUTS w1\n";
 
         assert_eq!(verify_emitted_circuit(emitted, &table).unwrap(), 1);
+    }
+
+    #[test]
+    fn frozen_baseline_metrics_do_not_claim_external_verification() {
+        let digest = "a".repeat(64);
+        let bytes = baseline_metrics_json(&digest, 37, 0.875, 0.75);
+        let metrics = std::str::from_utf8(&bytes).unwrap();
+
+        assert_eq!(
+            metrics,
+            format!(
+                "{{\"completed_table_sha256\":\"{digest}\",\"gates\":37,\
+\"train_exact\":1.0,\"verifier\":\"not_run\",\
+\"visible_cv_bit_accuracy\":0.875,\"visible_cv_exact\":0.75}}\n"
+            )
+        );
+        assert!(!metrics.contains("\"verifier\":\"pass\""));
     }
 
     #[test]

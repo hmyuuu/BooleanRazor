@@ -199,8 +199,17 @@ and artifact index. Runner logs use
 eight-byte unsigned big-endian length followed by the raw bytes. Runner scheduler fields
 are all `none`; scheduler-materialized evidence instead has empty argv,
 unavailable timestamps, and populated raw-accounting fields. Successful cells
-require `verifier=pass`; failed cells retain terminal evidence and use `none`
-for all unavailable candidate quality and artifact fields.
+require `verifier=pass`; non-candidate terminal failures use `none` for all
+unavailable candidate quality and artifact fields.
+
+`artifact.json` field `equivalence="pass"` records exhaustive equivalence
+inside the Rust XAG backend. The metrics and manifest field `verifier` records
+only the official external verifier. `VERIFIER_NOT_RUN` and
+`VERIFIER_FAILED` retain a fully validated, digest-bound candidate so a
+separate immutable verification record can be created or diagnosed, but
+neither status is runner success. Timeout, OOM, nonzero exit, invalid metrics,
+cancellation, and scheduler-only materialization carry no candidate-quality
+or artifact claim.
 
 For a Slurm task killed before runner evidence is written,
 `materialize-slurm-failures.py` consumes separately captured raw parsable
