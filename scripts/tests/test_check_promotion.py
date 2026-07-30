@@ -394,6 +394,49 @@ def test_disclosed_controls_reject_incomplete_or_wrong_public_commitment(tmp_pat
     assert reason in read_json(output)["reasons"]
 
 
+@pytest.mark.parametrize("mutation", ("bad_frozen_candidate", "design_projection", "sealed_schema", "sealed_content", "policy_extra", "policy_symlink", "duplicate_id", "role_swap"))
+def test_final_adversarial_schema_projection_role_and_policy_cases_never_promote(promotion_fixture: PromotionFixture, mutation: str) -> None:
+    track = "sealed_confirmation" if mutation.startswith("sealed") else "synthetic"
+    request = promotion_fixture.write_valid_request(track)
+    policy: Path | None | bool = True
+    if mutation == "bad_frozen_candidate":
+        frozen = promotion_fixture.root / "frozen-comparison.json"
+        value = read_json(frozen); value["frozen_candidate_id"] = "not-a-candidate"; write_json(frozen, value)
+    elif mutation == "design_projection":
+        design = promotion_fixture.root / "visible-design.json"
+        value = read_json(design); value["cells"][0]["dataset_id"] = "wrong"; write_json(design, value)
+        frozen = promotion_fixture.root / "frozen-comparison.json"
+        value = read_json(frozen); value["design_sha256"] = sha256(design.read_bytes()); write_json(frozen, value)
+    elif mutation == "sealed_schema":
+        sealed = promotion_fixture.root / "sealed.json"
+        value = read_json(sealed); value["schema_version"] = True; write_json(sealed, value)
+    elif mutation == "sealed_content":
+        sealed = promotion_fixture.root / "sealed.json"
+        value = read_json(sealed); value["matched_100x_against"] = ["hamming-1nn"]; write_json(sealed, value)
+    elif mutation == "policy_extra":
+        policy = promotion_fixture.write_trust_policy()
+        value = read_json(policy); value["extra"] = "x"; write_json(policy, value)
+    elif mutation == "policy_symlink":
+        policy = promotion_fixture.write_trust_policy()
+        link = promotion_fixture.root / "policy-link.json"; link.symlink_to(policy); policy = link
+    elif mutation == "duplicate_id":
+        other = promotion_fixture.root / "other"
+        shutil.copytree(promotion_fixture.root, other, ignore=shutil.ignore_patterns("other", "request.json", "decision.json", "trust-policy.json"))
+        value = read_json(request); value["candidate_evidence"][-1] = "other/cells/candidate-r0/manifest.json"; write_json(request, value)
+    else:
+        spec = promotion_fixture.root / "run_spec.json"
+        value = read_json(spec)
+        for cell in value["cells"]:
+            if cell["cell_id"] in {"baseline-1nn-r0", "baseline-1nn-r1"}:
+                cell["params"]["role"] = "candidate"
+        write_json(spec, value)
+        for identifier in ("baseline-1nn-r0", "baseline-1nn-r1"):
+            path = promotion_fixture.manifest(identifier); row = read_json(path); row["role"] = "candidate"; row["run_spec_sha256"] = sha256(spec.read_bytes()); write_json(path, row)
+    result, output = promotion_fixture.run_checker(request, policy=policy)
+    assert result.returncode in {0, 2}
+    assert not output.exists() or read_json(output)["decision"] in {"blocked", "reject", "no_change"}
+
+
 @pytest.mark.parametrize("mutation, expected", [
     ("missing_verification", "official_verifications_absent"),
     ("foreign_record", "foreign_verification_record"),

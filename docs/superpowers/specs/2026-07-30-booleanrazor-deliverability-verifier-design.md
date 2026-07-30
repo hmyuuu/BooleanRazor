@@ -435,6 +435,15 @@ Inapplicable values are the literal `none`, not missing or blank. Paths are
 resolved relative to the request file, cannot escape its evidence root, and
 cannot be symlinks.
 
+Positive tracks also require a separate canonical `--trust-policy` input. It
+binds the raw frozen-comparison digest, the exact unique
+`{comparison_id,sha256}` set of official-record bytes, and, for sealed
+promotion, the raw sealed-result digest; its own digest is recorded as
+`input_sha256.external_trust_policy`. This policy is an external
+operator/custodian selection and precommit. The checker verifies bindings only:
+authentication, authority, selection, chronology, and cryptographic
+authentication remain external duties and are not checker claims.
+
 ### 11.2 Common gates
 
 Every positive decision requires:
