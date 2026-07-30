@@ -229,6 +229,71 @@ class PromotionFixture:
         write_json(self.root / "sealed.json", sealed)
 
 
+class DisclosedControlFixture:
+    def __init__(self, parent: Path) -> None:
+        self.root = parent / "controls"
+        self.root.mkdir()
+        seed = PromotionFixture(self.root)
+        old = list(seed.ids)
+        self.ids = tuple(f"mystery-{letter}-r{repeat}" for letter in "ABCD" for repeat in range(2))
+        for source, target in zip(old, self.ids[:6]):
+            (self.root / "cells" / source).rename(self.root / "cells" / target)
+        shutil.copytree(self.root / "cells" / "mystery-A-r0", self.root / "cells" / "mystery-D-r0")
+        shutil.copytree(self.root / "cells" / "mystery-A-r1", self.root / "cells" / "mystery-D-r1")
+        provenance = read_json(self.root / "run_spec.json")["provenance"]
+        cells = []
+        for identifier in self.ids:
+            letter = identifier.split("-")[1]
+            candidate = letter == "D"
+            params = {"algorithm_seed": "a" * 64, "blind": "true", "comparison_id": identifier, "dataset_id": f"mystery-{letter}", "evaluation_scope": "visible_cv_only", "hardware": "local", "method": "control-candidate" if candidate else "control-baseline", "method_version": "1", "observation_fraction": "0.5", "repeat": "0", "role": "candidate" if candidate else "baseline", "tier": "fixture", "timeout_seconds": "300"}
+            cells.append({"cell_id": identifier, "params": params})
+        spec = {"cells": cells, "provenance": provenance, "schema_version": 1}
+        write_json(self.root / "run_spec.json", spec)
+        spec_digest = sha256((self.root / "run_spec.json").read_bytes())
+        params_by_id = {cell["cell_id"]: cell["params"] for cell in cells}
+        commitments = {"A": "51e3f026def41778ecd0d7dcaee9f970b9937488e6716891932b73824c16d4c7", "B": "e2c9d0e23ee36bfc0f12d7f39fdfe2ca5a8abe8eb194fec56500733694b75c28", "C": "c7b37413844bf0b10ebad0010046469f500354a22cc2ba95cbe42709f8e8337d", "D": "b445a717483303fa3c5d8a1f7abe81888b267b7c472121c9c464fa9766808580"}
+        for identifier in self.ids:
+            cell = self.root / "cells" / identifier
+            (cell / "official-verification.json").unlink(missing_ok=True)
+            manifest_path = cell / "manifest.json"
+            manifest = read_json(manifest_path)
+            manifest.update(params_by_id[identifier])
+            manifest["artifact_path"] = f"cells/{identifier}/artifact.json"
+            manifest["run_spec_sha256"] = spec_digest
+            write_json(manifest_path, manifest)
+            if identifier.endswith("r0"):
+                letter = identifier.split("-")[1]
+                record = {"bit_accuracy": "1.0", "circuit_sha256": manifest["circuit_sha256"], "comparison_id": identifier, "dataset_sha256": commitments[letter], "exact_accuracy": "1.0", "gates": int(manifest["gates"]), "julia_version": {"sha256": "d" * 64, "text": "julia version 1.12.4"}, "manifest_sha256": sha256(manifest_path.read_bytes()), "run_spec_sha256": spec_digest, "samples": 2, "schema_version": 1, "status": "pass", "verify_jl_sha256": "e" * 64}
+                write_json(cell / "official-verification.json", record)
+        design = {"cells": [{"comparison_id": identifier, "dataset_id": f"mystery-{identifier.split('-')[1]}"} for identifier in self.ids], "dataset_boundary": "synthetic-fixture", "schema_version": 1}
+        write_json(self.root / "visible-design.json", design)
+        frozen = {"baseline_ids": ["mystery-A-r0", "mystery-B-r0", "mystery-C-r0"], "candidate_ids": ["mystery-D-r0"], "design_path": "visible-design.json", "design_sha256": sha256((self.root / "visible-design.json").read_bytes()), "expected_ids": list(self.ids), "frozen_candidate_id": "mystery-D-r0", "rule": "accuracy_first_then_gates", "schema_version": 1}
+        write_json(self.root / "frozen-comparison.json", frozen)
+        self.request = self.root / "request.json"
+        request = {"candidate_evidence": [f"cells/{identifier}/manifest.json" for identifier in self.ids], "deterministic_pairs": [{"left": f"cells/mystery-{letter}-r0/manifest.json", "right": f"cells/mystery-{letter}-r1/manifest.json"} for letter in "ABCD"], "frozen_comparison": "frozen-comparison.json", "official_verifications": [f"cells/mystery-{letter}-r0/official-verification.json" for letter in "ABCD"], "schema_version": 1, "sealed_results": "none", "track": "disclosed_control"}
+        write_json(self.request, request)
+        self.policy = self.root / "policy.json"
+        policy = {"frozen_comparison_sha256": sha256((self.root / "frozen-comparison.json").read_bytes()), "official_verifications": [{"comparison_id": f"mystery-{letter}-r0", "sha256": sha256((self.root / f"cells/mystery-{letter}-r0/official-verification.json").read_bytes())} for letter in "ABCD"], "schema_version": 1, "sealed_results_sha256": "none"}
+        write_json(self.policy, policy)
+
+    def run(self) -> tuple[subprocess.CompletedProcess[str], Path]:
+        output = self.root / "decision.json"
+        return subprocess.run([sys.executable, str(CHECKER), "--request", str(self.request), "--output", str(output), "--trust-policy", str(self.policy)], text=True, capture_output=True, cwd=ROOT), output
+
+    def mutate(self, kind: str) -> None:
+        record = self.root / "cells/mystery-A-r0/official-verification.json"
+        value = read_json(record)
+        if kind == "missing_instance":
+            value["comparison_id"] = "missing-r0"
+        else:
+            value["dataset_sha256"] = "0" * 64
+        write_json(record, value)
+
+
+def disclosed_control_fixture(tmp_path: Path) -> DisclosedControlFixture:
+    return DisclosedControlFixture(tmp_path)
+
+
 @pytest.fixture
 def promotion_fixture(tmp_path: Path) -> PromotionFixture:
     return PromotionFixture(tmp_path)
@@ -297,6 +362,36 @@ def test_policy_must_bind_exact_official_record_bytes(promotion_fixture: Promoti
     assert result.returncode == 0, result.stderr
     assert read_json(output)["decision"] == "reject"
     assert "external_trust_policy_mismatch" in read_json(output)["reasons"]
+
+
+@pytest.mark.parametrize("field, value", (("exact_accuracy", "0.9"), ("bit_accuracy", "0.9"), ("samples", True), ("julia_version", {"sha256": "D" * 64, "text": ""})))
+def test_official_pass_record_requires_exact_pass_metrics_and_valid_julia_value(promotion_fixture: PromotionFixture, field: str, value: object) -> None:
+    request = promotion_fixture.write_valid_request("synthetic")
+    path = promotion_fixture.root / "cells/candidate-r0/official-verification.json"
+    record = read_json(path)
+    record[field] = value
+    write_json(path, record)
+    result, output = promotion_fixture.run_checker(request)
+    assert result.returncode == 2
+    assert not output.exists()
+
+
+def test_disclosed_controls_promote_only_with_all_four_committed_instances(tmp_path: Path) -> None:
+    fixture = disclosed_control_fixture(tmp_path)
+    result, output = fixture.run()
+    assert result.returncode == 0, result.stderr
+    assert read_json(output)["decision"] == "promote_control"
+    assert read_json(output)["highest_legal_next_step"] == "promote_control"
+
+
+@pytest.mark.parametrize("mutation, reason", (("missing_instance", "control_instance_set_mismatch"), ("wrong_commitment", "prediction_commitment_mismatch")))
+def test_disclosed_controls_reject_incomplete_or_wrong_public_commitment(tmp_path: Path, mutation: str, reason: str) -> None:
+    fixture = disclosed_control_fixture(tmp_path)
+    fixture.mutate(mutation)
+    result, output = fixture.run()
+    assert result.returncode == 0, result.stderr
+    assert read_json(output)["decision"] == "reject"
+    assert reason in read_json(output)["reasons"]
 
 
 @pytest.mark.parametrize("mutation, expected", [

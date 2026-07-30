@@ -101,9 +101,11 @@ def _load_record(path: Path) -> tuple[dict[str, object], bytes]:
         raise EvidenceError("official verification is not a pass record")
     if not isinstance(record["comparison_id"], str) or type(record["gates"]) is not int or record["gates"] < 0:
         raise EvidenceError("official verification has invalid identity")
+    if record["exact_accuracy"] != "1.0" or record["bit_accuracy"] != "1.0" or type(record["samples"]) is not int or record["samples"] <= 0:
+        raise EvidenceError("official verification does not prove an exact pass")
     if not all(isinstance(record[field], str) and HEX_64.fullmatch(record[field]) for field in ("circuit_sha256", "dataset_sha256", "manifest_sha256", "run_spec_sha256", "verify_jl_sha256")):
         raise EvidenceError("official verification has invalid digest")
-    if not isinstance(record["julia_version"], dict) or set(record["julia_version"]) != {"sha256", "text"}:
+    if not isinstance(record["julia_version"], dict) or set(record["julia_version"]) != {"sha256", "text"} or not isinstance(record["julia_version"]["sha256"], str) or not HEX_64.fullmatch(record["julia_version"]["sha256"]) or not isinstance(record["julia_version"]["text"], str) or not record["julia_version"]["text"] or any(ord(char) < 32 or ord(char) > 126 for char in record["julia_version"]["text"]):
         raise EvidenceError("official verification has invalid Julia version")
     return record, raw
 
