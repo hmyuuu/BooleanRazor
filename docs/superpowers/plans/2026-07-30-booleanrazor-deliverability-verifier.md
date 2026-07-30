@@ -1742,9 +1742,22 @@ Expected: import or subprocess failure because
 
 ```python
 project, digest = report_model.load_project(source, repo_root)
-generator_digest = hashlib.sha256(
-    (repo_root / "scripts/report_model.py").read_bytes()
-).hexdigest()
+component_bytes = read_stable_regular_generator_components(
+    repo_root,
+    (
+        "scripts/evidence_io.py",
+        "scripts/candidate_evidence.py",
+        "scripts/check-promotion.py",
+        "scripts/report_model.py",
+    ),
+)
+generator_digest = independently_frame_and_hash(component_bytes)
+assert generator_digest == report_model.report_generator_digest(
+    component_bytes["scripts/report_model.py"],
+    component_bytes["scripts/evidence_io.py"],
+    component_bytes["scripts/candidate_evidence.py"],
+    component_bytes["scripts/check-promotion.py"],
+)
 expected = report_model.render_outputs(project, digest, generator_digest)
 ```
 
@@ -1766,13 +1779,15 @@ CSS escapes/imports/alternate loaders/remote tokens are rejected
 report.js equals the independently fixed safe script byte for byte
 the checker-owned canonical ten-path set equals OUTPUT_PATHS and rendered keys
 each HTML and generated Markdown file contains the project source digest
-each HTML and generated Markdown file contains the report-model digest
+each HTML and generated Markdown file contains the four-component report-generator digest
 each generated Markdown file begins <!-- GENERATED; DO NOT EDIT
 ```
 
 The checker accepts only the canonical
-`reports/data/project.json`, verifies that the imported generator is the exact
-`<repo-root>/scripts/report_model.py`, and reads all evidence and generated
+`reports/data/project.json`, securely pins all four executable generator
+components before import, verifies their canonical repository identities,
+independently recomputes their domain-separated, named, length-framed digest,
+and reads all evidence and generated
 content through descriptor-anchored stable-file primitives. The CLI accepts
 optional `--source` and `--repo-root` flags for their canonical values. It
 prints sorted errors to stderr and exits `1`, or prints
@@ -1830,7 +1845,7 @@ git commit -m "feat: validate canonical deliverable evidence"
   no filesystem-dependent ordering, timestamp, absolute path, or environment
   value.
 - CLI:
-  `python scripts/build-report.py --source reports/data/project.json
+  `.venv/bin/python scripts/build-report.py --source reports/data/project.json
   --repo-root .`.
 
 Each exact round record contains:
@@ -1979,7 +1994,7 @@ def html_page(
         f'  <main id="content">{body}</main>\n'
         "  <footer>"
         f"Evidence source SHA-256: <code>{source_digest}</code>; "
-        f"report model SHA-256: <code>{generator_digest}</code>"
+        f"report generator SHA-256: <code>{generator_digest}</code>"
         "</footer>\n"
         '  <script src="assets/report.js"></script>\n'
         "</body>\n"
@@ -2121,7 +2136,7 @@ for (const button of document.querySelectorAll("[data-status-filter]")) {
 Every Markdown file begins:
 
 ```markdown
-<!-- GENERATED; DO NOT EDIT. Source: reports/data/project.json SHA-256: {source_digest}; report model SHA-256: {generator_digest} -->
+<!-- GENERATED; DO NOT EDIT. Source: reports/data/project.json SHA-256: {source_digest}; report generator SHA-256: {generator_digest} -->
 ```
 
 Render:
@@ -2266,7 +2281,7 @@ cargo run --locked --all-features --release \
   --max-cut-inputs 6 --deadline-seconds 285 \
   --metrics-json "$OUTPUT_DIR/metrics.json"
 
-python "$REPO_ROOT/scripts/run-experiment.py" \
+"$REPO_ROOT/.venv/bin/python" "$REPO_ROOT/scripts/run-experiment.py" \
   --run-root "$RUN_ROOT" --cell-id "$CELL_ID" \
   --metrics-json "$RUN_ROOT/cells/$CELL_ID/metrics.json" -- \
   "$REPO_ROOT/target/release/occam-circuit-hmyuuu" \
@@ -2278,12 +2293,12 @@ python "$REPO_ROOT/scripts/run-experiment.py" \
   "$JULIA_BIN" "$VERIFY_JL" "$CIRCUIT" "$DATASET" \
   "$EXPECTED_GATES" "$INSTANCE"
 
-python "$REPO_ROOT/scripts/record-verification.py" \
+"$REPO_ROOT/.venv/bin/python" "$REPO_ROOT/scripts/record-verification.py" \
   --manifest "$MANIFEST" --julia-bin "$JULIA_BIN" \
   --verify-jl "$VERIFY_JL" --dataset "$DATASET" \
   --output "$OFFICIAL_RECORD"
 
-python "$REPO_ROOT/scripts/check-promotion.py" \
+"$REPO_ROOT/.venv/bin/python" "$REPO_ROOT/scripts/check-promotion.py" \
   --request "$PROMOTION_REQUEST" --output "$PROMOTION_DECISION"
 
 make report
@@ -2300,13 +2315,21 @@ use = structured-content/static-render information architecture reference
   only; no source, style, result, circuit, or claim copied
 ```
 
+The landing page renders every validated external reference in a final
+`Report design references` section with its exact adaptation-only use note.
+These links are citations, not runtime dependencies; the generated site still
+loads only its local CSS and JavaScript.
+
 - [ ] **Step 7: Implement the build CLI and report README**
 
 `scripts/build-report.py` must parse `--source` and `--repo-root`, call
-`load_project`, hash exact `scripts/report_model.py` bytes, pass both digests
-to `render_outputs`, reject a symlink or non-directory parent, and atomically
-replace each generated regular file only after all output bytes have been
-computed. It prints generated paths in sorted order.
+`load_project`, securely load and revalidate exact regular-file bytes for
+`scripts/evidence_io.py`, `scripts/candidate_evidence.py`,
+`scripts/check-promotion.py`, and `scripts/report_model.py`, bind them into the
+same domain-separated named/length-framed report-generator digest, pass both
+digests to `render_outputs`, reject a symlink or non-directory parent, and
+atomically replace each generated regular file only after all output bytes have
+been computed. It prints generated paths in sorted order.
 
 `reports/README.md` contains:
 
@@ -2320,7 +2343,7 @@ hand.
 ```bash
 make report
 make report-check
-python3 -m http.server 8765 --directory reports/site
+.venv/bin/python -m http.server 8765 --directory reports/site
 ```
 
 The report is offline-first: it uses no CDN, tracker, external font, runtime
@@ -2932,7 +2955,7 @@ report freshness passes
 Start a local static server:
 
 ```bash
-python3 -m http.server 8765 --directory reports/site
+.venv/bin/python -m http.server 8765 --directory reports/site
 ```
 
 Inspect all four pages at approximately `1440×900` and `390×844`. Confirm:

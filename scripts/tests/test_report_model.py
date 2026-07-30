@@ -93,7 +93,59 @@ def commit_evidence(
     }
 
 
-def valid_project() -> dict[str, object]:
+def research_round(
+    *,
+    round_id: str = "R01",
+    parent_round_ids: list[str] | None = None,
+    round_index: int = 1,
+    revision: str = "0123456789abcdef0123456789abcdef01234567",
+    status: str = "verified_main",
+    turning_point: bool = True,
+) -> dict[str, object]:
+    result_evidence = commit_evidence(revision) | {
+        "locator": "evidence/base.md"
+    }
+    evidence = (
+        [path_evidence(), result_evidence]
+        if status == "verified_main"
+        else [result_evidence]
+    )
+    return {
+        "base_revision": revision,
+        "branch": "main" if status == "verified_main" else "research/round",
+        "decision": "Retain the exact result and preserve its limitations.",
+        "evidence": evidence,
+        "frozen_controls": ["Accuracy before gate count."],
+        "hypothesis": "The exact learner can recover the frozen synthetic fixture.",
+        "independent_variable": "Learner configuration.",
+        "insight": "Exactness and gate count must be reported separately.",
+        "limitations": ["Synthetic fixture only; no public or sealed evaluation."],
+        "next_pivot": "Test the next frozen hypothesis without changing the benchmark.",
+        "outcome": "The recorded run completed under the frozen controls.",
+        "parent_round_ids": [] if parent_round_ids is None else parent_round_ids,
+        "permitted_data": ["Tracked synthetic fixtures only."],
+        "result_revision": revision,
+        "round_id": round_id,
+        "round_index": round_index,
+        "runs": [
+            {
+                "classification": "exact synthetic result",
+                "evidence": evidence,
+                "outcome": "Completed with exact internal equivalence.",
+                "run_id": f"{round_id.lower()}-run-01",
+                "status": "successful",
+            }
+        ],
+        "status": status,
+        "title": "Exact synthetic control",
+        "track": "synthetic",
+        "turning_point": turning_point,
+    }
+
+
+def valid_project(
+    revision: str = "0123456789abcdef0123456789abcdef01234567",
+) -> dict[str, object]:
     controls = []
     for suffix, instance, function, gates in (
         ("a", "mystery-A", "x+y", 37),
@@ -174,8 +226,10 @@ def valid_project() -> dict[str, object]:
             "conclusion": "Blind advantage has not been demonstrated.",
             "next_gate": "Run the frozen public study before sealed access.",
             "purpose": "Separate constructive controls from blind-learning evidence.",
+            "synthetic_frontier_round_id": "R01",
             "title": "BooleanRazor",
         },
+        "research_rounds": [research_round(revision=revision)],
         "schema_version": 1,
         "verification_layers": [
             {
@@ -210,7 +264,8 @@ def project_repo(tmp_path: Path) -> tuple[Path, dict[str, object], Path]:
         "-m",
         "fixture evidence",
     )
-    project = valid_project()
+    revision = git(root, "rev-parse", "HEAD").stdout.strip()
+    project = valid_project(revision)
     source = root / "project.json"
     source.write_bytes(canonical(project))
     return root, project, source
@@ -1365,6 +1420,275 @@ def test_forged_blocked_decision_cannot_match_recomputed_task4_result(
         report_model.load_project(source, root)
 
 
+@pytest.mark.parametrize(
+    ("mutation", "fragment"),
+    (
+        ("round-extra-key", "research_rounds\\[0\\] must use exact keys"),
+        ("run-extra-key", "research_rounds\\[0\\].runs\\[0\\] must use exact keys"),
+        ("duplicate-round-id", "duplicate round_id"),
+        ("duplicate-round-index", "duplicate round_index"),
+        ("noncontiguous-index", "contiguous positive"),
+        ("multiple-roots", "exactly one root"),
+        ("missing-parent", "missing parent"),
+        ("duplicate-parent", "parent_round_ids must be unique"),
+        ("self-parent", "must not name itself"),
+        ("future-parent", "must precede child"),
+        ("cycle", "lineage must not contain a cycle"),
+        ("turning-point-not-bool", "turning_point must be a JSON boolean"),
+        ("no-turning-point", "at least one turning point"),
+        ("invalid-track", "has invalid track"),
+        ("invalid-status", "has invalid status"),
+        ("invalid-run-status", "runs\\[0\\] has invalid status"),
+        ("empty-round-text", "hypothesis must be a nonempty string"),
+        ("empty-round-list", "permitted_data must be a nonempty list"),
+        ("empty-runs", "runs must be a nonempty list"),
+        ("empty-run-text", "classification must be a nonempty string"),
+        ("empty-run-evidence", "must be a nonempty evidence list"),
+    ),
+)
+def test_research_round_schema_and_lineage_are_closed(
+    project_repo: tuple[Path, dict[str, object], Path],
+    mutation: str,
+    fragment: str,
+) -> None:
+    root, project, source = project_repo
+    revision = git(root, "rev-parse", "HEAD").stdout.strip()
+    first = project["research_rounds"][0]
+    assert isinstance(first, dict)
+    second = research_round(
+        round_id="R02",
+        parent_round_ids=["R01"],
+        round_index=2,
+        revision=revision,
+        turning_point=False,
+    )
+    project["research_rounds"].append(second)
+
+    if mutation == "round-extra-key":
+        first["conceptual_method_graph"] = "not a trace record"
+    elif mutation == "run-extra-key":
+        first["runs"][0]["metric"] = "unbound"
+    elif mutation == "duplicate-round-id":
+        second["round_id"] = "R01"
+    elif mutation == "duplicate-round-index":
+        second["round_index"] = 1
+    elif mutation == "noncontiguous-index":
+        second["round_index"] = 3
+    elif mutation == "multiple-roots":
+        second["parent_round_ids"] = []
+    elif mutation == "missing-parent":
+        second["parent_round_ids"] = ["R99"]
+    elif mutation == "duplicate-parent":
+        second["parent_round_ids"] = ["R01", "R01"]
+    elif mutation == "self-parent":
+        second["parent_round_ids"] = ["R02"]
+    elif mutation == "future-parent":
+        third = research_round(
+            round_id="R03",
+            parent_round_ids=["R01"],
+            round_index=3,
+            revision=revision,
+            turning_point=False,
+        )
+        project["research_rounds"].append(third)
+        second["parent_round_ids"] = ["R03"]
+    elif mutation == "cycle":
+        first["parent_round_ids"] = ["R02"]
+        second["parent_round_ids"] = ["R01"]
+    elif mutation == "turning-point-not-bool":
+        first["turning_point"] = 1
+    elif mutation == "no-turning-point":
+        first["turning_point"] = False
+    elif mutation == "invalid-track":
+        first["track"] = "conceptual"
+    elif mutation == "invalid-status":
+        first["status"] = "promising"
+    elif mutation == "invalid-run-status":
+        first["runs"][0]["status"] = "mostly_successful"
+    elif mutation == "empty-round-text":
+        first["hypothesis"] = ""
+    elif mutation == "empty-round-list":
+        first["permitted_data"] = []
+    elif mutation == "empty-runs":
+        first["runs"] = []
+    elif mutation == "empty-run-text":
+        first["runs"][0]["classification"] = ""
+    elif mutation == "empty-run-evidence":
+        first["runs"][0]["evidence"] = []
+    else:
+        raise AssertionError(mutation)
+
+    write_source(source, project)
+    with pytest.raises(report_model.ModelError, match=fragment):
+        report_model.load_project(source, root)
+
+
+def test_verified_main_sealed_round_requires_a_sanitized_authenticated_attestation(
+    project_repo: tuple[Path, dict[str, object], Path],
+) -> None:
+    root, project, source = project_repo
+    project["research_rounds"][0]["track"] = "sealed_confirmation"
+    write_source(source, project)
+
+    with pytest.raises(
+        report_model.ModelError,
+        match="sanitized authenticated attestation",
+    ):
+        report_model.load_project(source, root)
+
+
+@pytest.mark.parametrize("field", ("base_revision", "result_revision"))
+def test_research_round_revisions_are_existing_exact_commit_objects(
+    project_repo: tuple[Path, dict[str, object], Path],
+    field: str,
+) -> None:
+    root, project, source = project_repo
+    project["research_rounds"][0][field] = "a" * 40
+    write_source(source, project)
+    with pytest.raises(
+        report_model.ModelError,
+        match=f"{field} must name an existing exact Git commit object",
+    ):
+        report_model.load_project(source, root)
+
+
+def test_verified_main_round_preserves_historical_result_and_current_path_binding(
+    project_repo: tuple[Path, dict[str, object], Path],
+) -> None:
+    root, project, source = project_repo
+    previous = git(root, "rev-parse", "HEAD").stdout.strip()
+    (root / "evidence/current.md").write_text("current\n", encoding="utf-8")
+    git(root, "add", "evidence/current.md")
+    git(
+        root,
+        "-c",
+        "user.name=BooleanRazor Tests",
+        "-c",
+        "user.email=tests@example.invalid",
+        "-c",
+        "commit.gpgsign=false",
+        "commit",
+        "-q",
+        "-m",
+        "advance current head",
+    )
+    assert git(root, "rev-parse", "HEAD").stdout.strip() != previous
+    project["research_rounds"][0]["evidence"] = [path_evidence()]
+    write_source(source, project)
+
+    with pytest.raises(
+        report_model.ModelError,
+        match="must include commit evidence bound to result_revision",
+    ):
+        report_model.load_project(source, root)
+
+    project["research_rounds"][0]["evidence"].append(
+        commit_evidence(previous) | {"locator": "evidence/base.md"}
+    )
+    write_source(source, project)
+    loaded, _ = report_model.load_project(source, root)
+    assert loaded["research_rounds"][0]["result_revision"] == previous
+
+    project["research_rounds"][0]["evidence"] = [
+        {
+            "kind": "command",
+            "label": "unbound command",
+            "locator": "make test",
+            "revision": "none",
+        }
+    ]
+    write_source(source, project)
+    with pytest.raises(
+        report_model.ModelError,
+        match="verified_main requires HEAD-bound path evidence",
+    ):
+        report_model.load_project(source, root)
+
+
+def test_branch_only_round_evidence_binds_the_exact_result_revision(
+    project_repo: tuple[Path, dict[str, object], Path],
+) -> None:
+    root, project, source = project_repo
+    base_revision = git(root, "rev-parse", "HEAD").stdout.strip()
+    (root / "evidence/result.md").write_text("result\n", encoding="utf-8")
+    git(root, "add", "evidence/result.md")
+    git(
+        root,
+        "-c",
+        "user.name=BooleanRazor Tests",
+        "-c",
+        "user.email=tests@example.invalid",
+        "-c",
+        "commit.gpgsign=false",
+        "commit",
+        "-q",
+        "-m",
+        "historical result",
+    )
+    result_revision = git(root, "rev-parse", "HEAD").stdout.strip()
+    round_row = project["research_rounds"][0]
+    round_row.update(
+        {
+            "base_revision": base_revision,
+            "branch": "research/exact-result",
+            "result_revision": result_revision,
+            "status": "verified_branch_only",
+            "evidence": [
+                commit_evidence(base_revision)
+                | {"locator": "evidence/base.md"}
+            ],
+        }
+    )
+    round_row["runs"][0]["evidence"] = [
+        commit_evidence(result_revision)
+        | {"locator": "evidence/result.md"}
+    ]
+    write_source(source, project)
+
+    with pytest.raises(
+        report_model.ModelError,
+        match="must include commit evidence bound to result_revision",
+    ):
+        report_model.load_project(source, root)
+
+    round_row["evidence"] = [
+        commit_evidence(result_revision)
+        | {"locator": "evidence/result.md"}
+    ]
+    write_source(source, project)
+    loaded, _ = report_model.load_project(source, root)
+    assert loaded["research_rounds"][0]["result_revision"] == result_revision
+
+
+@pytest.mark.parametrize(
+    ("mutation", "fragment"),
+    (
+        ("missing", "must reference exactly one research round"),
+        ("wrong-track", "must reference a verified synthetic round"),
+        ("unverified", "must reference a verified synthetic round"),
+    ),
+)
+def test_synthetic_frontier_pointer_is_closed_and_evidence_bound(
+    project_repo: tuple[Path, dict[str, object], Path],
+    mutation: str,
+    fragment: str,
+) -> None:
+    root, project, source = project_repo
+    first = project["research_rounds"][0]
+    if mutation == "missing":
+        project["project"]["synthetic_frontier_round_id"] = "R99"
+    elif mutation == "wrong-track":
+        first["track"] = "disclosed_control"
+    elif mutation == "unverified":
+        first["status"] = "rejected"
+    else:
+        raise AssertionError(mutation)
+    write_source(source, project)
+
+    with pytest.raises(report_model.ModelError, match=fragment):
+        report_model.load_project(source, root)
+
+
 def test_validate_project_returns_sorted_unique_errors(
     project_repo: tuple[Path, dict[str, object], Path],
 ) -> None:
@@ -1411,3 +1735,301 @@ def test_renderer_escapes_html_attributes_and_markdown_table_link_syntax() -> No
     assert b'onclick="alert(4)' not in ledger
     assert b"\\|" in ledger
     assert b"\\[proof\\]\\(fake\\)" in ledger
+
+
+def test_renderer_exposes_the_actual_round_lineage_and_retains_dead_ends() -> None:
+    project = valid_project()
+    first = project["research_rounds"][0]
+    first.update(
+        {
+            "outcome": "The first candidate failed exactness.",
+            "title": "<b>R01 unsafe title</b>",
+        }
+    )
+    first["runs"][0].update(
+        {
+            "classification": "failed exactness <script>alert(1)</script>",
+            "outcome": "0 / 104857 exact rows.",
+            "status": "failed",
+        }
+    )
+    second = research_round(
+        round_id="R02",
+        parent_round_ids=["R01"],
+        round_index=2,
+        status="verified_branch_only",
+        turning_point=False,
+    )
+    second.update(
+        {
+            "outcome": "The control and candidate were equal.",
+            "title": "Fair-order R1",
+        }
+    )
+    second["runs"][0]["status"] = "equal"
+    third = research_round(
+        round_id="R03",
+        parent_round_ids=["R01", "R02"],
+        round_index=3,
+        status="rejected",
+        turning_point=True,
+    )
+    third.update(
+        {
+            "decision": "Supersede the pilot and pivot to executable binding.",
+            "insight": "A promising unbound pilot is not admissible evidence.",
+            "title": "Projected-support preflight",
+        }
+    )
+    third["runs"] = [
+        {
+            "classification": "unbound pilot",
+            "evidence": third["evidence"],
+            "outcome": "Promising, then withdrawn.",
+            "run_id": "r03-pilot",
+            "status": "superseded",
+        },
+        {
+            "classification": "rejected preflight",
+            "evidence": third["evidence"],
+            "outcome": "Timed out before an admissible comparison.",
+            "run_id": "r03-preflight",
+            "status": "timed_out",
+        },
+    ]
+    project["research_rounds"] = [third, first, second]
+
+    outputs = report_model.render_outputs(project, "a" * 64, "b" * 64)
+    index = outputs["reports/site/index.html"]
+    experiments = outputs["reports/site/experiments.html"]
+    css = outputs["reports/site/assets/report.css"]
+
+    assert b"Current internal synthetic frontier" in index
+    assert b"Missing public and sealed proof" in index
+    assert b'<ol class="research-lineage"' in index
+    lineage = index[index.index(b'<ol class="research-lineage"') :]
+    assert lineage.index(b"R01") < lineage.index(b"R02") < lineage.index(b"R03")
+    assert b'data-lineage-parent="R01" data-lineage-child="R02"' in lineage
+    assert b'data-lineage-parent="R01" data-lineage-child="R03"' in lineage
+    assert b'data-lineage-parent="R02" data-lineage-child="R03"' in lineage
+    assert b'class="lineage-origins has-multiple-parents"' in lineage
+    assert b'aria-label="Parent edge R01 to R03"' in lineage
+    assert b'aria-label="Parent edge R02 to R03"' in lineage
+    assert b'class="lineage-node turning-point"' in index
+    assert b"Turning point" in index
+    assert b"experiments.html#round-R03" in index
+    assert b"Report design references" in index
+    assert b'href="https://example.com/reference"' in index
+    assert b"Information-architecture reference only." in index
+    assert b"<svg" not in index
+    assert b"<svg" not in experiments
+
+    assert b'id="round-R01"' in experiments
+    assert b'href="#round-R01"' in experiments
+    assert b'href="#round-R02"' in experiments
+    for label in (
+        b"Parents",
+        b"Branch",
+        b"Base revision",
+        b"Result revision",
+        b"Track",
+        b"Status",
+        b"Hypothesis",
+        b"Independent variable",
+        b"Permitted data",
+        b"Frozen controls",
+        b"Outcome",
+        b"Decision",
+        b"Insight",
+        b"Limitations",
+        b"Next pivot",
+        b"Round evidence",
+        b"Runs",
+    ):
+        assert label in experiments
+    for run_status in (b"failed", b"equal", b"superseded", b"timed_out"):
+        assert run_status in experiments
+    assert b"0 / 104857 exact rows." in experiments
+    assert b"Promising, then withdrawn." in experiments
+    assert b"<script>alert(1)</script>" not in experiments
+    assert b"&lt;script&gt;alert(1)&lt;/script&gt;" in experiments
+
+    assert b".lineage-parent-edge::after" in css
+    assert b".lineage-origins.has-multiple-parents::after" in css
+    assert b".lineage-connector::before" in css
+    assert b".turning-point" in css
+    assert b".run-status-failed" in css
+    assert b".run-status-superseded" in css
+    assert b".card, .method-card { min-width: 0;" in css
+    assert b".research-round { min-width: 0;" in css
+    assert b".table-wrap { max-width: 100%; min-width: 0; overflow-x: auto; }" in css
+    assert b"@media (max-width: 760px)" in css
+    assert b"@media print" in css
+
+    experiment_index = outputs["docs/EXPERIMENT_INDEX.md"]
+    assert b"# Research trajectory" in experiment_index
+    assert experiment_index.index(b"R01") < experiment_index.index(b"R02")
+    assert b"r03-pilot" in experiment_index
+    assert b"superseded" in experiment_index
+    assert b"Timed out before an admissible comparison." in experiment_index
+    ledger = outputs["research/EVIDENCE_LEDGER.md"]
+    assert b"# Research-round provenance" in ledger
+    assert b"## R03" in ledger
+    assert b"r03-preflight" in ledger
+    assert ledger.endswith(b"\n")
+    assert not ledger.endswith(b"\n\n")
+
+
+def test_renderer_round_order_is_chronological_and_output_is_repeatable() -> None:
+    project = valid_project()
+    revision = project["research_rounds"][0]["result_revision"]
+    assert isinstance(revision, str)
+    second = research_round(
+        round_id="R02",
+        parent_round_ids=["R01"],
+        round_index=2,
+        revision=revision,
+        turning_point=False,
+    )
+    project["research_rounds"] = [second, project["research_rounds"][0]]
+
+    first_render = report_model.render_outputs(
+        project, "a" * 64, "b" * 64
+    )
+    second_render = report_model.render_outputs(
+        copy.deepcopy(project), "a" * 64, "b" * 64
+    )
+    assert first_render == second_render
+    experiments = first_render["reports/site/experiments.html"]
+    assert experiments.index(b'id="round-R01"') < experiments.index(
+        b'id="round-R02"'
+    )
+    assert first_render["reports/site/assets/report.js"] == (
+        report_model.REPORT_JS.encode("utf-8")
+    )
+
+
+def test_report_generator_digest_binds_all_executable_components() -> None:
+    evidence_helper = b"evidence helper bytes\n"
+    candidate_validator = b"candidate validator bytes\n"
+    promotion_validator = b"promotion validator bytes\n"
+    report_generator = b"report model bytes\n"
+    digest = hashlib.sha256()
+    digest.update(b"BooleanRazor deterministic report generator v2\0")
+    for path, content in (
+        (b"scripts/evidence_io.py", evidence_helper),
+        (b"scripts/candidate_evidence.py", candidate_validator),
+        (b"scripts/check-promotion.py", promotion_validator),
+        (b"scripts/report_model.py", report_generator),
+    ):
+        digest.update(len(path).to_bytes(4, "big"))
+        digest.update(path)
+        digest.update(len(content).to_bytes(8, "big"))
+        digest.update(content)
+
+    expected = digest.hexdigest()
+    assert (
+        report_model.report_generator_digest(
+            report_generator,
+            evidence_helper,
+            candidate_validator,
+            promotion_validator,
+        )
+        == expected
+    )
+    assert (
+        report_model.report_generator_digest(
+            report_generator + b"# changed\n",
+            evidence_helper,
+            candidate_validator,
+            promotion_validator,
+        )
+        != expected
+    )
+    assert (
+        report_model.report_generator_digest(
+            report_generator,
+            evidence_helper + b"# changed\n",
+            candidate_validator,
+            promotion_validator,
+        )
+        != expected
+    )
+    assert (
+        report_model.report_generator_digest(
+            report_generator,
+            evidence_helper,
+            candidate_validator + b"# changed\n",
+            promotion_validator,
+        )
+        != expected
+    )
+    assert (
+        report_model.report_generator_digest(
+            report_generator,
+            evidence_helper,
+            candidate_validator,
+            promotion_validator + b"# changed\n",
+        )
+        != expected
+    )
+
+
+def test_renderer_uses_the_structural_frontier_pointer_not_round_chronology() -> None:
+    project = valid_project()
+    revision = project["research_rounds"][0]["result_revision"]
+    assert isinstance(revision, str)
+    projected = research_round(
+        round_id="R08",
+        parent_round_ids=["R01"],
+        round_index=2,
+        revision=revision,
+        turning_point=True,
+    )
+    projected["title"] = "ProjectedSupportBDD frontier"
+    projected["outcome"] = "104857 / 104857 exact rows; 72 gates."
+    tensor_network = research_round(
+        round_id="R09",
+        parent_round_ids=["R08"],
+        round_index=3,
+        revision=revision,
+        turning_point=False,
+    )
+    tensor_network["title"] = "Tensor-network pipeline"
+    tensor_network["outcome"] = "A later plumbing round, not the frontier."
+    project["research_rounds"].extend([projected, tensor_network])
+    project["project"]["synthetic_frontier_round_id"] = "R08"
+
+    index = report_model.render_outputs(
+        project, "a" * 64, "b" * 64
+    )["reports/site/index.html"]
+    frontier = index[
+        index.index(b'<section class="frontier">') :
+        index.index(b"</section>", index.index(b'<section class="frontier">'))
+    ]
+    assert b"R08" in frontier
+    assert b"ProjectedSupportBDD frontier" in frontier
+    assert b"104857 / 104857 exact rows; 72 gates." in frontier
+    assert b"R09" not in frontier
+    assert b"Tensor-network pipeline" not in frontier
+    assert b"..</p>" not in frontier
+
+
+def test_renderer_preserves_sentence_list_punctuation_without_dot_semicolons() -> None:
+    project = valid_project()
+    project["research_rounds"][0]["limitations"] = [
+        "Synthetic fixture only.",
+        "No public conclusion is permitted.",
+    ]
+    project["methods"][0]["insights"] = [
+        "Exactness is primary.",
+        "Gate count is secondary.",
+    ]
+
+    outputs = report_model.render_outputs(project, "a" * 64, "b" * 64)
+
+    assert b".;" not in outputs["reports/site/index.html"]
+    assert b".;" not in outputs["docs/METHODS.md"]
+    assert b'<div class="frontier-boundary">' in outputs[
+        "reports/site/index.html"
+    ]

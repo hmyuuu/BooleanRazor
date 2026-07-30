@@ -5,16 +5,249 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import importlib.util
 import os
 import re
 import stat
 import sys
 from html.parser import HTMLParser
 from pathlib import Path
+from types import ModuleType
 from urllib.parse import unquote, urlsplit
 
-import evidence_io
-import report_model
+
+MAX_GENERATOR_BYTES = 16 * 1024 * 1024
+GENERATOR_DIGEST_DOMAIN = (
+    b"BooleanRazor deterministic report generator v2\0"
+)
+GENERATOR_COMPONENT_PATHS = (
+    "scripts/evidence_io.py",
+    "scripts/candidate_evidence.py",
+    "scripts/check-promotion.py",
+    "scripts/report_model.py",
+)
+_BOOTSTRAP_DIRECTORY_FLAGS = (
+    os.O_RDONLY
+    | getattr(os, "O_DIRECTORY", 0)
+    | getattr(os, "O_NOFOLLOW", 0)
+)
+_BOOTSTRAP_READ_FLAGS = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+
+
+class CheckerBootstrapError(ValueError):
+    """The checker cannot safely execute its repository dependencies."""
+
+
+def _bootstrap_absolute(path: Path) -> Path:
+    return Path(os.path.abspath(os.fspath(path)))
+
+
+def _bootstrap_open_directory(path: Path, label: str) -> int:
+    absolute = _bootstrap_absolute(path)
+    components = absolute.parts[1:]
+    if (
+        not absolute.is_absolute()
+        or not absolute.anchor
+        or not components
+        or any(part in {"", ".", ".."} for part in components)
+    ):
+        raise CheckerBootstrapError(f"{label} has an invalid path")
+    descriptor = os.open(
+        Path(absolute.anchor).anchor or "/",
+        _BOOTSTRAP_DIRECTORY_FLAGS,
+    )
+    try:
+        for component in components:
+            child = os.open(
+                component,
+                _BOOTSTRAP_DIRECTORY_FLAGS,
+                dir_fd=descriptor,
+            )
+            os.close(descriptor)
+            descriptor = child
+        return descriptor
+    except OSError as exc:
+        os.close(descriptor)
+        raise CheckerBootstrapError(
+            f"{label} must be a directory without symlinks"
+        ) from exc
+
+
+def _bootstrap_read_once(path: Path, label: str) -> bytes:
+    absolute = _bootstrap_absolute(path)
+    parent = _bootstrap_open_directory(absolute.parent, f"{label} parent")
+    try:
+        try:
+            descriptor = os.open(
+                absolute.name,
+                _BOOTSTRAP_READ_FLAGS,
+                dir_fd=parent,
+            )
+        except OSError as exc:
+            raise CheckerBootstrapError(
+                f"{label} must be a regular file without symlinks"
+            ) from exc
+    finally:
+        os.close(parent)
+    try:
+        before = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_size > MAX_GENERATOR_BYTES
+        ):
+            raise CheckerBootstrapError(
+                f"{label} must be a bounded regular file"
+            )
+        chunks: list[bytes] = []
+        remaining = MAX_GENERATOR_BYTES + 1
+        while remaining:
+            chunk = os.read(descriptor, min(1024 * 1024, remaining))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        content = b"".join(chunks)
+        after = os.fstat(descriptor)
+        if len(content) > MAX_GENERATOR_BYTES:
+            raise CheckerBootstrapError(f"{label} exceeds maximum size")
+        if (
+            before.st_dev,
+            before.st_ino,
+            before.st_size,
+            before.st_mtime_ns,
+            before.st_ctime_ns,
+        ) != (
+            after.st_dev,
+            after.st_ino,
+            after.st_size,
+            after.st_mtime_ns,
+            after.st_ctime_ns,
+        ):
+            raise CheckerBootstrapError(f"{label} changed while being read")
+        return content
+    finally:
+        os.close(descriptor)
+
+
+def _bootstrap_read_stable(path: Path, label: str) -> bytes:
+    first = _bootstrap_read_once(path, label)
+    second = _bootstrap_read_once(path, label)
+    if first != second:
+        raise CheckerBootstrapError(f"{label} changed between reads")
+    return first
+
+
+def _bootstrap_execute(
+    module_name: str,
+    path: Path,
+    source: bytes,
+) -> ModuleType:
+    spec = importlib.util.spec_from_file_location(module_name, path)
+    if spec is None:
+        raise CheckerBootstrapError(
+            f"cannot create module specification for {path.name}"
+        )
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
+    try:
+        exec(compile(source, os.fspath(path), "exec"), module.__dict__)
+    except BaseException:
+        if sys.modules.get(module_name) is module:
+            sys.modules.pop(module_name, None)
+        raise
+    return module
+
+
+def _load_checker_dependencies() -> tuple[
+    ModuleType,
+    ModuleType,
+    ModuleType,
+    ModuleType,
+    dict[str, bytes],
+]:
+    scripts = _bootstrap_absolute(Path(__file__).parent)
+    paths = {
+        relative: scripts / relative.removeprefix("scripts/")
+        for relative in GENERATOR_COMPONENT_PATHS
+    }
+    sources = {
+        relative: _bootstrap_read_stable(
+            path,
+            f"report generator component {relative}",
+        )
+        for relative, path in paths.items()
+    }
+    loaded: list[tuple[str, ModuleType]] = []
+    try:
+        evidence = _bootstrap_execute(
+            "evidence_io",
+            paths["scripts/evidence_io.py"],
+            sources["scripts/evidence_io.py"],
+        )
+        loaded.append(("evidence_io", evidence))
+        candidate = _bootstrap_execute(
+            "candidate_evidence",
+            paths["scripts/candidate_evidence.py"],
+            sources["scripts/candidate_evidence.py"],
+        )
+        loaded.append(("candidate_evidence", candidate))
+        promotion = _bootstrap_execute(
+            "_booleanrazor_report_check_promotion",
+            paths["scripts/check-promotion.py"],
+            sources["scripts/check-promotion.py"],
+        )
+        loaded.append(("_booleanrazor_report_check_promotion", promotion))
+        model = _bootstrap_execute(
+            "report_model",
+            paths["scripts/report_model.py"],
+            sources["scripts/report_model.py"],
+        )
+        loaded.append(("report_model", model))
+        if getattr(model, "_evidence_io", None) is not evidence:
+            raise CheckerBootstrapError(
+                "report model did not retain the pinned evidence helper"
+            )
+        if model._load_task4_module() is not promotion:
+            raise CheckerBootstrapError(
+                "report model did not retain the pinned promotion validator"
+            )
+        if sys.modules.get("candidate_evidence") is not candidate:
+            raise CheckerBootstrapError(
+                "report model did not retain the pinned candidate validator"
+            )
+        return evidence, candidate, promotion, model, sources
+    except BaseException:
+        for name, module in reversed(loaded):
+            if sys.modules.get(name) is module:
+                sys.modules.pop(name, None)
+        raise
+
+
+evidence_io: ModuleType | None
+candidate_evidence: ModuleType | None
+check_promotion: ModuleType | None
+report_model: ModuleType | None
+_IMPORTED_GENERATOR_BYTES: dict[str, bytes]
+_DEPENDENCY_BOOTSTRAP_ERROR: BaseException | None
+try:
+    (
+        evidence_io,
+        candidate_evidence,
+        check_promotion,
+        report_model,
+        _IMPORTED_GENERATOR_BYTES,
+    ) = _load_checker_dependencies()
+except KeyboardInterrupt:
+    raise
+except BaseException as exc:
+    evidence_io = None
+    candidate_evidence = None
+    check_promotion = None
+    report_model = None
+    _IMPORTED_GENERATOR_BYTES = {}
+    _DEPENDENCY_BOOTSTRAP_ERROR = exc
+else:
+    _DEPENDENCY_BOOTSTRAP_ERROR = None
 
 
 GENERATED_PREFIX = b"<!-- GENERATED; DO NOT EDIT."
@@ -69,8 +302,43 @@ def _absolute_lexical(path: Path) -> Path:
 def _generated_marker(source_digest: str, generator_digest: str) -> bytes:
     return (
         "<!-- GENERATED; DO NOT EDIT. Source: reports/data/project.json SHA-256: "
-        f"{source_digest}; report model SHA-256: {generator_digest} -->"
+        f"{source_digest}; report generator SHA-256: {generator_digest} -->"
     ).encode("utf-8")
+
+
+def _independent_generator_digest(
+    components: dict[str, bytes],
+) -> str:
+    if set(components) != set(GENERATOR_COMPONENT_PATHS) or any(
+        type(content) is not bytes for content in components.values()
+    ):
+        raise CheckerBootstrapError(
+            "report generator digest requires every exact component"
+        )
+    digest = hashlib.sha256()
+    digest.update(GENERATOR_DIGEST_DOMAIN)
+    for relative in GENERATOR_COMPONENT_PATHS:
+        name = relative.encode("utf-8")
+        content = components[relative]
+        digest.update(len(name).to_bytes(4, "big"))
+        digest.update(name)
+        digest.update(len(content).to_bytes(8, "big"))
+        digest.update(content)
+    return digest.hexdigest()
+
+
+def _restore_pinned_dependency_modules() -> None:
+    if (
+        evidence_io is None
+        or candidate_evidence is None
+        or check_promotion is None
+        or report_model is None
+    ):
+        raise CheckerBootstrapError("pinned dependency modules are unavailable")
+    sys.modules["evidence_io"] = evidence_io
+    sys.modules["candidate_evidence"] = candidate_evidence
+    sys.modules["_booleanrazor_report_check_promotion"] = check_promotion
+    sys.modules["report_model"] = report_model
 
 
 def _stable_read(
@@ -583,6 +851,22 @@ def _validate_fragment_targets(
 
 def check_deliverable(source: Path, repo_root: Path) -> list[str]:
     """Return sorted diagnostics; an empty list means the deliverable is fresh."""
+    if (
+        _DEPENDENCY_BOOTSTRAP_ERROR is not None
+        or evidence_io is None
+        or candidate_evidence is None
+        or check_promotion is None
+        or report_model is None
+    ):
+        failure = _DEPENDENCY_BOOTSTRAP_ERROR
+        detail = (
+            f"{type(failure).__name__}: {failure}"
+            if failure is not None
+            else "dependency modules are unavailable"
+        )
+        return [f"report checker dependency bootstrap failed: {detail}"]
+    _restore_pinned_dependency_modules()
+
     errors: list[str] = []
     root = _absolute_lexical(repo_root)
     supplied_source = source
@@ -602,17 +886,38 @@ def check_deliverable(source: Path, repo_root: Path) -> list[str]:
             f"{CANONICAL_SOURCE}"
         ]
 
-    generator_relative = "scripts/report_model.py"
-    generator_path = root.joinpath(*generator_relative.split("/"))
-    try:
-        imported_generator = _absolute_lexical(Path(report_model.__file__))
-    except (AttributeError, OSError, TypeError, ValueError):
-        return ["imported report model has no canonical file identity"]
-    if imported_generator != generator_path:
-        return [
-            "imported report model is not the canonical repository generator: "
-            f"{generator_relative}"
-        ]
+    component_modules = {
+        "scripts/evidence_io.py": evidence_io,
+        "scripts/candidate_evidence.py": candidate_evidence,
+        "scripts/check-promotion.py": check_promotion,
+        "scripts/report_model.py": report_model,
+    }
+    component_labels = {
+        "scripts/evidence_io.py": "evidence helper",
+        "scripts/candidate_evidence.py": "candidate validator",
+        "scripts/check-promotion.py": "promotion validator",
+        "scripts/report_model.py": "report model",
+    }
+    for relative in GENERATOR_COMPONENT_PATHS:
+        module = component_modules[relative]
+        expected_path = root.joinpath(*relative.split("/"))
+        try:
+            imported_path = _absolute_lexical(Path(module.__file__))
+        except (AttributeError, OSError, TypeError, ValueError):
+            return [
+                f"imported {component_labels[relative]} has no canonical file identity"
+            ]
+        if imported_path != expected_path:
+            return [
+                f"imported {component_labels[relative]} is not the canonical repository component: "
+                f"{relative}"
+            ]
+    if getattr(report_model, "_evidence_io", None) is not evidence_io:
+        return ["report model and checker do not share the canonical evidence helper"]
+    if report_model._load_task4_module() is not check_promotion:
+        return ["report model and checker do not share the promotion validator"]
+    if sys.modules.get("candidate_evidence") is not candidate_evidence:
+        return ["report model and checker do not share the candidate validator"]
 
     source_raw = _stable_read(
         source,
@@ -633,17 +938,29 @@ def check_deliverable(source: Path, repo_root: Path) -> list[str]:
         return [f"project source error: {exc}"]
     source_digest = hashlib.sha256(source_raw).hexdigest()
 
-    generator_path = _checked_regular(
-        root, generator_relative, errors, "report model"
+    component_bytes: dict[str, bytes] = {}
+    for relative in GENERATOR_COMPONENT_PATHS:
+        label = component_labels[relative]
+        path = _checked_regular(root, relative, errors, label)
+        if path is None:
+            return sorted(set(errors))
+        raw = _stable_read(path, label=label, errors=errors)
+        if raw is None:
+            return sorted(set(errors))
+        component_bytes[relative] = raw
+    generator_digest = _independent_generator_digest(component_bytes)
+    model_generator_digest = report_model.report_generator_digest(
+        component_bytes["scripts/report_model.py"],
+        component_bytes["scripts/evidence_io.py"],
+        component_bytes["scripts/candidate_evidence.py"],
+        component_bytes["scripts/check-promotion.py"],
     )
-    if generator_path is None:
-        return sorted(set(errors))
-    generator_bytes = _stable_read(
-        generator_path, label="report model", errors=errors
-    )
-    if generator_bytes is None:
-        return sorted(set(errors))
-    generator_digest = hashlib.sha256(generator_bytes).hexdigest()
+    if model_generator_digest != generator_digest:
+        return ["report generator digest contract drifted"]
+    if component_bytes != _IMPORTED_GENERATOR_BYTES:
+        return [
+            "report generator changed since checker bootstrap; restart the checker"
+        ]
     try:
         expected = report_model.render_outputs(
             project, source_digest, generator_digest

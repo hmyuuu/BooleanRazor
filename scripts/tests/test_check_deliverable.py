@@ -14,6 +14,8 @@ import pytest
 
 SCRIPTS = Path(__file__).resolve().parents[1]
 CHECKER_PATH = SCRIPTS / "check-deliverable.py"
+CANDIDATE_EVIDENCE_PATH = SCRIPTS / "candidate_evidence.py"
+CHECK_PROMOTION_PATH = SCRIPTS / "check-promotion.py"
 EXPECTED_SAFE_REPORT_JS = b"""\
 "use strict";
 for (const button of document.querySelectorAll("[data-status-filter]")) {
@@ -59,8 +61,8 @@ def canonical(value: object) -> bytes:
     )
 
 
-def git(root: Path, *args: str) -> None:
-    subprocess.run(
+def git(root: Path, *args: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
         ["git", "-C", str(root), *args],
         check=True,
         capture_output=True,
@@ -77,7 +79,7 @@ def evidence(locator: str = "evidence/base.md") -> dict[str, str]:
     }
 
 
-def valid_project() -> dict[str, object]:
+def valid_project(revision: str) -> dict[str, object]:
     controls = [
         {
             "control_id": f"control-{letter.lower()}",
@@ -162,8 +164,57 @@ def valid_project() -> dict[str, object]:
             "conclusion": "Blind advantage is not demonstrated.",
             "next_gate": "Run public evaluation.",
             "purpose": "Evidence-first circuit synthesis.",
+            "synthetic_frontier_round_id": "R01",
             "title": "BooleanRazor",
         },
+        "research_rounds": [
+            {
+                "base_revision": revision,
+                "branch": "main",
+                "decision": "Retain the exact synthetic result.",
+                "evidence": [
+                    evidence(),
+                    {
+                        "kind": "commit",
+                        "label": "historical round evidence",
+                        "locator": "evidence/base.md",
+                        "revision": revision,
+                    },
+                ],
+                "frozen_controls": ["Accuracy before gate count."],
+                "hypothesis": "The exact learner recovers the frozen fixture.",
+                "independent_variable": "Learner configuration.",
+                "insight": "Exactness and gate count are separate outcomes.",
+                "limitations": ["Synthetic fixture only."],
+                "next_pivot": "Test the next frozen hypothesis.",
+                "outcome": "The frozen synthetic fixture was recovered exactly.",
+                "parent_round_ids": [],
+                "permitted_data": ["Tracked synthetic fixture only."],
+                "result_revision": revision,
+                "round_id": "R01",
+                "round_index": 1,
+                "runs": [
+                    {
+                        "classification": "exact synthetic result",
+                        "evidence": [
+                            {
+                                "kind": "commit",
+                                "label": "historical run evidence",
+                                "locator": "evidence/base.md",
+                                "revision": revision,
+                            }
+                        ],
+                        "outcome": "Completed with exact internal equivalence.",
+                        "run_id": "r01-run-01",
+                        "status": "successful",
+                    }
+                ],
+                "status": "verified_main",
+                "title": "Exact synthetic control",
+                "track": "synthetic",
+                "turning_point": True,
+            }
+        ],
         "schema_version": 1,
         "verification_layers": [
             {
@@ -181,7 +232,7 @@ def valid_project() -> dict[str, object]:
 def marker(source_digest: str, generator_digest: str) -> str:
     return (
         "<!-- GENERATED; DO NOT EDIT. Source: reports/data/project.json SHA-256: "
-        f"{source_digest}; report model SHA-256: {generator_digest} -->"
+        f"{source_digest}; report generator SHA-256: {generator_digest} -->"
     )
 
 
@@ -243,6 +294,12 @@ def deliverable_repo(
     (root / "scripts/evidence_io.py").write_bytes(
         (SCRIPTS / "evidence_io.py").read_bytes()
     )
+    (root / "scripts/candidate_evidence.py").write_bytes(
+        CANDIDATE_EVIDENCE_PATH.read_bytes()
+    )
+    (root / "scripts/check-promotion.py").write_bytes(
+        CHECK_PROMOTION_PATH.read_bytes()
+    )
     (root / "scripts/check-deliverable.py").write_bytes(
         CHECKER_PATH.read_bytes()
     )
@@ -250,6 +307,21 @@ def deliverable_repo(
         check_deliverable_module.report_model,
         "__file__",
         str(root / "scripts/report_model.py"),
+    )
+    monkeypatch.setattr(
+        check_deliverable_module.evidence_io,
+        "__file__",
+        str(root / "scripts/evidence_io.py"),
+    )
+    monkeypatch.setattr(
+        check_deliverable_module.candidate_evidence,
+        "__file__",
+        str(root / "scripts/candidate_evidence.py"),
+    )
+    monkeypatch.setattr(
+        check_deliverable_module.check_promotion,
+        "__file__",
+        str(root / "scripts/check-promotion.py"),
     )
     git(root.parent, "init", "-q", str(root))
     git(root, "add", "evidence/base.md", "scripts/report_model.py")
@@ -265,13 +337,17 @@ def deliverable_repo(
         "-qm",
         "fixture evidence",
     )
+    revision = git(root, "rev-parse", "HEAD").stdout.strip()
     source = root / "reports/data/project.json"
     source.parent.mkdir(parents=True)
-    source.write_bytes(canonical(valid_project()))
+    source.write_bytes(canonical(valid_project(revision)))
     source_digest = hashlib.sha256(source.read_bytes()).hexdigest()
-    generator_digest = hashlib.sha256(
-        (root / "scripts/report_model.py").read_bytes()
-    ).hexdigest()
+    generator_digest = report_model.report_generator_digest(
+        (root / "scripts/report_model.py").read_bytes(),
+        (root / "scripts/evidence_io.py").read_bytes(),
+        (root / "scripts/candidate_evidence.py").read_bytes(),
+        (root / "scripts/check-promotion.py").read_bytes(),
+    )
     outputs = exact_outputs(source_digest, generator_digest)
     write_outputs(root, outputs)
     return root, source, source_digest, generator_digest, outputs
@@ -364,13 +440,17 @@ def test_all_checker_content_reads_use_stable_descriptor_io(
     root, source, _, _, outputs = deliverable_repo
     patch_outputs(monkeypatch, outputs)
     labels: list[str] = []
-    original = evidence_io.read_stable_regular
+    original = check_deliverable_module.evidence_io.read_stable_regular
 
     def record(path: Path, label: str, max_bytes: int) -> bytes:
         labels.append(label)
         return original(path, label, max_bytes)
 
-    monkeypatch.setattr(evidence_io, "read_stable_regular", record)
+    monkeypatch.setattr(
+        check_deliverable_module.evidence_io,
+        "read_stable_regular",
+        record,
+    )
     assert check_deliverable_module.check_deliverable(source, root) == []
     assert "project source" in labels
     assert "report model" in labels
@@ -943,6 +1023,116 @@ def test_exact_generated_marker_and_digests_are_required(
     )
 
 
+def test_checker_rejects_untrusted_evidence_helper_identity_or_symlink(
+    deliverable_repo: tuple[Path, Path, str, str, dict[str, bytes]],
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    root, source, _, _, outputs = deliverable_repo
+    patch_outputs(monkeypatch, outputs)
+    monkeypatch.setattr(
+        check_deliverable_module.evidence_io,
+        "__file__",
+        str(tmp_path / "outside-evidence_io.py"),
+    )
+    assert_error(
+        check_deliverable_module.check_deliverable(source, root),
+        "imported evidence helper is not the canonical repository component",
+    )
+
+    monkeypatch.setattr(
+        check_deliverable_module.evidence_io,
+        "__file__",
+        str(root / "scripts/evidence_io.py"),
+    )
+    helper = root / "scripts/evidence_io.py"
+    helper_bytes = helper.read_bytes()
+    helper.unlink()
+    outside = tmp_path / "outside-evidence_io.py"
+    outside.write_bytes(helper_bytes)
+    helper.symlink_to(outside)
+    assert_error(
+        check_deliverable_module.check_deliverable(source, root),
+        "evidence helper uses a symlink component",
+    )
+
+
+@pytest.mark.parametrize(
+    "component",
+    (
+        "evidence_io.py",
+        "candidate_evidence.py",
+        "check-promotion.py",
+        "report_model.py",
+    ),
+)
+def test_fresh_checker_rejects_initial_dependency_symlink_before_execution(
+    deliverable_repo: tuple[Path, Path, str, str, dict[str, bytes]],
+    tmp_path: Path,
+    component: str,
+) -> None:
+    root, source, _, _, _ = deliverable_repo
+    sentinel = tmp_path / "executed"
+    malicious = tmp_path / "malicious-evidence_io.py"
+    malicious.write_text(
+        "from pathlib import Path\n"
+        f"Path({str(sentinel)!r}).write_text('executed')\n",
+        encoding="utf-8",
+    )
+    dependency = root / "scripts" / component
+    dependency.unlink()
+    dependency.symlink_to(malicious)
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(root / "scripts/check-deliverable.py"),
+            "--source",
+            str(source),
+            "--repo-root",
+            str(root),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 1
+    assert "report checker dependency bootstrap failed" in result.stderr
+    assert "Traceback" not in result.stderr
+    assert not sentinel.exists()
+
+
+@pytest.mark.parametrize(
+    "component",
+    (
+        "evidence_io.py",
+        "candidate_evidence.py",
+        "check-promotion.py",
+        "report_model.py",
+    ),
+)
+def test_checker_independently_verifies_the_generator_digest_contract(
+    deliverable_repo: tuple[Path, Path, str, str, dict[str, bytes]],
+    monkeypatch: pytest.MonkeyPatch,
+    component: str,
+) -> None:
+    root, source, _, generator_digest, outputs = deliverable_repo
+    patch_outputs(monkeypatch, outputs)
+    dependency = root / "scripts" / component
+    dependency.write_bytes(dependency.read_bytes() + b"# post-import change\n")
+    monkeypatch.setattr(
+        check_deliverable_module.report_model,
+        "report_generator_digest",
+        lambda *_: generator_digest,
+    )
+
+    assert_error(
+        check_deliverable_module.check_deliverable(source, root),
+        "report generator digest contract drifted",
+    )
+
+
 def test_external_https_is_allowed_only_as_anchor_navigation(
     deliverable_repo: tuple[Path, Path, str, str, dict[str, bytes]],
     monkeypatch: pytest.MonkeyPatch,
@@ -966,8 +1156,9 @@ def test_cli_reports_success_for_real_renderer(
     deliverable_repo: tuple[Path, Path, str, str, dict[str, bytes]],
 ) -> None:
     root, source, source_digest, generator_digest, _ = deliverable_repo
+    project = json.loads(source.read_text(encoding="utf-8"))
     real_outputs = report_model.render_outputs(
-        valid_project(), source_digest, generator_digest
+        project, source_digest, generator_digest
     )
     write_outputs(root, real_outputs)
     result = subprocess.run(

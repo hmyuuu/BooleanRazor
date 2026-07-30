@@ -1,0 +1,41 @@
+<!-- GENERATED; DO NOT EDIT. Source: reports/data/project.json SHA-256: 6e71dd99c9ce7a4d228a5c231a3a4f6abf7e9d1fce56eefeea5a0945b062b8f8; report generator SHA-256: 834732d86d134fe0b7934590f6e4d12bbec7f10b883c49feaa2f285c10e101bd -->
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>BooleanRazor verification</title>
+  <link rel="stylesheet" href="assets/report.css">
+</head>
+<body>
+  <a class="skip-link" href="#content">Skip to content</a>
+  <header><nav aria-label="Report"><a href="index.html">Status</a><a href="methods.html">Methods</a><a href="verification.html" aria-current="page">Verification</a><a href="experiments.html">Experiments</a></nav></header>
+  <main id="content"><section class="hero"><h1>Verification</h1><p>Internal exhaustive equivalence and the official Julia verifier are separate authorities. This layer inventory is explanatory; authoritative result statements come only from structural claim records.</p></section><section class="table-wrap"><table><thead><tr><th>Layer</th><th>Authority</th><th>Meaning</th><th>Current state</th></tr></thead><tbody><tr><td>Training consistency</td><td>Visible rows</td><td>Every permitted observed training row must match before a candidate can advance.</td><td>Implemented in the exact learner and artifact checks.</td></tr><tr><td>Internal equivalence</td><td>Rust exhaustive XAG evaluation</td><td>The emitted circuit implements its completed table over the declared full input domain; this is not official verification.</td><td>Implemented for disclosed controls, synthetic fixtures, and candidate artifact construction.</td></tr><tr><td>Deterministic rerun</td><td>Byte-identical fresh artifacts</td><td>Two fresh eligible runs bind identical completed table, circuit, and artifact bytes.</td><td>Implemented for disclosed controls and required per future blind candidate; no current visible candidate pair is present.</td></tr><tr><td>Official Julia verification</td><td>Official Julia verifier</td><td>The unmodified official verifier confirms the bound candidate, dataset, samples, gates, exact accuracy, and bit accuracy.</td><td>Wrapper integrated; historical disclosed-control passes are branch-bound and the current blind official record is absent.</td></tr><tr><td>Sealed evaluator</td><td>Frozen custodian and evaluator boundary</td><td>A previously frozen visible-only candidate receives one confirmation without exposing sealed rows or private digests to the proposer.</td><td>Absent; no sealed result or sanitized authenticated attestation is present.</td></tr></tbody></table></section><section class="cards"><article class="card"><h3>Prepare and verify the repository</h3><p>Create the pinned local environment, validate vendored skills, and run the complete local baseline from a clean checkout.</p><pre><code>make setup
+make skills
+make test</code></pre></article><article class="card"><h3>Reproduce disclosed controls</h3><p>DATA_ROOT is the disclosed v1 archive root; OUTPUT_ROOT is a fresh artifact directory. This is a disclosed-control reproduction only.</p><pre><code>cargo run --locked --release --bin occam-circuit-hmyuuu -- \
+  solve-v1 &quot;$DATA_ROOT&quot; &quot;$OUTPUT_ROOT&quot;</code></pre></article><article class="card"><h3>Run one frozen public baseline</h3><p>PUBLIC_ROOT is the reviewed public bundle, OPAQUE_ID is its nonidentifying instance ID, and OUTPUT_DIR is a fresh runner-owned cell directory.</p><pre><code>cargo run --locked --release --bin occam-circuit-hmyuuu -- \
+  frozen-baseline &quot;$PUBLIC_ROOT&quot; &quot;$OPAQUE_ID&quot; &quot;$OUTPUT_DIR&quot; \
+  --method zero-fill --metrics-json &quot;$OUTPUT_DIR/metrics.json&quot;</code></pre></article><article class="card"><h3>Run the frozen Care-BDD candidate</h3><p>PUBLIC_ROOT, OPAQUE_ID, and ALGORITHM_SEED must come from the frozen visible-only design; OUTPUT_DIR must be fresh.</p><pre><code>cargo run --locked --release --bin occam-circuit-hmyuuu -- \
+  learn-care &quot;$PUBLIC_ROOT&quot; &quot;$OPAQUE_ID&quot; &quot;$OUTPUT_DIR&quot; \
+  --folds 5 --seed &quot;$ALGORITHM_SEED&quot; --policy reuse-sibling \
+  --max-order-evals 32</code></pre></article><article class="card"><h3>Run bounded exact SAT resynthesis</h3><p>INPUT_CIRCUIT is an already exact circuit; OUTPUT_DIR is fresh. The six-input and 285-second limits are frozen and the outer runner still owns the 300-second cap.</p><pre><code>cargo run --locked --all-features --release \
+  --bin occam-circuit-hmyuuu -- \
+  resynthesize &quot;$INPUT_CIRCUIT&quot; &quot;$OUTPUT_DIR&quot; \
+  --max-cut-inputs 6 --deadline-seconds 285 \
+  --metrics-json &quot;$OUTPUT_DIR/metrics.json&quot;</code></pre></article><article class="card"><h3>Run one bounded evidence cell</h3><p>REPO_ROOT is the clean source checkout; RUN_ROOT and CELL_ID identify one immutable frozen cell; PUBLIC_ROOT, OPAQUE_ID, and ALGORITHM_SEED remain visible-only inputs.</p><pre><code>&quot;$REPO_ROOT/.venv/bin/python&quot; &quot;$REPO_ROOT/scripts/run-experiment.py&quot; \
+  --run-root &quot;$RUN_ROOT&quot; --cell-id &quot;$CELL_ID&quot; \
+  --metrics-json &quot;$RUN_ROOT/cells/$CELL_ID/metrics.json&quot; -- \
+  &quot;$REPO_ROOT/target/release/occam-circuit-hmyuuu&quot; \
+  learn-care &quot;$PUBLIC_ROOT&quot; &quot;$OPAQUE_ID&quot; \
+  &quot;$RUN_ROOT/cells/$CELL_ID&quot; --folds 5 \
+  --seed &quot;$ALGORITHM_SEED&quot; --policy reuse-sibling --max-order-evals 32</code></pre></article><article class="card"><h3>Invoke the fail-closed Julia wrapper</h3><p>The custodian supplies absolute non-symlink JULIA_BIN, VERIFY_JL, CIRCUIT, and DATASET paths plus the frozen EXPECTED_GATES and safe INSTANCE label.</p><pre><code>&quot;$REPO_ROOT/scripts/verify-julia.sh&quot; \
+  &quot;$JULIA_BIN&quot; &quot;$VERIFY_JL&quot; &quot;$CIRCUIT&quot; &quot;$DATASET&quot; \
+  &quot;$EXPECTED_GATES&quot; &quot;$INSTANCE&quot;</code></pre></article><article class="card"><h3>Create an immutable official record</h3><p>The authorized custodian supplies immutable absolute paths. OFFICIAL_RECORD must not exist and private inputs stay outside the proposer report.</p><pre><code>&quot;$REPO_ROOT/.venv/bin/python&quot; &quot;$REPO_ROOT/scripts/record-verification.py&quot; \
+  --manifest &quot;$MANIFEST&quot; --julia-bin &quot;$JULIA_BIN&quot; \
+  --verify-jl &quot;$VERIFY_JL&quot; --dataset &quot;$DATASET&quot; \
+  --output &quot;$OFFICIAL_RECORD&quot;</code></pre></article><article class="card"><h3>Replay the promotion decision</h3><p>PROMOTION_REQUEST is one canonical evidence request and PROMOTION_DECISION is a new output path. A non-absent comparison additionally requires the reviewed trust policy.</p><pre><code>&quot;$REPO_ROOT/.venv/bin/python&quot; &quot;$REPO_ROOT/scripts/check-promotion.py&quot; \
+  --request &quot;$PROMOTION_REQUEST&quot; --output &quot;$PROMOTION_DECISION&quot;</code></pre></article><article class="card"><h3>Regenerate the report</h3><p>Regenerate every offline HTML and Markdown view from reports/data/project.json.</p><pre><code>make report</code></pre></article><article class="card"><h3>Verify the report</h3><p>Validate the canonical source, structural claim policy, evidence bindings, links, offline assets, and generated bytes.</p><pre><code>make report-check</code></pre></article></section></main>
+  <footer>Evidence source SHA-256: <code>6e71dd99c9ce7a4d228a5c231a3a4f6abf7e9d1fce56eefeea5a0945b062b8f8</code>; report generator SHA-256: <code>834732d86d134fe0b7934590f6e4d12bbec7f10b883c49feaa2f285c10e101bd</code></footer>
+  <script src="assets/report.js"></script>
+</body>
+</html>
