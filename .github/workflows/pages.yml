@@ -1,0 +1,130 @@
+name: Publish research report
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pages-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository and evidence history
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Install uv and Python
+        uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+        with:
+          version: "0.11.16"
+          python-version: "3.11.13"
+          enable-cache: true
+
+      - name: Sync locked report environment
+        run: uv sync --frozen --python 3.11.13 --dev
+
+      - name: Validate generated report
+        run: make report-check
+
+      - name: Stage commit-bound Pages artifact
+        env:
+          REPOSITORY_URL: ${{ github.server_url }}/${{ github.repository }}
+          REVISION: ${{ github.sha }}
+        run: |
+          cp -R reports/site _site
+          python - <<'PY'
+          import os
+          import re
+          from pathlib import Path, PurePosixPath
+          from urllib.parse import quote, unquote
+
+          repository = os.environ["REPOSITORY_URL"].rstrip("/")
+          revision = os.environ["REVISION"]
+          if re.fullmatch(r"[0-9a-f]{40}", revision) is None:
+              raise SystemExit("REVISION must be one lowercase commit SHA")
+
+          pattern = re.compile(
+              r'href="\.\./\.\./(?P<path>[^"#?]+)'
+              r'(?P<suffix>[?#][^"]*)?"'
+          )
+          replacements = 0
+
+          def rewrite(match: re.Match[str]) -> str:
+              global replacements
+              decoded = unquote(match.group("path"))
+              relative = PurePosixPath(decoded)
+              if (
+                  relative.is_absolute()
+                  or not relative.parts
+                  or any(part in {"", ".", ".."} for part in relative.parts)
+              ):
+                  raise ValueError(f"unsafe evidence link: {decoded}")
+
+              target = Path(*relative.parts)
+              current = Path()
+              for part in relative.parts:
+                  current /= part
+                  if current.is_symlink():
+                      raise ValueError(
+                          f"symlinked evidence link: {relative.as_posix()}"
+                      )
+              if not target.is_file():
+                  raise ValueError(
+                      f"missing evidence link: {relative.as_posix()}"
+                  )
+
+              replacements += 1
+              encoded = quote(relative.as_posix(), safe="/-._~")
+              suffix = match.group("suffix") or ""
+              return (
+                  f'href="{repository}/blob/{revision}/{encoded}{suffix}"'
+              )
+
+          for page in sorted(Path("_site").rglob("*.html")):
+              source = page.read_text(encoding="utf-8")
+              rewritten = pattern.sub(rewrite, source)
+              if 'href="../../' in rewritten:
+                  raise ValueError(f"unresolved repository link in {page}")
+              page.write_text(rewritten, encoding="utf-8", newline="\n")
+
+          if replacements == 0:
+              raise ValueError("report contained no repository evidence links")
+          if any(path.is_symlink() for path in Path("_site").rglob("*")):
+              raise ValueError("Pages artifact contains a symlink")
+
+          Path("_site/.nojekyll").write_bytes(b"")
+          print(f"Rewrote {replacements} evidence links at {revision}")
+          PY
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v4
+        with:
+          path: _site
+          include-hidden-files: true
+
+  deploy:
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Configure GitHub Pages
+        uses: actions/configure-pages@v5
+
+      - name: Deploy
+        id: deployment
+        uses: actions/deploy-pages@v4
