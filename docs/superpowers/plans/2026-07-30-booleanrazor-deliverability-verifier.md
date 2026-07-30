@@ -1577,8 +1577,12 @@ EXPERIMENT_FIELDS = {
     "decision", "limitations", "evidence",
 }
 CLAIM_FIELDS = {
-    "claim_id", "track", "status", "summary", "evidence", "limitations",
-    "missing_proof",
+    "claim_id", "claim_kind", "track", "status", "summary", "evidence",
+    "limitations", "missing_proof", "proof",
+}
+CLAIM_PROOF_FIELDS = {
+    "official_record", "promotion_decision", "promotion_request",
+    "trust_policy",
 }
 LAYER_FIELDS = {
     "layer_id", "title", "authority", "meaning", "current_state", "command",
@@ -1661,19 +1665,35 @@ CONTROL_GATES = {
 Every evidence reference has uniform keys. Enforce:
 
 ```text
-kind=path    -> revision=main, locator is a Git-tracked existing regular file
-kind=commit  -> revision is one lowercase 40-hex SHA, locator is safe relative
+kind=path    -> revision=main, locator is an exact current-HEAD blob and the
+                stable worktree bytes equal that blob
+kind=commit  -> revision is an existing lowercase 40-hex commit and locator is
+                an exact blob at that commit
 kind=command -> revision=none, locator is one nonempty command string
 kind=test    -> revision=main, locator is one nonempty test selector
 kind=url     -> revision=none, locator is an https URL without credentials
 ```
 
 Require all non-`verified_main` claims, methods, and experiments to have a
-nonempty limitation. Reject a `verified_main` sealed-confirmation claim unless
-its evidence includes a tracked path to a canonical sealed promotion decision.
-Reject a `verified_main` summary that claims official-verifier pass unless its
-path evidence includes a canonical `official-verification.json` with
-`status="pass"`.
+nonempty limitation. Every `verified_main` row requires current-HEAD path
+evidence; every `verified_branch_only` row requires an existing commit/blob
+reference. Define a closed `CLAIM_POLICY` keyed by
+`(claim_kind, track, status)`, render only its canonical statement as
+authoritative, and treat `claim_id`/`summary` as non-authoritative metadata.
+
+Proof roles must name exact path-evidence locators. Recompute any cited
+promotion decision through Task 4 and compare canonical bytes exactly. Reject
+shape-only official/sealed credentials. The current repository may report a
+replayed blocked blind-visible decision and a historical branch-bound
+disclosed-control Julia result. The latter uses only the closed
+`historical_disclosed_julia_pass` binding to
+`41518ce876b9c2a5939a525e538473165765203c:LOG.md` and its exact blob digest.
+It must reject positive current-head official, blind, or sealed claims until a
+complete replayable package and a separately designed sanitized authenticated
+public attestation exist. Git validation disables replacement refs and
+inherited `GIT_*` repository/object overrides, pins one HEAD OID, bounds blobs
+before reading, and accepts fetched exact historical commit objects without
+requiring developer-local branch names.
 
 - [ ] **Step 4: Run schema tests**
 
@@ -1734,19 +1754,28 @@ library `HTMLParser` subclass, and enforce:
 
 ```text
 all local href/src targets exist
+all same-page and cross-page fragments resolve
 no http(s) stylesheet or script src
+inline SVG is rejected
 one meta viewport
-one skip link
-one main landmark
-CSS contains @media print and :focus-visible
+one skip link targeting the sole main landmark
+one main landmark and no duplicate fragment IDs
+effective comment-stripped CSS contains @media print and a nonzero visible
+  :focus-visible style
+CSS escapes/imports/alternate loaders/remote tokens are rejected
+report.js equals the independently fixed safe script byte for byte
+the checker-owned canonical ten-path set equals OUTPUT_PATHS and rendered keys
 each HTML and generated Markdown file contains the project source digest
 each HTML and generated Markdown file contains the report-model digest
 each generated Markdown file begins <!-- GENERATED; DO NOT EDIT
 ```
 
-The CLI accepts optional `--source` and `--repo-root`, defaulting to
-`reports/data/project.json` and the repository root. It prints sorted errors to
-stderr and exits `1`, or prints
+The checker accepts only the canonical
+`reports/data/project.json`, verifies that the imported generator is the exact
+`<repo-root>/scripts/report_model.py`, and reads all evidence and generated
+content through descriptor-anchored stable-file primitives. The CLI accepts
+optional `--source` and `--repo-root` flags for their canonical values. It
+prints sorted errors to stderr and exits `1`, or prints
 `deliverable check: pass (10 generated files)` and exits `0`.
 
 - [ ] **Step 8: Run checker tests and commit the model**
@@ -1794,12 +1823,66 @@ git commit -m "feat: validate canonical deliverable evidence"
 **Interfaces:**
 - Consumes the schema frozen in Task 5 and the current blocked promotion
   request/decision from Task 4.
+- Extends the canonical source with an append-only `research_rounds` lineage.
+  This is the actual evidence-backed trace of executed research rounds, not a
+  conceptual method diagram or a reconstructed leaderboard.
 - Produces one deterministic `dict[str, bytes]` with ten generated files and
   no filesystem-dependent ordering, timestamp, absolute path, or environment
   value.
 - CLI:
   `python scripts/build-report.py --source reports/data/project.json
   --repo-root .`.
+
+Each exact round record contains:
+
+```text
+round_id
+parent_round_ids
+round_index
+title
+branch
+base_revision
+result_revision
+track
+status
+turning_point
+hypothesis
+independent_variable
+permitted_data
+frozen_controls
+runs
+outcome
+decision
+insight
+limitations
+next_pivot
+evidence
+```
+
+Each `runs` item has exact keys `run_id`, `status`, `classification`,
+`outcome`, and `evidence`. Require one root with no parents, unique contiguous
+positive indexes, prior existing parents, no duplicate/self edges or cycles,
+strict Boolean turning-point flags, full revision bindings, and the existing
+evidence/limitation rules. Multiple parents preserve the real Care-BDD/SAT
+integration and TN refresh merges. Preserve failed, timed-out, invalid, equal,
+rejected, and superseded observations inside their rounds.
+
+The executed lineage contains exactly the evidence-backed rounds R01–R11:
+disclosed-v1 control; blind protocol; care-BDD; bounded SAT; integration and
+scheduler audit; fair-order R1; GreedyExactConflict R1; ProjectedSupportBDD R2;
+TN pilot; historical disclosed-v1 Julia; and deliverability/promotion
+infrastructure. ProjectedSupportBDD R2 is the current internal tracked-formula
+synthetic frontier (`104857/104857`, 72 gates), never a public, blind, sealed,
+external, or global SOTA result. Public baseline, visible-blind, and sealed
+studies remain future gates outside the executed lineage.
+
+The landing page renders a compact static lineage. The experiments page
+renders the complete round and run records: hypothesis, independent variable,
+permitted data, frozen controls, outcomes, decisions, insights, limitations,
+next pivots, and evidence. Highlight a turning point only when the recorded
+decision changed the next research direction. Keep the never-executed public
+and sealed studies in the blocker/next-gate section, outside the executed
+trajectory.
 
 - [ ] **Step 1: Write renderer tests before renderer code**
 
@@ -2100,6 +2183,7 @@ bounded-sat             verified_main (tool evidence scope)
 oxidd-oracle            verified_main (oracle-only scope)
 bounded-runner          verified_main
 official-julia-wrapper  verified_main (wrapper infrastructure)
+projected-support-bdd   verified_branch_only
 tensor-network-pilot    verified_branch_only
 ```
 
@@ -2113,6 +2197,8 @@ fair-order-r1            rejected
   d019a3dc3d5afe1aef76a25f266afe27f9d66c6e
 greedy-conflict-r1       verified_branch_only
   7ac3c3ba2430ed787bab5ca215c259e259fa1fb5
+projected-support-r2     verified_branch_only
+  8f6eda40e089a12faa8df3827207024afd719865
 tn-pilot                 verified_branch_only
   96429f981170766575fd167713a528078f297d67
 public-baselines         blocked
@@ -2123,9 +2209,13 @@ sealed-confirmation      absent
 Record the fair scheduler as deterministic but tied and rejected. Record
 GreedyExactConflict as synthetic `36084 -> 34917` gates with exact-row CV
 still `0 / 104857`, advancing only to public-candidate consideration. Record
-TN as a deterministic synthetic pipeline only. Record the Julia run as
-historical disclosed-v1 evidence bound to its branch source, not a fresh
-current-HEAD record.
+ProjectedSupportBDD R2 as the internal tracked-formula synthetic frontier:
+two executable-bound repeats at `104857 / 104857` exact rows and 72 gates
+against the matched 34,917-gate, zero-exact R1 control. Preserve its three
+superseded pilot cells and two rejected preflights. Do not describe it as
+public, blind, sealed, external, or global SOTA. Record TN as a deterministic
+synthetic pipeline only. Record the Julia run as historical disclosed-v1
+evidence bound to its branch source, not a fresh current-HEAD record.
 
 Claims must explicitly state:
 
@@ -2526,7 +2616,8 @@ Use exactly these top-level sections:
 
 ```text
 Verified main: disclosed controls and exact core/infrastructure.
-Verified branch-only: historical v1 Julia run, GreedyExactConflict, TN pilot.
+Verified branch-only: historical v1 Julia run, GreedyExactConflict,
+ProjectedSupportBDD R2, TN pilot.
 Rejected: fair scheduler as a quality improvement.
 Blocked/absent: public baseline results, visible freeze, sealed confirmation,
 and blind advantage.

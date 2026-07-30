@@ -163,13 +163,37 @@ Each claim has:
 
 ```text
 claim_id
+claim_kind
 track
 status
 summary
 evidence
 limitations
 missing_proof
+proof
 ```
+
+`claim_id` and `summary` are display metadata only. `claim_kind`, `track`, and
+`status` select one exact statement from a closed claim-policy table; the
+renderer never uses author prose as an authoritative conclusion. `proof` is an
+exact role map:
+
+```text
+official_record
+promotion_decision
+promotion_request
+trust_policy
+```
+
+Each role is either `none` or an exact current-HEAD evidence path. A promotion
+statement is accepted only when the stored decision equals a fresh replay of
+the Task 4 state machine byte for byte. A digest-shaped or schema-shaped file
+is not proof by itself. The only positive historical Julia statement uses the
+separate `historical_disclosed_julia_pass` claim kind and a closed provenance
+binding to
+`41518ce876b9c2a5939a525e538473165765203c:LOG.md` plus its exact blob digest.
+It states historical disclosed-control evidence only; it is not a fresh
+current-HEAD official record.
 
 Allowed `track` values are:
 
@@ -200,19 +224,27 @@ The checker validates:
 - exact keys and enum values;
 - unique IDs;
 - canonical JSON bytes;
-- tracked-path existence;
-- lowercase full commit SHA syntax;
+- current-path evidence against the exact current `HEAD` blob, not the mutable
+  index or a pathspec match, with replacement refs and inherited Git
+  repository/object overrides disabled and the blob size checked before it is
+  materialized;
+- lowercase full commit SHA syntax plus existence of the exact commit and
+  historical blob;
 - safe URLs;
 - nonempty limitations for every non-main or incomplete claim;
-- absence of a blind-success claim without sealed-confirmation evidence;
-- absence of `official_verifier=pass` without a bound official verification
-  record;
+- structural claim-policy compatibility independent of prose and filenames;
+- replay of the current blocked promotion request/decision;
+- rejection of positive current-head official or sealed claims until a
+  replayable evidence package and a sanitized authenticated public attestation
+  exist;
 - exact disclosed-control gate counts and explicit control-only labeling;
 - no family/generator/sealed fields inside proposer-facing records.
 
-Branch-only commit references need not be reachable in a future shallow clone,
-but their full SHA, branch role, outcome, limitation, and summarized evidence
-remain in the tracked canonical ledger.
+Branch-only commit references must resolve while the report is built: their
+full SHA, historical path, branch role, outcome, limitation, and summarized
+evidence remain in the tracked canonical ledger. A future shallow clone must
+fetch the cited exact commit objects before running the report checker; local
+branch names are not required.
 
 ## 8. Static report
 
@@ -223,6 +255,8 @@ remain in the tracked canonical ledger.
 - one-sentence current conclusion;
 - disclosed control versus blind-study separation;
 - current control gate table;
+- a compact lineage tree built from the actual per-round research records,
+  with evidence-backed turning points called out explicitly;
 - evidence-level summary;
 - implemented/blocked/absent status;
 - next ratified gate;
@@ -253,25 +287,89 @@ remain in the tracked canonical ledger.
 
 - a status table for main, branch-only, rejected, proposed, blocked, and absent
   work;
+- the complete append-only research trace, including the recorded hypothesis,
+  independent variable, permitted data, frozen controls, run outcomes,
+  decision, insight, limitation, and next pivot for every executed round;
+- explicit merge provenance for rounds with more than one research parent;
+- preserved failed, equal, rejected, timed-out, and superseded runs rather
+  than a success-only retrospective;
 - exact commit/source references;
 - outcomes and decision boundaries;
 - no dynamic public leaderboard snapshot.
 
-### 8.2 Rendering properties
+### 8.2 Research-round provenance
+
+The trajectory is an evidence model, not a conceptual method diagram. The
+canonical source contains `research_rounds`, ordered by a contiguous positive
+`round_index`. Each round records:
+
+```text
+round_id
+parent_round_ids
+round_index
+title
+branch
+base_revision
+result_revision
+track
+status
+turning_point
+hypothesis
+independent_variable
+permitted_data
+frozen_controls
+runs
+outcome
+decision
+insight
+limitations
+next_pivot
+evidence
+```
+
+`parent_round_ids` is empty only for the root. Multiple parents preserve real
+merge provenance instead of flattening the Care-BDD/SAT integration or the TN
+base refresh into a false linear history. Parent rounds must precede children;
+missing parents, self-parenting, duplicate edges, and cycles are rejected.
+
+`runs` is a nonempty list of exact records:
+
+```text
+run_id
+status
+classification
+outcome
+evidence
+```
+
+Run statuses preserve successful, failed, timed-out, invalid, equal,
+superseded, blocked, and not-run observations. A round may be highlighted as a
+turning point only when its recorded decision changed the next research
+direction. The landing page renders a compact static lineage; the experiments
+page renders the full round and run records. Future gates such as the absent
+public and sealed studies are shown separately from the executed trajectory.
+
+### 8.3 Rendering properties
 
 - original CSS and JavaScript;
 - semantic HTML, keyboard-visible navigation, accessible color contrast, and
   descriptive table/figure text;
 - responsive layout and print/PDF stylesheet;
 - no external fonts, trackers, CDNs, or runtime network access;
+- one independently fixed JavaScript program, compared byte for byte by the
+  checker, plus CSS escape/loader rejection;
+- an independently fixed ten-path output set, rejection of inline SVG, and
+  effective (comment-stripped, nonzero) print/focus-style checks;
 - local relative links only;
+- complete same-page and cross-page fragment validation, including a skip link
+  that targets the sole main landmark;
 - HTML escaping for all evidence content;
 - deterministic page bytes;
 - generator/source digest embedded in each generated page;
 - English-first content; the schema permits a future translation without
   requiring it now.
 
-### 8.3 Markdown outputs
+### 8.4 Markdown outputs
 
 The same renderer produces:
 
