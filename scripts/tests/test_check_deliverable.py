@@ -14,6 +14,20 @@ import pytest
 
 SCRIPTS = Path(__file__).resolve().parents[1]
 CHECKER_PATH = SCRIPTS / "check-deliverable.py"
+EXPECTED_SAFE_REPORT_JS = b"""\
+"use strict";
+for (const button of document.querySelectorAll("[data-status-filter]")) {
+  button.addEventListener("click", () => {
+    const wanted = button.dataset.statusFilter;
+    for (const row of document.querySelectorAll("[data-status]")) {
+      row.hidden = wanted !== "all" && row.dataset.status !== wanted;
+    }
+    for (const peer of document.querySelectorAll("[data-status-filter]")) {
+      peer.setAttribute("aria-pressed", String(peer === button));
+    }
+  });
+}
+"""
 
 
 def load_module(name: str, filename: str):
@@ -25,6 +39,7 @@ def load_module(name: str, filename: str):
     return module
 
 
+evidence_io = load_module("evidence_io", "evidence_io.py")
 report_model = load_module("report_model", "report_model.py")
 check_deliverable_module = load_module(
     "check_deliverable", "check-deliverable.py"
@@ -84,9 +99,16 @@ def valid_project() -> dict[str, object]:
         "claims": [
             {
                 "claim_id": "blind-result",
+                "claim_kind": "blind_advantage",
                 "evidence": [evidence()],
                 "limitations": ["Public evaluation has not run."],
                 "missing_proof": ["Sealed confirmation."],
+                "proof": {
+                    "official_record": "none",
+                    "promotion_decision": "none",
+                    "promotion_request": "none",
+                    "trust_policy": "none",
+                },
                 "status": "blocked",
                 "summary": "Blind advantage is not demonstrated.",
                 "track": "blind_visible",
@@ -190,7 +212,7 @@ def exact_outputs(
             "a:focus-visible { outline: 2px solid; }\n"
             "@media print { nav { display: none; } }\n"
         ).encode(),
-        "reports/site/assets/report.js": b'"use strict";\n',
+        "reports/site/assets/report.js": EXPECTED_SAFE_REPORT_JS,
         "reports/site/experiments.html": page,
         "reports/site/index.html": page,
         "reports/site/methods.html": page,
@@ -209,6 +231,7 @@ def write_outputs(root: Path, outputs: dict[str, bytes]) -> None:
 @pytest.fixture
 def deliverable_repo(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> tuple[Path, Path, str, str, dict[str, bytes]]:
     root = tmp_path / "repo"
     (root / "evidence").mkdir(parents=True)
@@ -217,8 +240,31 @@ def deliverable_repo(
     (root / "scripts/report_model.py").write_bytes(
         (SCRIPTS / "report_model.py").read_bytes()
     )
+    (root / "scripts/evidence_io.py").write_bytes(
+        (SCRIPTS / "evidence_io.py").read_bytes()
+    )
+    (root / "scripts/check-deliverable.py").write_bytes(
+        CHECKER_PATH.read_bytes()
+    )
+    monkeypatch.setattr(
+        check_deliverable_module.report_model,
+        "__file__",
+        str(root / "scripts/report_model.py"),
+    )
     git(root.parent, "init", "-q", str(root))
     git(root, "add", "evidence/base.md", "scripts/report_model.py")
+    git(
+        root,
+        "-c",
+        "user.name=BooleanRazor Test",
+        "-c",
+        "user.email=booleanrazor-test@example.invalid",
+        "-c",
+        "commit.gpgsign=false",
+        "commit",
+        "-qm",
+        "fixture evidence",
+    )
     source = root / "reports/data/project.json"
     source.parent.mkdir(parents=True)
     source.write_bytes(canonical(valid_project()))
@@ -273,6 +319,67 @@ def test_missing_and_noncanonical_source_fail_closed(
     )
 
 
+def test_only_the_canonical_project_source_is_accepted(
+    deliverable_repo: tuple[Path, Path, str, str, dict[str, bytes]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root, source, _, generator_digest, _ = deliverable_repo
+    alternate_project = json.loads(source.read_text(encoding="utf-8"))
+    alternate_project["project"]["title"] = "Alternate report"
+    alternate = root / "reports/data/alternate.json"
+    alternate.write_bytes(canonical(alternate_project))
+    alternate_digest = hashlib.sha256(alternate.read_bytes()).hexdigest()
+    alternate_outputs = exact_outputs(alternate_digest, generator_digest)
+    write_outputs(root, alternate_outputs)
+    patch_outputs(monkeypatch, alternate_outputs)
+    assert_error(
+        check_deliverable_module.check_deliverable(alternate, root),
+        "canonical project source",
+    )
+
+
+def test_imported_report_model_must_be_the_repo_generator(
+    deliverable_repo: tuple[Path, Path, str, str, dict[str, bytes]],
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    root, source, _, _, outputs = deliverable_repo
+    patch_outputs(monkeypatch, outputs)
+    other = tmp_path / "other/report_model.py"
+    other.parent.mkdir()
+    other.write_bytes((root / "scripts/report_model.py").read_bytes())
+    monkeypatch.setattr(
+        check_deliverable_module.report_model, "__file__", str(other)
+    )
+    assert_error(
+        check_deliverable_module.check_deliverable(source, root),
+        "imported report model",
+    )
+
+
+def test_all_checker_content_reads_use_stable_descriptor_io(
+    deliverable_repo: tuple[Path, Path, str, str, dict[str, bytes]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root, source, _, _, outputs = deliverable_repo
+    patch_outputs(monkeypatch, outputs)
+    labels: list[str] = []
+    original = evidence_io.read_stable_regular
+
+    def record(path: Path, label: str, max_bytes: int) -> bytes:
+        labels.append(label)
+        return original(path, label, max_bytes)
+
+    monkeypatch.setattr(evidence_io, "read_stable_regular", record)
+    assert check_deliverable_module.check_deliverable(source, root) == []
+    assert "project source" in labels
+    assert "report model" in labels
+    assert {
+        f"generated output {relative}"
+        for relative in report_model.OUTPUT_PATHS
+    }.issubset(labels)
+
+
 def test_missing_drift_symlink_and_unexpected_outputs_are_rejected(
     deliverable_repo: tuple[Path, Path, str, str, dict[str, bytes]],
     monkeypatch: pytest.MonkeyPatch,
@@ -311,6 +418,25 @@ def test_missing_drift_symlink_and_unexpected_outputs_are_rejected(
         check_deliverable_module.check_deliverable(source, root),
         "unexpected generated output",
     )
+
+
+def test_checker_owns_the_complete_generated_output_set(
+    deliverable_repo: tuple[Path, Path, str, str, dict[str, bytes]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root, source, _, _, outputs = deliverable_repo
+    omitted = "docs/STATUS.md"
+    reduced = {name: raw for name, raw in outputs.items() if name != omitted}
+    (root / omitted).unlink()
+    monkeypatch.setattr(
+        check_deliverable_module.report_model,
+        "OUTPUT_PATHS",
+        frozenset(reduced),
+    )
+    patch_outputs(monkeypatch, reduced)
+    errors = check_deliverable_module.check_deliverable(source, root)
+    assert_error(errors, "canonical generated output set")
+    assert_error(errors, f"missing generated output: {omitted}")
 
 
 def mutate_matching_output(
@@ -415,6 +541,46 @@ def mutate_matching_output(
             ),
             "event-handler attribute",
         ),
+        (
+            "svg set mutates href",
+            lambda page: page.replace(
+                b"<main",
+                (
+                    b'<svg><image href="assets/report.css">'
+                    b'<set attributeName="href" '
+                    b'to="https://cdn.example/remote.svg"></set>'
+                    b"</image></svg><main"
+                ),
+                1,
+            ),
+            "forbidden SVG animation",
+        ),
+        (
+            "svg animate mutates href",
+            lambda page: page.replace(
+                b"<main",
+                (
+                    b'<svg><image href="assets/report.css">'
+                    b'<animate attributeName="href" '
+                    b'values="assets/report.css;https://cdn.example/remote.svg">'
+                    b"</animate></image></svg><main"
+                ),
+                1,
+            ),
+            "forbidden SVG animation",
+        ),
+        (
+            "svg external paint server",
+            lambda page: page.replace(
+                b"<main",
+                (
+                    b'<svg><rect fill="url(https://tracker.invalid/'
+                    b'paint.svg#x)"></rect></svg><main'
+                ),
+                1,
+            ),
+            "forbidden inline SVG",
+        ),
     ),
 )
 def test_html_offline_resource_contract(
@@ -443,6 +609,14 @@ def test_html_offline_resource_contract(
             "CSS @import",
         ),
         (
+            lambda css: b'@\\69mport "https://cdn.example/x.css";\n' + css,
+            "CSS escape",
+        ),
+        (
+            lambda css: b'@im/**/port "https://cdn.example/x.css";\n' + css,
+            "CSS @import",
+        ),
+        (
             lambda css: b'a{background:url(data:image/png;base64,AA==)}\n' + css,
             "remote CSS URL",
         ),
@@ -457,6 +631,13 @@ def test_html_offline_resource_contract(
         (
             lambda css: b'a{background:url(%2e%2e/%2e%2e/out.png)}\n' + css,
             "noncanonical CSS URL",
+        ),
+        (
+            lambda css: (
+                b'a{background-image:image-set("https://cdn.example/x.png" 1x)}\n'
+                + css
+            ),
+            "remote CSS token",
         ),
     ),
 )
@@ -473,6 +654,163 @@ def test_css_offline_resource_contract(
     patch_outputs(monkeypatch, changed)
     assert_error(
         check_deliverable_module.check_deliverable(source, root), fragment
+    )
+
+
+@pytest.mark.parametrize(
+    "payload",
+    (
+        b'fetch(atob("L3RyYWNr"));\n',
+        b'new XMLHttpRequest().open("GET", atob("L3RyYWNr"));\n',
+        b'navigator.sendBeacon(atob("L3RyYWNr"), "x");\n',
+        b'new WebSocket(String.fromCharCode(119,115,58,47,47,120));\n',
+    ),
+)
+def test_report_script_must_match_the_independently_reviewed_safe_contract(
+    deliverable_repo: tuple[Path, Path, str, str, dict[str, bytes]],
+    monkeypatch: pytest.MonkeyPatch,
+    payload: bytes,
+) -> None:
+    root, source, _, _, outputs = deliverable_repo
+    changed = mutate_matching_output(
+        root,
+        outputs,
+        "reports/site/assets/report.js",
+        lambda script: script + payload,
+    )
+    patch_outputs(monkeypatch, changed)
+    assert_error(
+        check_deliverable_module.check_deliverable(source, root),
+        "reviewed safe script",
+    )
+
+
+def test_every_internal_fragment_must_resolve(
+    deliverable_repo: tuple[Path, Path, str, str, dict[str, bytes]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root, source, _, _, outputs = deliverable_repo
+    changed = mutate_matching_output(
+        root,
+        outputs,
+        "reports/site/index.html",
+        lambda page: page.replace(
+            b"<main",
+            b'<a href="#missing">missing</a><main',
+            1,
+        ),
+    )
+    patch_outputs(monkeypatch, changed)
+    assert_error(
+        check_deliverable_module.check_deliverable(source, root),
+        "missing fragment target",
+    )
+
+    changed = mutate_matching_output(
+        root,
+        outputs,
+        "reports/site/index.html",
+        lambda page: page.replace(
+            b'href="methods.html"',
+            b'href="methods.html#missing"',
+            1,
+        ),
+    )
+    patch_outputs(monkeypatch, changed)
+    assert_error(
+        check_deliverable_module.check_deliverable(source, root),
+        "missing fragment target",
+    )
+
+
+def test_cross_page_fragment_resolves_against_the_target_page(
+    deliverable_repo: tuple[Path, Path, str, str, dict[str, bytes]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root, source, _, _, outputs = deliverable_repo
+    changed = mutate_matching_output(
+        root,
+        outputs,
+        "reports/site/index.html",
+        lambda page: page.replace(
+            b'href="methods.html"',
+            b'href="methods.html#content"',
+            1,
+        ),
+    )
+    patch_outputs(monkeypatch, changed)
+    assert check_deliverable_module.check_deliverable(source, root) == []
+
+
+def test_skip_link_fragment_must_target_the_main_landmark(
+    deliverable_repo: tuple[Path, Path, str, str, dict[str, bytes]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root, source, _, _, outputs = deliverable_repo
+    changed = mutate_matching_output(
+        root,
+        outputs,
+        "reports/site/index.html",
+        lambda page: page.replace(
+            b'<main id="content">',
+            b'<div id="content"></div><main id="other">',
+            1,
+        ),
+    )
+    patch_outputs(monkeypatch, changed)
+    assert_error(
+        check_deliverable_module.check_deliverable(source, root),
+        "skip link must target the main landmark",
+    )
+
+
+@pytest.mark.parametrize(
+    "replacement",
+    (
+        b"https://example.com#content",
+        b"//example.com#content",
+        b"?mode=external#content",
+        b"index.html#content",
+    ),
+)
+def test_skip_link_must_be_a_same_page_fragment(
+    deliverable_repo: tuple[Path, Path, str, str, dict[str, bytes]],
+    monkeypatch: pytest.MonkeyPatch,
+    replacement: bytes,
+) -> None:
+    root, source, _, _, outputs = deliverable_repo
+    changed = mutate_matching_output(
+        root,
+        outputs,
+        "reports/site/index.html",
+        lambda page: page.replace(b'href="#content"', b'href="' + replacement + b'"', 1),
+    )
+    patch_outputs(monkeypatch, changed)
+    assert_error(
+        check_deliverable_module.check_deliverable(source, root),
+        "skip link must target the main landmark",
+    )
+
+
+def test_duplicate_fragment_ids_are_rejected(
+    deliverable_repo: tuple[Path, Path, str, str, dict[str, bytes]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root, source, _, _, outputs = deliverable_repo
+    changed = mutate_matching_output(
+        root,
+        outputs,
+        "reports/site/index.html",
+        lambda page: page.replace(
+            b"<main",
+            b'<div id="content"></div><main',
+            1,
+        ),
+    )
+    patch_outputs(monkeypatch, changed)
+    assert_error(
+        check_deliverable_module.check_deliverable(source, root),
+        "duplicate fragment id",
     )
 
 
@@ -516,16 +854,48 @@ def test_html_accessibility_contract(
 
 
 @pytest.mark.parametrize(
-    ("removed", "fragment"),
+    ("transform", "fragment"),
     (
-        (b"@media print", "print stylesheet"),
-        (b":focus-visible", "visible focus style"),
+        (
+            lambda css: css.replace(b"@media print", b"removed", 1),
+            "print stylesheet",
+        ),
+        (
+            lambda css: css.replace(
+                b"@media print", b"/* @media print */", 1
+            ),
+            "print stylesheet",
+        ),
+        (
+            lambda css: css.replace(b":focus-visible", b":focus-removed", 1),
+            "visible focus style",
+        ),
+        (
+            lambda css: css.replace(
+                b"a:focus-visible {",
+                b"/* a:focus-visible */ .focus-placeholder {",
+                1,
+            ),
+            "visible focus style",
+        ),
+        (
+            lambda css: css.replace(
+                b"outline: 2px solid", b"outline: none", 1
+            ),
+            "visible focus style",
+        ),
+        (
+            lambda css: css.replace(
+                b"outline: 2px solid", b"outline: 0 transparent", 1
+            ),
+            "visible focus style",
+        ),
     ),
 )
 def test_stylesheet_accessibility_contract(
     deliverable_repo: tuple[Path, Path, str, str, dict[str, bytes]],
     monkeypatch: pytest.MonkeyPatch,
-    removed: bytes,
+    transform,
     fragment: str,
 ) -> None:
     root, source, _, _, outputs = deliverable_repo
@@ -533,7 +903,7 @@ def test_stylesheet_accessibility_contract(
         root,
         outputs,
         "reports/site/assets/report.css",
-        lambda css: css.replace(removed, b"removed", 1),
+        transform,
     )
     patch_outputs(monkeypatch, changed)
     assert_error(
@@ -603,7 +973,7 @@ def test_cli_reports_success_for_real_renderer(
     result = subprocess.run(
         [
             sys.executable,
-            str(CHECKER_PATH),
+            str(root / "scripts/check-deliverable.py"),
             "--source",
             str(source),
             "--repo-root",

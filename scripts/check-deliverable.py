@@ -13,15 +13,53 @@ from html.parser import HTMLParser
 from pathlib import Path
 from urllib.parse import unquote, urlsplit
 
+import evidence_io
 import report_model
 
 
 GENERATED_PREFIX = b"<!-- GENERATED; DO NOT EDIT."
+CANONICAL_SOURCE = "reports/data/project.json"
+CANONICAL_OUTPUT_PATHS = frozenset(
+    {
+        "reports/site/index.html",
+        "reports/site/methods.html",
+        "reports/site/verification.html",
+        "reports/site/experiments.html",
+        "reports/site/assets/report.css",
+        "reports/site/assets/report.js",
+        "docs/STATUS.md",
+        "docs/METHODS.md",
+        "docs/EXPERIMENT_INDEX.md",
+        "research/EVIDENCE_LEDGER.md",
+    }
+)
+MAX_GENERATED_BYTES = 16 * 1024 * 1024
 CSS_URL = re.compile(
     r"""url\s*\(\s*(?P<quote>["']?)(?P<url>.*?)(?P=quote)\s*\)""",
     re.IGNORECASE,
 )
 URI_SCHEME = re.compile(r"[A-Za-z][A-Za-z0-9+.-]*:")
+CSS_REMOTE_TOKEN = re.compile(
+    r"(?i)(?:https?|data|javascript|ftp|file|blob):|//"
+)
+CSS_ALTERNATE_LOADER = re.compile(
+    r"(?i)(?:-webkit-)?image-set\s*\(|\bsrc\s*\(|"
+    r"\bexpression\s*\(|\bbehavior\s*:|(?:-moz-)?binding\s*:"
+)
+SAFE_REPORT_JS = b"""\
+"use strict";
+for (const button of document.querySelectorAll("[data-status-filter]")) {
+  button.addEventListener("click", () => {
+    const wanted = button.dataset.statusFilter;
+    for (const row of document.querySelectorAll("[data-status]")) {
+      row.hidden = wanted !== "all" && row.dataset.status !== wanted;
+    }
+    for (const peer of document.querySelectorAll("[data-status-filter]")) {
+      peer.setAttribute("aria-pressed", String(peer === button));
+    }
+  });
+}
+"""
 
 
 def _absolute_lexical(path: Path) -> Path:
@@ -33,6 +71,20 @@ def _generated_marker(source_digest: str, generator_digest: str) -> bytes:
         "<!-- GENERATED; DO NOT EDIT. Source: reports/data/project.json SHA-256: "
         f"{source_digest}; report model SHA-256: {generator_digest} -->"
     ).encode("utf-8")
+
+
+def _stable_read(
+    path: Path,
+    *,
+    label: str,
+    errors: list[str],
+    max_bytes: int = MAX_GENERATED_BYTES,
+) -> bytes | None:
+    try:
+        return evidence_io.read_stable_regular(path, label, max_bytes)
+    except (evidence_io.EvidenceError, OSError, ValueError, TypeError) as exc:
+        errors.append(f"{label} cannot be read safely: {exc}")
+        return None
 
 
 def _checked_regular(
@@ -83,7 +135,7 @@ def _walk_without_symlinks(root: Path, start: Path):
 
 def _unexpected_outputs(root: Path, errors: list[str]) -> None:
     root = _absolute_lexical(root)
-    expected = set(report_model.OUTPUT_PATHS)
+    expected = set(CANONICAL_OUTPUT_PATHS)
     site = root / "reports/site"
     for path in _walk_without_symlinks(root, site) or ():
         try:
@@ -101,9 +153,13 @@ def _unexpected_outputs(root: Path, errors: list[str]) -> None:
             if path.is_symlink() or path.suffix != ".md":
                 continue
             try:
-                raw = path.read_bytes()
                 relative = path.relative_to(root).as_posix()
-            except (OSError, ValueError):
+                raw = evidence_io.read_stable_regular(
+                    path,
+                    f"unexpected generated candidate {relative}",
+                    MAX_GENERATED_BYTES,
+                )
+            except (evidence_io.EvidenceError, OSError, ValueError):
                 continue
             if raw.startswith(GENERATED_PREFIX) and relative not in expected:
                 errors.append(f"unexpected generated output: {relative}")
@@ -129,6 +185,26 @@ def _decode_url_path(raw_path: str) -> tuple[str | None, str | None]:
         or any(ord(character) < 32 or ord(character) == 127 for character in decoded)
     ):
         return None, "unsafe local path"
+    return decoded, None
+
+
+def _decode_fragment(raw_fragment: str) -> tuple[str | None, str | None]:
+    decoded = raw_fragment
+    for _ in range(4):
+        updated = unquote(decoded)
+        if updated == decoded:
+            break
+        decoded = updated
+    else:
+        return None, "repeated percent encoding"
+    from urllib.parse import quote
+
+    if (
+        not decoded
+        or quote(decoded, safe="!$&'()*+,;=:@/?-._~") != raw_fragment
+        or any(ord(character) < 32 or ord(character) == 127 for character in decoded)
+    ):
+        return None, "noncanonical or unsafe fragment"
     return decoded, None
 
 
@@ -173,19 +249,12 @@ def _local_target(
     except ValueError:
         errors.append(f"{label} local target escapes the repository")
         return
-    current = root
-    for part in relative.parts:
-        current = current / part
-        try:
-            mode = current.lstat().st_mode
-        except OSError:
-            errors.append(f"{label} has a missing local target: {decoded}")
-            return
-        if stat.S_ISLNK(mode):
-            errors.append(f"{label} local target uses a symlink: {decoded}")
-            return
-    if not stat.S_ISREG(target.lstat().st_mode):
-        errors.append(f"{label} local target is not a regular file: {decoded}")
+    try:
+        evidence_io.resolve_evidence_path(root, relative.as_posix(), label)
+    except (evidence_io.EvidenceError, OSError, ValueError, TypeError):
+        errors.append(
+            f"{label} has a missing local target or unsafe path: {decoded}"
+        )
 
 
 class _PageParser(HTMLParser):
@@ -196,6 +265,9 @@ class _PageParser(HTMLParser):
         self.viewport = 0
         self.skip_link = 0
         self.main = 0
+        self.ids: list[str] = []
+        self.main_ids: list[str] = []
+        self.skip_hrefs: list[str] = []
         self.urls: list[tuple[str, str, str, bool]] = []
         self.inline_css: list[str] = []
         self.stylesheets: list[str] = []
@@ -218,6 +290,18 @@ class _PageParser(HTMLParser):
             self.errors.append(f"{self.page} contains an event-handler attribute")
         if tag in {"iframe", "object", "embed"}:
             self.errors.append(f"{self.page} contains forbidden {tag}")
+        if tag == "svg":
+            self.errors.append(f"{self.page} contains forbidden inline SVG")
+        if tag in {
+            "animate",
+            "animatemotion",
+            "animatetransform",
+            "discard",
+            "set",
+        }:
+            self.errors.append(
+                f"{self.page} contains a forbidden SVG animation element"
+            )
         if tag == "base":
             self.errors.append(f"{self.page} contains a forbidden base element")
         if tag == "meta":
@@ -227,10 +311,17 @@ class _PageParser(HTMLParser):
                 self.errors.append(f"{self.page} contains a forbidden meta refresh")
         if tag == "main":
             self.main += 1
+            self.main_ids.append(attributes.get("id", ""))
+        identifier = attributes.get("id")
+        if identifier is not None:
+            if not identifier:
+                self.errors.append(f"{self.page} has an empty fragment id")
+            self.ids.append(identifier)
         if tag == "a":
             classes = attributes.get("class", "").split()
-            if "skip-link" in classes and attributes.get("href") == "#content":
+            if "skip-link" in classes:
                 self.skip_link += 1
+                self.skip_hrefs.append(attributes.get("href", ""))
         if tag == "link":
             rel = set(attributes.get("rel", "").lower().split())
             if rel != {"stylesheet"}:
@@ -311,8 +402,16 @@ def _validate_css(
     errors: list[str],
 ) -> None:
     normalized = re.sub(r"/\*.*?\*/", "", css, flags=re.DOTALL)
+    if "\\" in normalized:
+        errors.append(f"{label} contains a forbidden CSS escape")
+    if "/*" in normalized or "*/" in normalized:
+        errors.append(f"{label} contains an unterminated CSS comment")
     if re.search(r"@import\b", normalized, re.IGNORECASE):
         errors.append(f"{label} contains forbidden CSS @import")
+    if CSS_REMOTE_TOKEN.search(normalized):
+        errors.append(f"{label} contains a remote CSS token")
+    if CSS_ALTERNATE_LOADER.search(normalized):
+        errors.append(f"{label} contains a remote CSS token or unsupported loader")
     for match in CSS_URL.finditer(normalized):
         value = match.group("url").strip()
         before = len(errors)
@@ -332,26 +431,66 @@ def _validate_css(
                 errors.append(f"{label} contains a noncanonical CSS URL")
 
 
+def _has_visible_focus_style(css: str) -> bool:
+    for match in re.finditer(r"([^{}]+)\{([^{}]*)\}", css):
+        selector, declarations = match.groups()
+        if ":focus-visible" not in selector.lower():
+            continue
+        for declaration in declarations.split(";"):
+            if ":" not in declaration:
+                continue
+            property_name, value = declaration.split(":", 1)
+            if property_name.strip().lower() not in {
+                "border",
+                "box-shadow",
+                "outline",
+            }:
+                continue
+            normalized = value.strip().lower()
+            if (
+                not normalized
+                or re.search(r"\b(?:none|transparent)\b", normalized)
+                or normalized in {"0", "0.0"}
+            ):
+                continue
+            numeric_values = [
+                float(number)
+                for number in re.findall(
+                    r"(?<![A-Za-z0-9_.-])"
+                    r"([+-]?(?:\d+(?:\.\d*)?|\.\d+))"
+                    r"(?:[A-Za-z%]+)?",
+                    normalized,
+                )
+            ]
+            if any(number != 0.0 for number in numeric_values) or re.search(
+                r"\b(?:auto|medium|thick|thin)\b", normalized
+            ):
+                return True
+    return False
+
+
 def _validate_html(
     *,
     root: Path,
     relative: str,
     raw: bytes,
     errors: list[str],
-) -> None:
+) -> _PageParser | None:
     try:
         text = raw.decode("utf-8")
     except UnicodeDecodeError:
         errors.append(f"{relative} must be UTF-8 HTML")
-        return
+        return None
     parser = _PageParser(relative)
     try:
         parser.feed(text)
         parser.close()
     except Exception as exc:
         errors.append(f"{relative} cannot be parsed as HTML: {exc}")
-        return
+        return None
     errors.extend(parser.errors)
+    if len(parser.ids) != len(set(parser.ids)):
+        errors.append(f"{relative} contains a duplicate fragment id")
     if parser.viewport != 1:
         errors.append(f"{relative} must contain exactly one viewport meta")
     if parser.skip_link != 1:
@@ -380,28 +519,130 @@ def _validate_html(
             label=f"{relative} inline CSS",
             errors=errors,
         )
+    return parser
+
+
+def _validate_fragment_targets(
+    *,
+    root: Path,
+    relative: str,
+    parser: _PageParser,
+    pages: dict[str, _PageParser],
+    errors: list[str],
+) -> None:
+    if parser.skip_link == 1:
+        skip_href = parser.skip_hrefs[0]
+        split = urlsplit(skip_href)
+        decoded, problem = _decode_fragment(split.fragment)
+        if (
+            problem is not None
+            or decoded is None
+            or split.scheme
+            or split.netloc
+            or split.query
+            or split.path
+            or decoded not in parser.main_ids
+        ):
+            errors.append(f"{relative} skip link must target the main landmark")
+
+    page_path = _absolute_lexical(root).joinpath(*relative.split("/"))
+    for tag, attribute, value, allow_external in parser.urls:
+        if not allow_external:
+            continue
+        split = urlsplit(value)
+        if not split.fragment:
+            continue
+        if split.scheme or split.netloc:
+            continue
+        fragment, problem = _decode_fragment(split.fragment)
+        if problem is not None or fragment is None:
+            errors.append(
+                f"{relative} {tag}[{attribute}] has a noncanonical fragment"
+            )
+            continue
+        if split.path:
+            decoded_path, path_problem = _decode_url_path(split.path)
+            if path_problem is not None or decoded_path is None:
+                continue
+            target = _absolute_lexical(page_path.parent / decoded_path)
+            try:
+                target_relative = target.relative_to(
+                    _absolute_lexical(root)
+                ).as_posix()
+            except ValueError:
+                continue
+        else:
+            target_relative = relative
+        target_page = pages.get(target_relative)
+        if target_page is None or fragment not in target_page.ids:
+            errors.append(
+                f"{relative} {tag}[{attribute}] has a missing fragment target: "
+                f"{target_relative}#{fragment}"
+            )
 
 
 def check_deliverable(source: Path, repo_root: Path) -> list[str]:
     """Return sorted diagnostics; an empty list means the deliverable is fresh."""
     errors: list[str] = []
     root = _absolute_lexical(repo_root)
-    source = source if source.is_absolute() else root / source
-    try:
-        project, source_digest = report_model.load_project(source, root)
-    except (report_model.ModelError, OSError, ValueError, TypeError) as exc:
-        return [f"project source error: {exc}"]
+    supplied_source = source
+    if supplied_source.is_absolute():
+        canonical_spelling = supplied_source == root.joinpath(
+            *CANONICAL_SOURCE.split("/")
+        )
+    else:
+        canonical_spelling = supplied_source.as_posix() == CANONICAL_SOURCE
+    source = _absolute_lexical(
+        supplied_source if supplied_source.is_absolute() else root / supplied_source
+    )
+    canonical_source = root.joinpath(*CANONICAL_SOURCE.split("/"))
+    if not canonical_spelling or source != canonical_source:
+        return [
+            "project source must be the canonical project source: "
+            f"{CANONICAL_SOURCE}"
+        ]
 
     generator_relative = "scripts/report_model.py"
+    generator_path = root.joinpath(*generator_relative.split("/"))
+    try:
+        imported_generator = _absolute_lexical(Path(report_model.__file__))
+    except (AttributeError, OSError, TypeError, ValueError):
+        return ["imported report model has no canonical file identity"]
+    if imported_generator != generator_path:
+        return [
+            "imported report model is not the canonical repository generator: "
+            f"{generator_relative}"
+        ]
+
+    source_raw = _stable_read(
+        source,
+        label="project source",
+        errors=errors,
+        max_bytes=report_model.MAX_SOURCE_BYTES,
+    )
+    if source_raw is None:
+        return sorted(set(errors))
+    try:
+        project = report_model._parse_canonical_object(
+            source_raw, "project source"
+        )
+        model_errors = report_model.validate_project(project, root)
+        if model_errors:
+            raise report_model.ModelError("\n".join(model_errors))
+    except (report_model.ModelError, OSError, ValueError, TypeError) as exc:
+        return [f"project source error: {exc}"]
+    source_digest = hashlib.sha256(source_raw).hexdigest()
+
     generator_path = _checked_regular(
         root, generator_relative, errors, "report model"
     )
     if generator_path is None:
         return sorted(set(errors))
-    try:
-        generator_bytes = generator_path.read_bytes()
-    except OSError as exc:
-        return [f"report model cannot be read: {exc}"]
+    generator_bytes = _stable_read(
+        generator_path, label="report model", errors=errors
+    )
+    if generator_bytes is None:
+        return sorted(set(errors))
     generator_digest = hashlib.sha256(generator_bytes).hexdigest()
     try:
         expected = report_model.render_outputs(
@@ -411,7 +652,11 @@ def check_deliverable(source: Path, repo_root: Path) -> list[str]:
         return [f"report rendering error: {exc}"]
     if not isinstance(expected, dict):
         return ["report renderer must return an output map"]
-    if set(expected) != set(report_model.OUTPUT_PATHS):
+    if set(report_model.OUTPUT_PATHS) != set(CANONICAL_OUTPUT_PATHS):
+        errors.append(
+            "report model does not declare the canonical generated output set"
+        )
+    if set(expected) != set(CANONICAL_OUTPUT_PATHS):
         errors.append("report renderer returned an unexpected generated output set")
     if any(
         not isinstance(name, str) or not isinstance(content, bytes)
@@ -421,14 +666,16 @@ def check_deliverable(source: Path, repo_root: Path) -> list[str]:
         return sorted(set(errors))
 
     committed: dict[str, bytes] = {}
-    for relative in sorted(report_model.OUTPUT_PATHS):
+    for relative in sorted(CANONICAL_OUTPUT_PATHS):
         path = _checked_regular(root, relative, errors, "generated output")
         if path is None:
             continue
-        try:
-            raw = path.read_bytes()
-        except OSError as exc:
-            errors.append(f"generated output cannot be read: {relative}: {exc}")
+        raw = _stable_read(
+            path,
+            label=f"generated output {relative}",
+            errors=errors,
+        )
+        if raw is None:
             continue
         committed[relative] = raw
         if expected.get(relative) != raw:
@@ -454,11 +701,20 @@ def check_deliverable(source: Path, repo_root: Path) -> list[str]:
         if not raw.startswith(exact_marker + b"\n") or raw.count(exact_marker) != 1:
             errors.append(f"{relative} lacks the exact generated marker")
 
-    for relative in sorted(
-        name for name in committed if name.endswith(".html")
-    ):
-        _validate_html(
+    parsed_pages: dict[str, _PageParser] = {}
+    for relative in sorted(name for name in committed if name.endswith(".html")):
+        parsed = _validate_html(
             root=root, relative=relative, raw=committed[relative], errors=errors
+        )
+        if parsed is not None:
+            parsed_pages[relative] = parsed
+    for relative, parsed in sorted(parsed_pages.items()):
+        _validate_fragment_targets(
+            root=root,
+            relative=relative,
+            parser=parsed,
+            pages=parsed_pages,
+            errors=errors,
         )
 
     css_relative = "reports/site/assets/report.css"
@@ -469,9 +725,19 @@ def check_deliverable(source: Path, repo_root: Path) -> list[str]:
         except UnicodeDecodeError:
             errors.append("report stylesheet must be UTF-8")
         else:
-            if re.search(r"@media\s+print\b", css_text, re.IGNORECASE) is None:
+            effective_css = re.sub(
+                r"/\*.*?\*/", "", css_text, flags=re.DOTALL
+            )
+            if (
+                re.search(
+                    r"@media\s+print\b\s*\{",
+                    effective_css,
+                    re.IGNORECASE,
+                )
+                is None
+            ):
                 errors.append("report stylesheet is missing a print stylesheet")
-            if ":focus-visible" not in css_text:
+            if not _has_visible_focus_style(effective_css):
                 errors.append("report stylesheet is missing a visible focus style")
             _validate_css(
                 css=css_text,
@@ -483,15 +749,10 @@ def check_deliverable(source: Path, repo_root: Path) -> list[str]:
 
     js_raw = committed.get("reports/site/assets/report.js")
     if js_raw is not None:
-        try:
-            js_text = js_raw.decode("utf-8")
-        except UnicodeDecodeError:
-            errors.append("report script must be UTF-8")
-        else:
-            if re.search(
-                r"(?i)(?:https?:)?//|data:|javascript:", js_text
-            ):
-                errors.append("report script contains a remote runtime URL")
+        if js_raw != SAFE_REPORT_JS:
+            errors.append(
+                "report script does not match the independently reviewed safe script"
+            )
 
     return sorted(set(errors))
 
@@ -510,7 +771,7 @@ def main(argv: list[str] | None = None) -> int:
             print(error, file=sys.stderr)
         return 1
     print(
-        f"deliverable check: pass ({len(report_model.OUTPUT_PATHS)} generated files)"
+        f"deliverable check: pass ({len(CANONICAL_OUTPUT_PATHS)} generated files)"
     )
     return 0
 

@@ -4,14 +4,43 @@
 from __future__ import annotations
 
 import hashlib
+import importlib.util
 import json
 import os
 import re
-import stat
 import subprocess
+import sys
 from html import escape
 from pathlib import Path, PurePosixPath
+from types import ModuleType
 from urllib.parse import quote, urlsplit
+
+
+def _load_sibling_module(module_name: str, filename: str) -> ModuleType:
+    path = Path(__file__).resolve().with_name(filename)
+    existing = sys.modules.get(module_name)
+    if isinstance(existing, ModuleType):
+        existing_file = getattr(existing, "__file__", None)
+        if (
+            isinstance(existing_file, str)
+            and Path(existing_file).resolve() == path
+        ):
+            return existing
+        del sys.modules[module_name]
+    spec = importlib.util.spec_from_file_location(module_name, path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"cannot load sibling module {filename}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+_evidence_io = _load_sibling_module("evidence_io", "evidence_io.py")
+EvidenceError = _evidence_io.EvidenceError
+canonical_evidence_json_bytes = _evidence_io.canonical_json_bytes
+load_canonical_evidence_object = _evidence_io.load_canonical_object
+read_stable_regular = _evidence_io.read_stable_regular
 
 
 PROJECT_FIELDS = {
@@ -61,12 +90,20 @@ EXPERIMENT_FIELDS = {
 }
 CLAIM_FIELDS = {
     "claim_id",
+    "claim_kind",
     "track",
     "status",
     "summary",
     "evidence",
     "limitations",
     "missing_proof",
+    "proof",
+}
+CLAIM_PROOF_FIELDS = {
+    "official_record",
+    "promotion_decision",
+    "promotion_request",
+    "trust_policy",
 }
 LAYER_FIELDS = {
     "layer_id",
@@ -150,6 +187,98 @@ FORBIDDEN_PROPOSER_KEYS = {
     "source_family",
 }
 MAX_SOURCE_BYTES = 16 * 1024 * 1024
+HISTORICAL_OFFICIAL_PROOFS: dict[
+    tuple[str, str], dict[tuple[str, str], str]
+] = {
+    ("disclosed_control", "verified_branch_only"): {
+        (
+            "41518ce876b9c2a5939a525e538473165765203c",
+            "LOG.md",
+        ): "daa8b4eb4db5a25cd8506c0785a4a64a7296d37d9c510fd268625f7fcaf77754",
+    }
+}
+
+# Claim prose is intentionally not authoritative.  A report statement exists
+# only when an exact structural (claim_kind, track, status) tuple appears here.
+# This keeps both validation and rendering independent of author-controlled IDs
+# and prose.
+CLAIM_POLICY: dict[str, dict[tuple[str, str], str]] = {
+    "blind_advantage": {
+        (
+            "blind_visible",
+            "blocked",
+        ): "Blind advantage has not been demonstrated.",
+        (
+            "blind_visible",
+            "absent",
+        ): "Blind-visible and sealed evidence are absent; blind advantage has not been demonstrated.",
+        (
+            "sealed_confirmation",
+            "blocked",
+        ): "Sealed confirmation is blocked; blind advantage has not been demonstrated.",
+    },
+    "control_equivalence": {
+        (
+            "disclosed_control",
+            "verified_main",
+        ): "The disclosed controls pass current internal exhaustive equivalence.",
+        (
+            "disclosed_control",
+            "verified_branch_only",
+        ): "Disclosed-control equivalence is recorded only at the cited historical revision.",
+    },
+    # Current-head official claims have no permitted positive tuple until a
+    # sanitized authenticated attestation contract exists.
+    "official_verifier_pass": {},
+    "historical_disclosed_julia_pass": {
+        (
+            "disclosed_control",
+            "verified_branch_only",
+        ): (
+            "The ratified historical disclosed-v1 log records Julia verifier "
+            "passes for disclosed controls only; this is not a fresh "
+            "current-HEAD official verification or blind-learning evidence."
+        ),
+    },
+    "promotion_state": {
+        (
+            "blind_visible",
+            "blocked",
+        ): "The current blind-visible promotion decision is blocked.",
+        (
+            "synthetic",
+            "blocked",
+        ): "The current synthetic promotion decision is blocked.",
+        (
+            "disclosed_control",
+            "blocked",
+        ): "The current disclosed-control promotion decision is blocked.",
+    },
+    "sealed_promotion": {
+        (
+            "sealed_confirmation",
+            "blocked",
+        ): "Sealed promotion is blocked.",
+        (
+            "sealed_confirmation",
+            "absent",
+        ): "No sealed-promotion evidence is present.",
+    },
+    "synthetic_candidate": {
+        (
+            "synthetic",
+            "verified_branch_only",
+        ): "A synthetic candidate result is recorded only at the cited historical revision.",
+        (
+            "synthetic",
+            "rejected",
+        ): "The cited synthetic candidate was rejected.",
+        (
+            "synthetic",
+            "proposed",
+        ): "The cited synthetic candidate is proposed, not promoted.",
+    },
+}
 
 
 class ModelError(ValueError):
@@ -214,30 +343,12 @@ def _read_regular_without_symlinks(
         relative = path.relative_to(root)
     except ValueError as exc:
         raise ModelError(f"{label} must remain inside the repository") from exc
-    current = root
     try:
-        root_mode = root.lstat().st_mode
-    except OSError as exc:
-        raise ModelError("repository root must exist") from exc
-    if stat.S_ISLNK(root_mode) or not stat.S_ISDIR(root_mode):
-        raise ModelError("repository root must be a real directory")
-    for part in relative.parts:
-        current = current / part
-        try:
-            mode = current.lstat().st_mode
-        except OSError as exc:
-            raise ModelError(f"{label} does not exist") from exc
-        if stat.S_ISLNK(mode):
-            raise ModelError(f"{label} must not use a symlink component")
-    if not stat.S_ISREG(current.lstat().st_mode):
-        raise ModelError(f"{label} must be a regular file")
-    try:
-        raw = current.read_bytes()
-    except OSError as exc:
-        raise ModelError(f"{label} cannot be read") from exc
-    if len(raw) > max_bytes:
-        raise ModelError(f"{label} is too large")
-    return raw
+        return read_stable_regular(path, label, max_bytes)
+    except EvidenceError as exc:
+        raise ModelError(
+            f"{label} must be a stable regular file without symlink components: {exc}"
+        ) from exc
 
 
 def load_project(source: Path, repo_root: Path) -> tuple[dict[str, object], str]:
@@ -302,7 +413,10 @@ def _safe_repo_locator(value: object) -> bool:
         not pure.is_absolute()
         and value not in {".", ".."}
         and all(
-            part not in {"", ".", ".."} and not part.startswith("-")
+            part not in {"", ".", ".."}
+            and not part.startswith("-")
+            and re.fullmatch(r"[A-Za-z0-9_.@+][A-Za-z0-9._@+=,-]*", part)
+            is not None
             for part in parts
         )
     )
@@ -332,61 +446,143 @@ def _https_url(value: object) -> bool:
     )
 
 
-def _tracked_regular_path(
-    repo_root: Path, locator: str, label: str, errors: list[str]
-) -> Path | None:
-    if not _safe_repo_locator(locator):
-        errors.append(f"{label} must use a safe repo-relative POSIX path")
-        return None
-    root = _absolute_lexical(repo_root)
-    path = root.joinpath(*locator.split("/"))
-    current = root
+def _git_bytes(repo_root: Path, *arguments: str) -> subprocess.CompletedProcess[bytes]:
+    environment = {
+        key: value
+        for key, value in os.environ.items()
+        if not key.startswith("GIT_")
+    }
+    environment["GIT_NO_REPLACE_OBJECTS"] = "1"
     try:
-        if stat.S_ISLNK(current.lstat().st_mode):
-            errors.append(f"{label} must not use a symlink component")
-            return None
-    except OSError:
-        errors.append("repository root must exist")
-        return None
-    for part in locator.split("/"):
-        current = current / part
-        try:
-            mode = current.lstat().st_mode
-        except OSError:
-            errors.append(f"{label} must be a tracked evidence path")
-            return None
-        if stat.S_ISLNK(mode):
-            errors.append(f"{label} must not use a symlink component")
-            return None
-    if not stat.S_ISREG(path.lstat().st_mode):
-        errors.append(f"{label} must be an existing regular file")
-        return None
-    try:
-        tracked = subprocess.run(
+        return subprocess.run(
             [
                 "git",
+                "--no-replace-objects",
+                "-c",
+                "core.useReplaceRefs=false",
                 "-C",
-                os.fspath(root),
-                "ls-files",
-                "--error-unmatch",
-                "--",
-                locator,
+                os.fspath(repo_root),
+                *arguments,
             ],
             check=False,
             capture_output=True,
-            text=True,
+            env=environment,
         )
-    except OSError:
-        errors.append(f"{label} cannot verify the tracked evidence path")
+    except OSError as exc:
+        raise ModelError("Git is required to validate report evidence") from exc
+
+
+def _resolve_head_oid(repo_root: Path, errors: list[str]) -> str | None:
+    root = _absolute_lexical(repo_root)
+    resolved = _git_bytes(
+        root,
+        "rev-parse",
+        "--verify",
+        "--end-of-options",
+        "HEAD^{commit}",
+    )
+    try:
+        oid = resolved.stdout.decode("ascii").removesuffix("\n")
+    except UnicodeDecodeError:
+        oid = ""
+    if (
+        resolved.returncode != 0
+        or resolved.stdout.count(b"\n") != 1
+        or HEX_40.fullmatch(oid) is None
+    ):
+        errors.append("repository HEAD must resolve to one exact Git commit OID")
         return None
-    if tracked.returncode != 0:
-        errors.append(f"{label} must be a Git-tracked evidence path")
+    object_type = _git_bytes(root, "cat-file", "-t", oid)
+    if object_type.returncode != 0 or object_type.stdout != b"commit\n":
+        errors.append("repository HEAD must name an exact Git commit object")
         return None
-    return path
+    return oid
+
+
+def _head_regular_path(
+    repo_root: Path,
+    head_oid: str | None,
+    locator: str,
+    label: str,
+    errors: list[str],
+) -> tuple[Path, bytes] | None:
+    if not _safe_repo_locator(locator):
+        errors.append(f"{label} must use a safe repo-relative POSIX path")
+        return None
+    if head_oid is None:
+        errors.append(f"{label} cannot resolve pinned HEAD evidence")
+        return None
+    root = _absolute_lexical(repo_root)
+    path = root.joinpath(*locator.split("/"))
+    try:
+        head_type = _git_bytes(
+            root, "cat-file", "-t", f"{head_oid}:{locator}"
+        )
+    except ModelError as exc:
+        errors.append(f"{label} cannot verify the HEAD-tracked evidence path: {exc}")
+        return None
+    if head_type.returncode != 0 or head_type.stdout != b"blob\n":
+        errors.append(f"{label} must be a HEAD-tracked evidence path")
+        return None
+    head_size = _git_bytes(root, "cat-file", "-s", f"{head_oid}:{locator}")
+    try:
+        blob_size = int(head_size.stdout.decode("ascii").removesuffix("\n"))
+    except (UnicodeDecodeError, ValueError):
+        blob_size = -1
+    if (
+        head_size.returncode != 0
+        or head_size.stdout.count(b"\n") != 1
+        or blob_size < 0
+        or blob_size > MAX_SOURCE_BYTES
+    ):
+        errors.append(
+            f"{label} HEAD blob must not exceed {MAX_SOURCE_BYTES} bytes"
+        )
+        return None
+    head_blob = _git_bytes(root, "cat-file", "blob", f"{head_oid}:{locator}")
+    if head_blob.returncode != 0:
+        errors.append(f"{label} cannot read the exact HEAD blob")
+        return None
+    try:
+        worktree = _read_regular_without_symlinks(path, root, label)
+    except ModelError as exc:
+        errors.append(str(exc))
+        return None
+    if worktree != head_blob.stdout:
+        errors.append(f"{label} must match the HEAD blob byte for byte")
+        return None
+    return path, head_blob.stdout
+
+
+def _commit_blob_exists(
+    repo_root: Path,
+    revision: str,
+    locator: str,
+    label: str,
+    errors: list[str],
+) -> bool:
+    root = _absolute_lexical(repo_root)
+    object_type = _git_bytes(root, "cat-file", "-t", revision)
+    if object_type.returncode != 0:
+        errors.append(f"{label} revision must name an existing Git commit object")
+        return False
+    if object_type.stdout != b"commit\n":
+        errors.append(f"{label} revision must name an exact Git commit object")
+        return False
+    blob = _git_bytes(root, "cat-file", "-t", f"{revision}:{locator}")
+    if blob.returncode != 0 or blob.stdout != b"blob\n":
+        errors.append(f"{label} locator must name a blob at the exact commit")
+        return False
+    return True
 
 
 def _validate_evidence(
-    value: object, repo_root: Path, label: str, errors: list[str]
+    value: object,
+    repo_root: Path,
+    head_oid: str | None,
+    verified_head_blobs: dict[str, bytes],
+    label: str,
+    errors: list[str],
 ) -> dict[str, object] | None:
     if not _exact_keys(value, EVIDENCE_FIELDS, label, errors):
         return None
@@ -402,7 +598,12 @@ def _validate_evidence(
         if revision != "main":
             errors.append(f"{label} path evidence revision must equal main")
         if isinstance(locator, str):
-            _tracked_regular_path(repo_root, locator, label, errors)
+            checked = _head_regular_path(
+                repo_root, head_oid, locator, label, errors
+            )
+            if checked is not None:
+                _, blob = checked
+                verified_head_blobs[locator] = blob
         else:
             errors.append(f"{label} must use a safe repo-relative POSIX path")
     elif kind == "commit":
@@ -410,6 +611,8 @@ def _validate_evidence(
             errors.append(f"{label} commit revision must be 40 lowercase hex")
         if not _safe_repo_locator(locator):
             errors.append(f"{label} must use a safe repo-relative POSIX path")
+        elif isinstance(revision, str) and HEX_40.fullmatch(revision) is not None:
+            _commit_blob_exists(repo_root, revision, locator, label, errors)
     elif kind == "command":
         if revision != "none" or not isinstance(locator, str) or not locator.strip():
             errors.append(
@@ -429,7 +632,12 @@ def _validate_evidence(
 
 
 def _validate_evidence_list(
-    value: object, repo_root: Path, label: str, errors: list[str]
+    value: object,
+    repo_root: Path,
+    head_oid: str | None,
+    verified_head_blobs: dict[str, bytes],
+    label: str,
+    errors: list[str],
 ) -> list[dict[str, object]]:
     if not isinstance(value, list) or not value:
         errors.append(f"{label} must be a nonempty evidence list")
@@ -437,7 +645,12 @@ def _validate_evidence_list(
     result = []
     for index, row in enumerate(value):
         checked = _validate_evidence(
-            row, repo_root, f"{label}[{index}]", errors
+            row,
+            repo_root,
+            head_oid,
+            verified_head_blobs,
+            f"{label}[{index}]",
+            errors,
         )
         if checked is not None:
             result.append(checked)
@@ -489,8 +702,11 @@ def _forbidden_keys(value: object, path: str, errors: list[str]) -> None:
 
 
 def _load_proof(path: Path, repo_root: Path, label: str) -> dict[str, object]:
-    raw = _read_regular_without_symlinks(path, repo_root, label)
-    return _parse_canonical_object(raw, label)
+    try:
+        value, _ = load_canonical_evidence_object(path, label)
+    except EvidenceError as exc:
+        raise ModelError(str(exc)) from exc
+    return value
 
 
 def _validate_official_record(
@@ -604,11 +820,241 @@ def _validate_sealed_decision(
     return valid
 
 
+def _load_task4_module() -> ModuleType:
+    # check-promotion imports candidate_evidence by its script module name.
+    # Loading the exact sibling modules keeps report validation on the same
+    # transitive evidence and decision implementation as Task 4.
+    _load_sibling_module("candidate_evidence", "candidate_evidence.py")
+    return _load_sibling_module(
+        "_booleanrazor_report_check_promotion",
+        "check-promotion.py",
+    )
+
+
+def _claim_statement(row: dict[str, object]) -> str:
+    kind = row.get("claim_kind")
+    track = row.get("track")
+    status = row.get("status")
+    if not isinstance(kind, str) or not isinstance(track, str) or not isinstance(
+        status, str
+    ):
+        raise ModelError("claim policy tuple is incomplete")
+    statement = CLAIM_POLICY.get(kind, {}).get((track, status))
+    if statement is None:
+        raise ModelError(
+            f"claim policy forbids claim_kind={kind}, track={track}, status={status}"
+        )
+    return statement
+
+
+def _status_evidence_contract(
+    row: dict[str, object],
+    evidence: list[dict[str, object]],
+    label: str,
+    errors: list[str],
+) -> None:
+    status = row.get("status")
+    if status == "verified_main" and not any(
+        item.get("kind") == "path" and item.get("revision") == "main"
+        for item in evidence
+    ):
+        errors.append(f"{label} verified_main requires HEAD-bound path evidence")
+    if status == "verified_branch_only" and not any(
+        item.get("kind") == "commit"
+        and isinstance(item.get("revision"), str)
+        and HEX_40.fullmatch(item["revision"]) is not None
+        for item in evidence
+    ):
+        errors.append(
+            f"{label} verified_branch_only requires full-SHA commit evidence"
+        )
+
+
+def _validate_historical_official_proof(
+    row: dict[str, object],
+    evidence: list[dict[str, object]],
+    repo_root: Path,
+    label: str,
+    errors: list[str],
+) -> None:
+    track = row.get("track")
+    status = row.get("status")
+    if not isinstance(track, str) or not isinstance(status, str):
+        errors.append(
+            f"{label} has no ratified historical official provenance"
+        )
+        return
+    key = (track, status)
+    expected = HISTORICAL_OFFICIAL_PROOFS.get(key)
+    if expected is None:
+        errors.append(
+            f"{label} has no ratified historical official provenance"
+        )
+        return
+    proof = row.get("proof")
+    if not isinstance(proof, dict) or any(
+        proof.get(role) != "none" for role in CLAIM_PROOF_FIELDS
+    ):
+        errors.append(
+            f"{label} historical official provenance uses commit bindings, not current-HEAD proof roles"
+        )
+    bindings = {
+        (item.get("revision"), item.get("locator"))
+        for item in evidence
+        if item.get("kind") == "commit"
+    }
+    root = _absolute_lexical(repo_root)
+    for (revision, locator), digest in sorted(expected.items()):
+        if (revision, locator) not in bindings:
+            errors.append(
+                f"{label} requires ratified historical official provenance "
+                f"{revision}:{locator}"
+            )
+            continue
+        blob = _git_bytes(root, "cat-file", "blob", f"{revision}:{locator}")
+        if blob.returncode != 0 or hashlib.sha256(blob.stdout).hexdigest() != digest:
+            errors.append(
+                f"{label} ratified historical official provenance digest mismatch"
+            )
+
+
+def _validate_claim_proof(
+    row: dict[str, object],
+    evidence: list[dict[str, object]],
+    repo_root: Path,
+    verified_head_blobs: dict[str, bytes],
+    label: str,
+    errors: list[str],
+) -> dict[str, object] | None:
+    proof = row.get("proof")
+    if not _exact_keys(proof, CLAIM_PROOF_FIELDS, f"{label}.proof", errors):
+        return None
+    assert isinstance(proof, dict)
+    path_locators = {
+        item["locator"]
+        for item in evidence
+        if item.get("kind") == "path"
+        and isinstance(item.get("locator"), str)
+        and _safe_repo_locator(item["locator"])
+    }
+    resolved: dict[str, Path | None] = {}
+    role_locators: dict[str, str] = {}
+    root = _absolute_lexical(repo_root)
+    for role in sorted(CLAIM_PROOF_FIELDS):
+        locator = proof[role]
+        if locator == "none":
+            resolved[role] = None
+            continue
+        if not _safe_repo_locator(locator):
+            errors.append(
+                f"{label}.proof.{role} must be none or a safe repo-relative POSIX path"
+            )
+            resolved[role] = None
+            continue
+        assert isinstance(locator, str)
+        if locator not in path_locators:
+            errors.append(
+                f"{label}.proof.{role} must reference exact HEAD-bound path evidence"
+            )
+            resolved[role] = None
+            continue
+        if locator not in verified_head_blobs:
+            errors.append(
+                f"{label}.proof.{role} lacks verified pinned-HEAD bytes"
+            )
+            resolved[role] = None
+            continue
+        role_locators[role] = locator
+        resolved[role] = root.joinpath(*locator.split("/"))
+
+    def roles_match_pinned_head(stage: str) -> bool:
+        valid = True
+        for role, locator in sorted(role_locators.items()):
+            path = resolved[role]
+            assert path is not None
+            try:
+                current = _read_regular_without_symlinks(
+                    path,
+                    repo_root,
+                    f"{label}.proof.{role}",
+                )
+            except ModelError as exc:
+                errors.append(f"{label}.proof.{role} {stage}: {exc}")
+                valid = False
+                continue
+            if current != verified_head_blobs[locator]:
+                errors.append(
+                    f"{label}.proof.{role} changed from the pinned HEAD blob {stage}"
+                )
+                valid = False
+        return valid
+
+    if not roles_match_pinned_head("before proof replay"):
+        return None
+
+    official_path = resolved["official_record"]
+    if official_path is not None:
+        _validate_official_record(official_path, repo_root, errors)
+
+    decision_path = resolved["promotion_decision"]
+    request_path = resolved["promotion_request"]
+    policy_path = resolved["trust_policy"]
+    decision: dict[str, object] | None = None
+    decision_raw: bytes | None = None
+    if decision_path is not None:
+        try:
+            decision = _load_proof(
+                decision_path, repo_root, "promotion decision"
+            )
+            decision_locator = role_locators.get("promotion_decision")
+            if decision_locator is not None:
+                decision_raw = verified_head_blobs[decision_locator]
+        except ModelError as exc:
+            errors.append(f"{label} promotion decision: {exc}")
+        if row.get("claim_kind") == "sealed_promotion":
+            _validate_sealed_decision(decision_path, repo_root, errors)
+
+    if (decision_path is None) != (request_path is None):
+        errors.append(
+            f"{label} replayable promotion proof requires both promotion_decision and promotion_request"
+        )
+    if decision_path is None or request_path is None or decision_raw is None:
+        roles_match_pinned_head("after proof validation")
+        return decision
+
+    try:
+        task4 = _load_task4_module()
+        recomputed = task4.build_decision(request_path, policy_path)
+        recomputed_raw = canonical_evidence_json_bytes(recomputed)
+    except (
+        EvidenceError,
+        ModelError,
+        OSError,
+        TypeError,
+        ValueError,
+        KeyError,
+        ImportError,
+    ) as exc:
+        errors.append(f"{label} replayable promotion proof is invalid: {exc}")
+        roles_match_pinned_head("after proof replay")
+        return decision
+    if not roles_match_pinned_head("after proof replay"):
+        return decision
+    if decision_raw != recomputed_raw:
+        errors.append(
+            f"{label} promotion decision must equal the recomputed Task 4 decision byte for byte"
+        )
+        return decision
+    return recomputed
+
+
 def validate_project(
     project: dict[str, object], repo_root: Path
 ) -> list[str]:
     """Return deterministic diagnostics for one decoded project object."""
     errors: list[str] = []
+    head_oid = _resolve_head_oid(repo_root, errors)
+    verified_head_blobs: dict[str, bytes] = {}
     if not isinstance(project, dict):
         return ["project source must be an object with exact keys"]
     _forbidden_keys(project, "", errors)
@@ -673,37 +1119,31 @@ def validate_project(
                 errors.append(
                     f"{instance} must use {expected[1]} gates and function {expected[0]}"
                 )
-        _validate_evidence_list(row["evidence"], repo_root, f"{label}.evidence", errors)
+        evidence = _validate_evidence_list(
+            row["evidence"],
+            repo_root,
+            head_oid,
+            verified_head_blobs,
+            f"{label}.evidence",
+            errors,
+        )
+        _status_evidence_contract(row, evidence, label, errors)
     if seen_instances != set(CONTROL_GATES) or len(controls) != 4:
         errors.append("controls must contain each disclosed mystery-A through mystery-D once")
 
-    official_paths: dict[Path, bool] = {}
-    def evidence_and_proofs(
+    def evidence_for(
         row: dict[str, object], label: str
-    ) -> tuple[list[dict[str, object]], list[Path], list[Path]]:
+    ) -> list[dict[str, object]]:
         evidence = _validate_evidence_list(
-            row["evidence"], repo_root, f"{label}.evidence", errors
+            row["evidence"],
+            repo_root,
+            head_oid,
+            verified_head_blobs,
+            f"{label}.evidence",
+            errors,
         )
-        row_official_paths: list[Path] = []
-        row_promotion_paths: list[Path] = []
-        for item in evidence:
-            if item.get("kind") != "path" or not isinstance(item.get("locator"), str):
-                continue
-            locator = item["locator"]
-            if not _safe_repo_locator(locator):
-                continue
-            path = _absolute_lexical(repo_root).joinpath(*locator.split("/"))
-            name = PurePosixPath(locator).name
-            if name == "official-verification.json":
-                row_official_paths.append(path)
-                if path not in official_paths:
-                    official_paths[path] = _validate_official_record(
-                        path, repo_root, errors
-                    )
-            lowered = name.lower()
-            if "promotion" in lowered and "decision" in lowered:
-                row_promotion_paths.append(path)
-        return evidence, row_official_paths, row_promotion_paths
+        _status_evidence_contract(row, evidence, label, errors)
+        return evidence
 
     for index, row in enumerate(methods):
         label = f"methods[{index}]"
@@ -713,18 +1153,9 @@ def validate_project(
             errors.append(f"{label} has invalid status")
         for field in ("insights", "optimization", "stop_rules", "limitations"):
             _string_list(row[field], f"{label}.{field}", errors)
-        evidence, _, _ = evidence_and_proofs(row, label)
+        evidence = evidence_for(row, label)
         if row["status"] != "verified_main" and not row["limitations"]:
             errors.append(f"{label} limitation must not be empty")
-        if row["status"] == "verified_branch_only" and not any(
-            item.get("kind") == "commit"
-            and isinstance(item.get("revision"), str)
-            and HEX_40.fullmatch(item["revision"]) is not None
-            for item in evidence
-        ):
-            errors.append(
-                f"{label} verified_branch_only requires full-SHA commit evidence"
-            )
 
     for index, row in enumerate(experiments):
         label = f"experiments[{index}]"
@@ -741,22 +1172,20 @@ def validate_project(
         if not isinstance(row["status"], str) or row["status"] not in STATUSES:
             errors.append(f"{label} has invalid status")
         _string_list(row["limitations"], f"{label}.limitations", errors)
-        evidence, _, _ = evidence_and_proofs(row, label)
+        evidence = evidence_for(row, label)
         if row["status"] != "verified_main" and not row["limitations"]:
             errors.append(f"{label} limitation must not be empty")
-        if row["status"] == "verified_branch_only" and not any(
-            item.get("kind") == "commit"
-            and isinstance(item.get("revision"), str)
-            and HEX_40.fullmatch(item["revision"]) is not None
-            for item in evidence
+        if (
+            row["track"] == "sealed_confirmation"
+            and row["status"] == "verified_main"
         ):
             errors.append(
-                f"{label} verified_branch_only requires full-SHA commit evidence"
+                f"{label} cannot report verified_main sealed evidence without a sanitized authenticated attestation"
             )
 
     for index, row in enumerate(claims):
         label = f"claims[{index}]"
-        for field in ("claim_id", "summary"):
+        for field in ("claim_id", "claim_kind", "summary"):
             _nonempty_string(row[field], f"{label}.{field}", errors)
         if not isinstance(row["track"], str) or row["track"] not in TRACKS:
             errors.append(f"{label} has invalid track")
@@ -764,40 +1193,87 @@ def validate_project(
             errors.append(f"{label} has invalid status")
         _string_list(row["limitations"], f"{label}.limitations", errors)
         _string_list(row["missing_proof"], f"{label}.missing_proof", errors)
-        evidence, row_official_paths, row_promotion_paths = evidence_and_proofs(
-            row, label
-        )
+        evidence = evidence_for(row, label)
         if row["status"] != "verified_main" and not row["limitations"]:
             errors.append(f"{label} limitation must not be empty")
-        if row["status"] == "verified_branch_only" and not any(
-            item.get("kind") == "commit"
-            and isinstance(item.get("revision"), str)
-            and HEX_40.fullmatch(item["revision"]) is not None
-            for item in evidence
+        proof_decision = _validate_claim_proof(
+            row,
+            evidence,
+            repo_root,
+            verified_head_blobs,
+            label,
+            errors,
+        )
+        claim_kind = row.get("claim_kind")
+        if not isinstance(claim_kind, str) or claim_kind not in CLAIM_POLICY:
+            errors.append(f"{label} has unknown claim_kind")
+        else:
+            try:
+                _claim_statement(row)
+            except ModelError as exc:
+                errors.append(f"{label} {exc}")
+
+        if claim_kind == "historical_disclosed_julia_pass":
+            _validate_historical_official_proof(
+                row,
+                evidence,
+                repo_root,
+                label,
+                errors,
+            )
+
+        if claim_kind == "promotion_state":
+            if proof_decision is None:
+                errors.append(
+                    f"{label} promotion_state requires replayable promotion proof"
+                )
+            elif (
+                proof_decision.get("track") != row.get("track")
+                or proof_decision.get("decision") != row.get("status")
+            ):
+                errors.append(
+                    f"{label} promotion_state must match the recomputed Task 4 track and decision"
+                )
+
+        if (
+            row.get("status") == "verified_main"
+            and claim_kind in {"official_verifier_pass", "blind_advantage"}
         ):
             errors.append(
-                f"{label} verified_branch_only requires full-SHA commit evidence"
+                f"{label} positive current-head official or blind claims require a replayable promotion proof and a sanitized authenticated attestation"
+            )
+        proof = row.get("proof")
+        if (
+            claim_kind == "official_verifier_pass"
+            and row.get("status") == "verified_main"
+            and (
+                not isinstance(proof, dict)
+                or proof.get("official_record") == "none"
+            )
+        ):
+            errors.append(
+                f"{label} requires a canonical official-verification.json proof role"
             )
         if (
-            row["status"] == "verified_main"
-            and row["track"] == "sealed_confirmation"
-            and not any(
-                _validate_sealed_decision(path, repo_root, errors)
-                for path in row_promotion_paths
+            row.get("status") == "verified_main"
+            and (
+                row.get("track") == "sealed_confirmation"
+                or claim_kind == "sealed_promotion"
             )
         ):
             errors.append(
-                f"{label} verified_main sealed claim requires a canonical sealed promotion decision"
+                f"{label} positive sealed claims require a sanitized authenticated attestation"
             )
         if (
-            row["status"] == "verified_main"
-            and row["claim_id"] == "official-verifier-pass"
-            and not any(
-                official_paths.get(path, False) for path in row_official_paths
+            claim_kind == "sealed_promotion"
+            and row.get("status") == "verified_main"
+            and (
+                not isinstance(proof, dict)
+                or proof.get("promotion_decision") == "none"
             )
         ):
             errors.append(
-                f"{label} requires a canonical official-verification.json"
+                f"{label} requires a canonical sealed promotion decision proof role"
             )
 
     for index, row in enumerate(layers):
@@ -925,6 +1401,18 @@ def _html_page(
     ).encode("utf-8")
 
 
+def _authoritative_conclusion(project: dict[str, object]) -> str:
+    claims = project.get("claims")
+    if not isinstance(claims, list) or not claims:
+        raise ModelError("authoritative conclusion requires claim records")
+    statements = []
+    for row in claims:
+        if not isinstance(row, dict):
+            raise ModelError("authoritative conclusion requires valid claim records")
+        statements.append(_claim_statement(row))
+    return " ".join(statements)
+
+
 def _render_index(project: dict[str, object]) -> str:
     info = project["project"]
     assert isinstance(info, dict)
@@ -943,7 +1431,7 @@ def _render_index(project: dict[str, object]) -> str:
         if isinstance(row, dict)
     )
     blockers = "".join(
-        f"<li>{escape(str(row['summary']), quote=True)}</li>"
+        f"<li>{escape(_claim_statement(row), quote=True)}</li>"
         for row in claims
         if isinstance(row, dict) and row.get("status") in {"blocked", "absent"}
     )
@@ -953,7 +1441,9 @@ def _render_index(project: dict[str, object]) -> str:
         f"<p>{escape(str(info['purpose']), quote=True)}</p>"
         "</section>"
         "<section><h2>Current conclusion</h2>"
-        f"<p>{escape(str(info['conclusion']), quote=True)}</p></section>"
+        f"<p>{escape(_authoritative_conclusion(project), quote=True)}</p>"
+        "<p><small>Generated from structural claim policy; author narrative is not "
+        "used as verification evidence.</small></p></section>"
         '<section class="table-wrap"><h2>Disclosed controls</h2>'
         "<table><thead><tr><th>Instance</th><th>Function</th><th>Gates</th>"
         f"<th>Status</th><th>Boundary</th></tr></thead><tbody>{rows}</tbody></table>"
@@ -994,7 +1484,14 @@ def _render_methods(project: dict[str, object]) -> str:
             + _html_evidence_list(method["evidence"])
             + "</article>"
         )
-    return '<section class="hero"><h1>Methods</h1></section><div class="method-grid">' + "".join(cards) + "</div>"
+    return (
+        '<section class="hero"><h1>Methods</h1>'
+        "<p>Method notes describe process. Authoritative scientific status is "
+        "generated only from structural claim records in the evidence ledger.</p>"
+        '</section><div class="method-grid">'
+        + "".join(cards)
+        + "</div>"
+    )
 
 
 def _render_verification(project: dict[str, object]) -> str:
@@ -1023,7 +1520,8 @@ def _render_verification(project: dict[str, object]) -> str:
     return (
         '<section class="hero"><h1>Verification</h1>'
         "<p>Internal exhaustive equivalence and the official Julia verifier are "
-        "separate authorities.</p></section>"
+        "separate authorities. This layer inventory is explanatory; authoritative "
+        "result statements come only from structural claim records.</p></section>"
         '<section class="table-wrap"><table><thead><tr><th>Layer</th>'
         "<th>Authority</th><th>Meaning</th><th>Current state</th></tr></thead>"
         f"<tbody>{layer_rows}</tbody></table></section>"
@@ -1049,7 +1547,9 @@ def _render_experiments(project: dict[str, object]) -> str:
         if isinstance(row, dict)
     )
     return (
-        '<section class="hero"><h1>Experiments</h1></section>'
+        '<section class="hero"><h1>Experiments</h1>'
+        "<p>Outcomes and decisions are trace notes, not proof-bearing claims. "
+        "Authoritative result statements are generated from claim policy.</p></section>"
         '<section><button type="button" data-status-filter="all" '
         'aria-pressed="true">All</button></section>'
         '<section class="table-wrap"><table><thead><tr><th>Experiment</th>'
@@ -1125,7 +1625,9 @@ def _markdown_outputs(
     status = (
         header
         + "# Status\n\n"
-        + _markdown_text(info["conclusion"])
+        + _markdown_text(_authoritative_conclusion(project))
+        + "\n\n_Authoritative wording is generated from structural claim policy; "
+        "author narrative is not verification evidence._"
         + "\n\n## Disclosed controls\n\n"
         + "| Instance | Function | Gates | Status | Boundary |\n"
         + "| --- | --- | ---: | --- | --- |\n"
@@ -1173,7 +1675,7 @@ def _markdown_outputs(
         ledger_parts.extend(
             (
                 f"## {_markdown_text(row['claim_id'])}\n\n",
-                _markdown_text(row["summary"]) + "\n\n",
+                _markdown_text(_claim_statement(row)) + "\n\n",
                 "Evidence:\n\n",
                 "".join(
                     f"- {_markdown_evidence(item)}\n"

@@ -8,6 +8,7 @@ import os
 import subprocess
 import sys
 from pathlib import Path
+from types import ModuleType
 
 import pytest
 
@@ -40,6 +41,18 @@ def canonical(value: object) -> bytes:
     )
 
 
+def task4_canonical(value: object) -> bytes:
+    return (
+        json.dumps(
+            value,
+            allow_nan=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+        + b"\n"
+    )
+
+
 def git(root: Path, *args: str) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         ["git", "-C", str(root), *args],
@@ -56,6 +69,17 @@ def path_evidence(locator: str = "evidence/base.md") -> dict[str, str]:
         "locator": locator,
         "revision": "main",
     }
+
+
+def empty_claim_proof(**updates: str) -> dict[str, str]:
+    proof = {
+        "official_record": "none",
+        "promotion_decision": "none",
+        "promotion_request": "none",
+        "trust_policy": "none",
+    }
+    proof.update(updates)
+    return proof
 
 
 def commit_evidence(
@@ -92,9 +116,11 @@ def valid_project() -> dict[str, object]:
         "claims": [
             {
                 "claim_id": "blind-advantage",
+                "claim_kind": "blind_advantage",
                 "evidence": [path_evidence()],
                 "limitations": ["Public and sealed evaluations have not run."],
                 "missing_proof": ["Frozen visible and sealed results."],
+                "proof": empty_claim_proof(),
                 "status": "blocked",
                 "summary": "Blind advantage has not been demonstrated.",
                 "track": "blind_visible",
@@ -171,6 +197,19 @@ def project_repo(tmp_path: Path) -> tuple[Path, dict[str, object], Path]:
     (root / "evidence/base.md").write_text("evidence\n", encoding="utf-8")
     git(root.parent, "init", "-q", str(root))
     git(root, "add", "evidence/base.md")
+    git(
+        root,
+        "-c",
+        "user.name=BooleanRazor Tests",
+        "-c",
+        "user.email=tests@example.invalid",
+        "-c",
+        "commit.gpgsign=false",
+        "commit",
+        "-q",
+        "-m",
+        "fixture evidence",
+    )
     project = valid_project()
     source = root / "project.json"
     source.write_bytes(canonical(project))
@@ -228,6 +267,19 @@ def add_path(root: Path, project: dict[str, object], name: str, value: object) -
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(canonical(value))
     git(root, "add", name)
+    git(
+        root,
+        "-c",
+        "user.name=BooleanRazor Tests",
+        "-c",
+        "user.email=tests@example.invalid",
+        "-c",
+        "commit.gpgsign=false",
+        "commit",
+        "-q",
+        "-m",
+        f"add {name}",
+    )
     claim = project["claims"][0]
     assert isinstance(claim, dict)
     claim["evidence"] = [path_evidence(name)]
@@ -285,11 +337,13 @@ def test_invalid_project_cases(
     elif case == "forbidden-proposer-key":
         project["project"]["source_family"] = "private-generator"
     elif case == "blind-success-without-sealed-proof":
+        project["claims"][0]["claim_kind"] = "sealed_promotion"
         project["claims"][0]["track"] = "sealed_confirmation"
         project["claims"][0]["status"] = "verified_main"
         project["claims"][0]["limitations"] = []
         project["claims"][0]["missing_proof"] = []
     elif case == "official-pass-without-record":
+        project["claims"][0]["claim_kind"] = "official_verifier_pass"
         project["claims"][0]["status"] = "verified_main"
         project["claims"][0]["track"] = "disclosed_control"
         project["claims"][0]["limitations"] = []
@@ -373,8 +427,12 @@ def test_official_record_requires_exact_task3_schema_and_types(
     )
     project["claims"][0].update(
         {
+            "claim_kind": "official_verifier_pass",
             "limitations": [],
             "missing_proof": [],
+            "proof": empty_claim_proof(
+                official_record="evidence/official-verification.json"
+            ),
             "status": "verified_main",
             "track": "disclosed_control",
         }
@@ -396,8 +454,12 @@ def test_forged_minimal_official_record_is_not_proof(
     )
     project["claims"][0].update(
         {
+            "claim_kind": "official_verifier_pass",
             "limitations": [],
             "missing_proof": [],
+            "proof": empty_claim_proof(
+                official_record="evidence/official-verification.json"
+            ),
             "status": "verified_main",
             "track": "disclosed_control",
         }
@@ -424,8 +486,12 @@ def test_official_julia_version_digest_binds_the_exact_lf_terminated_text(
     )
     project["claims"][0].update(
         {
+            "claim_kind": "official_verifier_pass",
             "limitations": [],
             "missing_proof": [],
+            "proof": empty_claim_proof(
+                official_record="evidence/official-verification.json"
+            ),
             "status": "verified_main",
             "track": "disclosed_control",
         }
@@ -438,7 +504,7 @@ def test_official_julia_version_digest_binds_the_exact_lf_terminated_text(
         report_model.load_project(source, root)
 
 
-def test_valid_official_record_is_accepted(
+def test_shape_valid_official_record_without_replayable_package_is_rejected(
     project_repo: tuple[Path, dict[str, object], Path],
 ) -> None:
     root, project, source = project_repo
@@ -450,15 +516,19 @@ def test_valid_official_record_is_accepted(
     )
     project["claims"][0].update(
         {
+            "claim_kind": "official_verifier_pass",
             "limitations": [],
             "missing_proof": [],
+            "proof": empty_claim_proof(
+                official_record="evidence/official-verification.json"
+            ),
             "status": "verified_main",
             "track": "disclosed_control",
         }
     )
     write_source(source, project)
-    loaded, _ = report_model.load_project(source, root)
-    assert loaded["claims"][0]["status"] == "verified_main"
+    with pytest.raises(report_model.ModelError, match="replayable promotion proof"):
+        report_model.load_project(source, root)
 
 
 @pytest.mark.parametrize(
@@ -491,8 +561,12 @@ def test_sealed_success_requires_exact_positive_task4_decision(
     )
     project["claims"][0].update(
         {
+            "claim_kind": "sealed_promotion",
             "limitations": [],
             "missing_proof": [],
+            "proof": empty_claim_proof(
+                promotion_decision="evidence/promotion-decision.json"
+            ),
             "status": "verified_main",
             "track": "sealed_confirmation",
         }
@@ -502,7 +576,7 @@ def test_sealed_success_requires_exact_positive_task4_decision(
         report_model.load_project(source, root)
 
 
-def test_valid_sealed_decision_is_accepted(
+def test_shape_valid_sealed_decision_is_not_a_public_report_attestation(
     project_repo: tuple[Path, dict[str, object], Path],
 ) -> None:
     root, project, source = project_repo
@@ -514,14 +588,22 @@ def test_valid_sealed_decision_is_accepted(
     )
     project["claims"][0].update(
         {
+            "claim_kind": "sealed_promotion",
             "limitations": [],
             "missing_proof": [],
+            "proof": empty_claim_proof(
+                promotion_decision="evidence/promotion-decision.json"
+            ),
             "status": "verified_main",
             "track": "sealed_confirmation",
         }
     )
     write_source(source, project)
-    report_model.load_project(source, root)
+    with pytest.raises(
+        report_model.ModelError,
+        match="sanitized authenticated attestation",
+    ):
+        report_model.load_project(source, root)
 
 
 def test_blocked_claim_may_cite_a_canonical_blocked_promotion_decision(
@@ -573,6 +655,19 @@ def test_path_evidence_rejects_symlink_untracked_and_nonregular(
     root, project, source = project_repo
     (root / "evidence/link.md").symlink_to("base.md")
     git(root, "add", "evidence/link.md")
+    git(
+        root,
+        "-c",
+        "user.name=BooleanRazor Tests",
+        "-c",
+        "user.email=tests@example.invalid",
+        "-c",
+        "commit.gpgsign=false",
+        "commit",
+        "-q",
+        "-m",
+        "symlink fixture",
+    )
     project["methods"][0]["evidence"] = [path_evidence("evidence/link.md")]
     write_source(source, project)
     with pytest.raises(report_model.ModelError, match="symlink"):
@@ -587,7 +682,7 @@ def test_path_evidence_rejects_symlink_untracked_and_nonregular(
     (root / "evidence/directory").mkdir()
     project["methods"][0]["evidence"] = [path_evidence("evidence/directory")]
     write_source(source, project)
-    with pytest.raises(report_model.ModelError, match="regular file"):
+    with pytest.raises(report_model.ModelError, match="HEAD-tracked evidence path"):
         report_model.load_project(source, root)
 
 
@@ -601,10 +696,673 @@ def test_verified_branch_only_requires_commit_and_limitation(
     with pytest.raises(report_model.ModelError, match="full-SHA commit evidence"):
         report_model.load_project(source, root)
 
-    project["methods"][0]["evidence"].append(commit_evidence())
+    revision = git(root, "rev-parse", "HEAD").stdout.strip()
+    project["methods"][0]["evidence"].append(
+        commit_evidence(revision) | {"locator": "evidence/base.md"}
+    )
     write_source(source, project)
     loaded, _ = report_model.load_project(source, root)
     assert loaded["methods"][0]["status"] == "verified_branch_only"
+
+
+def test_branch_only_official_claim_rejects_arbitrary_commit_evidence(
+    project_repo: tuple[Path, dict[str, object], Path],
+) -> None:
+    root, project, source = project_repo
+    revision = git(root, "rev-parse", "HEAD").stdout.strip()
+    project["claims"][0].update(
+        {
+            "claim_kind": "historical_disclosed_julia_pass",
+            "evidence": [
+                commit_evidence(revision)
+                | {"locator": "evidence/base.md"}
+            ],
+            "limitations": [
+                "Historical disclosed-control verification only."
+            ],
+            "missing_proof": [],
+            "status": "verified_branch_only",
+            "track": "disclosed_control",
+        }
+    )
+    write_source(source, project)
+
+    with pytest.raises(
+        report_model.ModelError,
+        match="ratified historical official provenance",
+    ):
+        report_model.load_project(source, root)
+
+
+def test_branch_only_official_claim_accepts_only_closed_historical_binding(
+    project_repo: tuple[Path, dict[str, object], Path],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root, project, source = project_repo
+    revision = git(root, "rev-parse", "HEAD").stdout.strip()
+    digest = hashlib.sha256((root / "evidence/base.md").read_bytes()).hexdigest()
+    monkeypatch.setattr(
+        report_model,
+        "HISTORICAL_OFFICIAL_PROOFS",
+        {
+            ("disclosed_control", "verified_branch_only"): {
+                (revision, "evidence/base.md"): digest,
+            }
+        },
+        raising=False,
+    )
+    project["claims"][0].update(
+        {
+            "claim_kind": "historical_disclosed_julia_pass",
+            "evidence": [
+                commit_evidence(revision)
+                | {"locator": "evidence/base.md"}
+            ],
+            "limitations": [
+                "Historical disclosed-control verification only."
+            ],
+            "missing_proof": [],
+            "status": "verified_branch_only",
+            "track": "disclosed_control",
+        }
+    )
+    write_source(source, project)
+
+    loaded, _ = report_model.load_project(source, root)
+    assert loaded["claims"][0]["status"] == "verified_branch_only"
+    outputs = report_model.render_outputs(loaded, "a" * 64, "b" * 64)
+    assert (
+        b"not a fresh current-HEAD official verification or blind-learning evidence"
+        in outputs["research/EVIDENCE_LEDGER.md"]
+    )
+
+
+def test_historical_official_claim_with_malformed_track_returns_diagnostics(
+    project_repo: tuple[Path, dict[str, object], Path],
+) -> None:
+    root, project, source = project_repo
+    project["claims"][0].update(
+        {
+            "claim_kind": "historical_disclosed_julia_pass",
+            "status": "verified_branch_only",
+            "track": [],
+        }
+    )
+    write_source(source, project)
+
+    with pytest.raises(report_model.ModelError, match="invalid track"):
+        report_model.load_project(source, root)
+
+
+def test_claim_policy_rejects_unknown_kind_and_track_status_mismatch(
+    project_repo: tuple[Path, dict[str, object], Path],
+) -> None:
+    root, project, source = project_repo
+    project["claims"][0].update(
+        {
+            "claim_id": "anything-the-author-wants",
+            "claim_kind": "made_up_scientific_result",
+            "limitations": [],
+            "missing_proof": [],
+            "status": "verified_main",
+            "summary": "Official verifier pass proves a promoted blind result.",
+            "track": "blind_visible",
+        }
+    )
+    write_source(source, project)
+    with pytest.raises(report_model.ModelError, match="unknown claim_kind"):
+        report_model.load_project(source, root)
+
+    project["claims"][0].update(
+        {
+            "claim_kind": "blind_advantage",
+            "status": "verified_main",
+            "track": "blind_visible",
+        }
+    )
+    write_source(source, project)
+    with pytest.raises(report_model.ModelError, match="claim policy"):
+        report_model.load_project(source, root)
+
+
+def test_authoritative_claim_rendering_ignores_author_narrative(
+    project_repo: tuple[Path, dict[str, object], Path],
+) -> None:
+    root, project, source = project_repo
+    overstatement = "Official pass proves a promoted sealed blind result."
+    project["project"]["conclusion"] = overstatement
+    project["claims"][0]["summary"] = overstatement
+    write_source(source, project)
+    loaded, _ = report_model.load_project(source, root)
+
+    outputs = report_model.render_outputs(loaded, "a" * 64, "b" * 64)
+    assert overstatement.encode() not in outputs["reports/site/index.html"]
+    assert overstatement.encode() not in outputs["research/EVIDENCE_LEDGER.md"]
+    assert b"Blind advantage has not been demonstrated." in outputs[
+        "reports/site/index.html"
+    ]
+    assert b"Blind advantage has not been demonstrated." in outputs[
+        "research/EVIDENCE_LEDGER.md"
+    ]
+
+
+def test_verified_main_requires_current_head_bound_path_evidence(
+    project_repo: tuple[Path, dict[str, object], Path],
+) -> None:
+    root, project, source = project_repo
+    project["methods"][0]["evidence"] = [
+        {
+            "kind": "command",
+            "label": "command only",
+            "locator": "make test",
+            "revision": "none",
+        }
+    ]
+    write_source(source, project)
+    with pytest.raises(report_model.ModelError, match="HEAD-bound path evidence"):
+        report_model.load_project(source, root)
+
+
+def test_main_path_evidence_must_match_the_head_blob(
+    project_repo: tuple[Path, dict[str, object], Path],
+) -> None:
+    root, project, source = project_repo
+    (root / "evidence/base.md").write_text("modified after HEAD\n", encoding="utf-8")
+    write_source(source, project)
+    with pytest.raises(report_model.ModelError, match="match the HEAD blob"):
+        report_model.load_project(source, root)
+
+
+def test_main_path_evidence_checks_head_blob_size_before_materializing(
+    project_repo: tuple[Path, dict[str, object], Path],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root, _, source = project_repo
+    monkeypatch.setattr(report_model, "MAX_SOURCE_BYTES", 4)
+    with pytest.raises(report_model.ModelError, match="HEAD blob must not exceed 4"):
+        report_model.load_project(source, root)
+
+
+def test_git_replace_cannot_forge_head_path_evidence(
+    project_repo: tuple[Path, dict[str, object], Path],
+) -> None:
+    root, project, source = project_repo
+    original = git(root, "rev-parse", "HEAD").stdout.strip()
+    (root / "evidence/base.md").write_text("forged replacement\n", encoding="utf-8")
+    git(root, "add", "evidence/base.md")
+    git(
+        root,
+        "-c",
+        "user.name=BooleanRazor Tests",
+        "-c",
+        "user.email=tests@example.invalid",
+        "-c",
+        "commit.gpgsign=false",
+        "commit",
+        "-q",
+        "-m",
+        "forged replacement",
+    )
+    forged = git(root, "rev-parse", "HEAD").stdout.strip()
+    git(root, "update-ref", "HEAD", original)
+    git(root, "replace", original, forged)
+    assert (
+        git(root, "show", "HEAD:evidence/base.md").stdout
+        == "forged replacement\n"
+    )
+    write_source(source, project)
+
+    with pytest.raises(report_model.ModelError, match="match the HEAD blob"):
+        report_model.load_project(source, root)
+
+
+def test_inherited_git_dir_cannot_redirect_evidence_queries(
+    project_repo: tuple[Path, dict[str, object], Path],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root, _, source = project_repo
+    attacker = tmp_path / "attacker"
+    attacker.mkdir()
+    git(attacker.parent, "init", "-q", str(attacker))
+    (attacker / "unrelated.txt").write_text("unrelated\n", encoding="utf-8")
+    git(attacker, "add", "unrelated.txt")
+    git(
+        attacker,
+        "-c",
+        "user.name=BooleanRazor Tests",
+        "-c",
+        "user.email=tests@example.invalid",
+        "-c",
+        "commit.gpgsign=false",
+        "commit",
+        "-q",
+        "-m",
+        "attacker repository",
+    )
+    monkeypatch.setenv("GIT_DIR", str(attacker / ".git"))
+
+    loaded, _ = report_model.load_project(source, root)
+    assert loaded["schema_version"] == 1
+
+
+def test_staged_only_path_is_not_mainline_evidence(
+    project_repo: tuple[Path, dict[str, object], Path],
+) -> None:
+    root, project, source = project_repo
+    (root / "evidence/staged.md").write_text("staged only\n", encoding="utf-8")
+    git(root, "add", "evidence/staged.md")
+    project["methods"][0]["evidence"] = [path_evidence("evidence/staged.md")]
+    write_source(source, project)
+    with pytest.raises(report_model.ModelError, match="HEAD-tracked evidence path"):
+        report_model.load_project(source, root)
+
+
+def test_commit_evidence_requires_existing_commit_and_blob(
+    project_repo: tuple[Path, dict[str, object], Path],
+) -> None:
+    root, project, source = project_repo
+    project["methods"][0]["status"] = "verified_branch_only"
+    project["methods"][0]["limitations"] = ["Historical branch only."]
+    project["methods"][0]["evidence"] = [commit_evidence()]
+    write_source(source, project)
+    with pytest.raises(report_model.ModelError, match="existing Git commit"):
+        report_model.load_project(source, root)
+
+    revision = git(root, "rev-parse", "HEAD").stdout.strip()
+    project["methods"][0]["evidence"] = [
+        commit_evidence(revision) | {"locator": "evidence/missing.md"}
+    ]
+    write_source(source, project)
+    with pytest.raises(report_model.ModelError, match="blob at the exact commit"):
+        report_model.load_project(source, root)
+
+
+def test_commit_evidence_rejects_annotated_tag_object_id(
+    project_repo: tuple[Path, dict[str, object], Path],
+) -> None:
+    root, project, source = project_repo
+    git(
+        root,
+        "-c",
+        "user.name=BooleanRazor Tests",
+        "-c",
+        "user.email=tests@example.invalid",
+        "-c",
+        "tag.gpgsign=false",
+        "tag",
+        "-a",
+        "evidence-tag",
+        "-m",
+        "annotated evidence tag",
+    )
+    tag_oid = git(
+        root, "rev-parse", "refs/tags/evidence-tag"
+    ).stdout.strip()
+    assert git(root, "cat-file", "-t", tag_oid).stdout == "tag\n"
+    project["methods"][0]["status"] = "verified_branch_only"
+    project["methods"][0]["limitations"] = ["Historical branch only."]
+    project["methods"][0]["evidence"] = [
+        commit_evidence(tag_oid) | {"locator": "evidence/base.md"}
+    ]
+    write_source(source, project)
+
+    with pytest.raises(
+        report_model.ModelError,
+        match="exact Git commit object",
+    ):
+        report_model.load_project(source, root)
+
+
+def test_commit_evidence_accepts_exact_fetched_object_without_a_local_branch(
+    project_repo: tuple[Path, dict[str, object], Path],
+) -> None:
+    root, project, source = project_repo
+    tree = git(root, "write-tree").stdout.strip()
+    unreachable = git(
+        root,
+        "-c",
+        "user.name=BooleanRazor Tests",
+        "-c",
+        "user.email=tests@example.invalid",
+        "-c",
+        "commit.gpgsign=false",
+        "commit-tree",
+        tree,
+        "-m",
+        "unreachable evidence commit",
+    ).stdout.strip()
+    assert (
+        git(
+            root,
+            "for-each-ref",
+            f"--contains={unreachable}",
+            "--format=%(refname)",
+            "refs/heads",
+        ).stdout
+        == ""
+    )
+    project["methods"][0]["status"] = "verified_branch_only"
+    project["methods"][0]["limitations"] = ["Historical branch only."]
+    project["methods"][0]["evidence"] = [
+        commit_evidence(unreachable) | {"locator": "evidence/base.md"}
+    ]
+    write_source(source, project)
+
+    loaded, _ = report_model.load_project(source, root)
+    assert loaded == project
+
+
+def test_project_and_proof_reads_use_descriptor_anchored_stable_reader(
+    project_repo: tuple[Path, dict[str, object], Path],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root, _, source = project_repo
+
+    def unstable(*_args: object, **_kwargs: object) -> bytes:
+        raise report_model.EvidenceError("project source changed between reads")
+
+    monkeypatch.setattr(report_model, "read_stable_regular", unstable)
+    with pytest.raises(report_model.ModelError, match="changed between reads"):
+        report_model.load_project(source, root)
+
+
+def test_task4_replay_rejects_a_preloaded_foreign_module(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    foreign = ModuleType("_booleanrazor_report_check_promotion")
+    foreign.__file__ = "/tmp/foreign-check-promotion.py"
+    foreign.build_decision = lambda *_args, **_kwargs: {"decision": "blocked"}
+    monkeypatch.setitem(
+        sys.modules,
+        "_booleanrazor_report_check_promotion",
+        foreign,
+    )
+
+    loaded = report_model._load_task4_module()
+    assert Path(loaded.__file__).resolve() == (
+        SCRIPTS / "check-promotion.py"
+    ).resolve()
+
+
+def test_blocked_promotion_proof_is_recomputed_byte_for_byte(
+    project_repo: tuple[Path, dict[str, object], Path],
+) -> None:
+    root, project, source = project_repo
+    request = {
+        "candidate_evidence": "none",
+        "deterministic_pairs": "none",
+        "frozen_comparison": "none",
+        "official_verifications": "none",
+        "schema_version": 1,
+        "sealed_results": "none",
+        "track": "blind_visible",
+    }
+    decision = {
+        "decision": "blocked",
+        "highest_legal_next_step": "freeze_candidate",
+        "input_sha256": {
+            "promotion-request.json": hashlib.sha256(canonical(request)).hexdigest()
+        },
+        "reasons": [
+            "candidate_evidence_absent",
+            "deterministic_pairs_absent",
+            "frozen_comparison_absent",
+            "official_verifications_absent",
+        ],
+        "schema_version": 1,
+        "track": "blind_visible",
+    }
+    (root / "evidence/promotion-request.json").write_bytes(canonical(request))
+    (root / "evidence/promotion-decision.json").write_bytes(canonical(decision))
+    git(
+        root,
+        "add",
+        "evidence/promotion-request.json",
+        "evidence/promotion-decision.json",
+    )
+    git(
+        root,
+        "-c",
+        "user.name=BooleanRazor Tests",
+        "-c",
+        "user.email=tests@example.invalid",
+        "-c",
+        "commit.gpgsign=false",
+        "commit",
+        "-q",
+        "-m",
+        "promotion proof",
+    )
+    project["claims"][0].update(
+        {
+            "claim_kind": "promotion_state",
+            "evidence": [
+                path_evidence("evidence/promotion-request.json"),
+                path_evidence("evidence/promotion-decision.json"),
+            ],
+            "proof": empty_claim_proof(
+                promotion_decision="evidence/promotion-decision.json",
+                promotion_request="evidence/promotion-request.json",
+            ),
+            "summary": "Author-controlled text is not authoritative.",
+        }
+    )
+    write_source(source, project)
+    loaded, _ = report_model.load_project(source, root)
+    assert loaded["claims"][0]["claim_kind"] == "promotion_state"
+
+
+def test_proof_role_changed_during_replay_is_rejected_against_pinned_head(
+    project_repo: tuple[Path, dict[str, object], Path],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root, project, source = project_repo
+    request = {
+        "candidate_evidence": "none",
+        "deterministic_pairs": "none",
+        "frozen_comparison": "none",
+        "official_verifications": "none",
+        "schema_version": 1,
+        "sealed_results": "none",
+        "track": "blind_visible",
+    }
+    decision = {
+        "decision": "blocked",
+        "highest_legal_next_step": "freeze_candidate",
+        "input_sha256": {
+            "promotion-request.json": hashlib.sha256(
+                task4_canonical(request)
+            ).hexdigest()
+        },
+        "reasons": [
+            "candidate_evidence_absent",
+            "deterministic_pairs_absent",
+            "frozen_comparison_absent",
+            "official_verifications_absent",
+        ],
+        "schema_version": 1,
+        "track": "blind_visible",
+    }
+    request_path = root / "evidence/promotion-request.json"
+    decision_path = root / "evidence/promotion-decision.json"
+    request_path.write_bytes(task4_canonical(request))
+    decision_path.write_bytes(task4_canonical(decision))
+    git(
+        root,
+        "add",
+        "evidence/promotion-request.json",
+        "evidence/promotion-decision.json",
+    )
+    git(
+        root,
+        "-c",
+        "user.name=BooleanRazor Tests",
+        "-c",
+        "user.email=tests@example.invalid",
+        "-c",
+        "commit.gpgsign=false",
+        "commit",
+        "-q",
+        "-m",
+        "promotion proof for replacement race",
+    )
+    project["claims"][0].update(
+        {
+            "claim_kind": "promotion_state",
+            "evidence": [
+                path_evidence("evidence/promotion-request.json"),
+                path_evidence("evidence/promotion-decision.json"),
+            ],
+            "proof": empty_claim_proof(
+                promotion_decision="evidence/promotion-decision.json",
+                promotion_request="evidence/promotion-request.json",
+            ),
+        }
+    )
+    write_source(source, project)
+    task4 = report_model._load_task4_module()
+    original_build_decision = task4.build_decision
+
+    def mutate_after_replay(
+        replay_request: Path, replay_policy: Path | None
+    ) -> dict[str, object]:
+        result = original_build_decision(replay_request, replay_policy)
+        forged = dict(decision)
+        forged["reasons"] = ["changed_after_initial_validation"]
+        decision_path.write_bytes(task4_canonical(forged))
+        return result
+
+    monkeypatch.setattr(task4, "build_decision", mutate_after_replay)
+    with pytest.raises(
+        report_model.ModelError,
+        match="changed from the pinned HEAD blob after proof replay",
+    ):
+        report_model.load_project(source, root)
+
+
+def test_task4_replay_uses_task4_canonical_bytes_for_non_ascii_input_key(
+    project_repo: tuple[Path, dict[str, object], Path],
+) -> None:
+    root, project, source = project_repo
+    request = {
+        "candidate_evidence": "none",
+        "deterministic_pairs": "none",
+        "frozen_comparison": "none",
+        "official_verifications": ["验证.json"],
+        "schema_version": 1,
+        "sealed_results": "none",
+        "track": "blind_visible",
+    }
+    request_path = root / "evidence/promotion-request.json"
+    decision_path = root / "evidence/promotion-decision.json"
+    (root / "evidence/验证.json").write_bytes(
+        task4_canonical(official_record())
+    )
+    request_path.write_bytes(task4_canonical(request))
+    task4 = report_model._load_task4_module()
+    decision = task4.build_decision(request_path, None)
+    decision_path.write_bytes(task4_canonical(decision))
+    assert b"\\u9a8c\\u8bc1.json" in decision_path.read_bytes()
+    git(
+        root,
+        "add",
+        "evidence/验证.json",
+        "evidence/promotion-request.json",
+        "evidence/promotion-decision.json",
+    )
+    git(
+        root,
+        "-c",
+        "user.name=BooleanRazor Tests",
+        "-c",
+        "user.email=tests@example.invalid",
+        "-c",
+        "commit.gpgsign=false",
+        "commit",
+        "-q",
+        "-m",
+        "non-ASCII promotion input",
+    )
+    project["claims"][0].update(
+        {
+            "evidence": [
+                path_evidence(),
+                path_evidence("evidence/promotion-request.json"),
+                path_evidence("evidence/promotion-decision.json"),
+            ],
+            "proof": empty_claim_proof(
+                promotion_decision="evidence/promotion-decision.json",
+                promotion_request="evidence/promotion-request.json",
+            ),
+        }
+    )
+    write_source(source, project)
+
+    loaded, _ = report_model.load_project(source, root)
+    assert loaded["claims"][0]["status"] == "blocked"
+
+
+def test_forged_blocked_decision_cannot_match_recomputed_task4_result(
+    project_repo: tuple[Path, dict[str, object], Path],
+) -> None:
+    root, project, source = project_repo
+    request = {
+        "candidate_evidence": "none",
+        "deterministic_pairs": "none",
+        "frozen_comparison": "none",
+        "official_verifications": "none",
+        "schema_version": 1,
+        "sealed_results": "none",
+        "track": "blind_visible",
+    }
+    forged = {
+        "decision": "blocked",
+        "highest_legal_next_step": "freeze_candidate",
+        "input_sha256": {
+            "promotion-request.json": hashlib.sha256(canonical(request)).hexdigest()
+        },
+        "reasons": ["candidate_evidence_absent"],
+        "schema_version": 1,
+        "track": "blind_visible",
+    }
+    (root / "evidence/promotion-request.json").write_bytes(canonical(request))
+    (root / "evidence/promotion-decision.json").write_bytes(canonical(forged))
+    git(
+        root,
+        "add",
+        "evidence/promotion-request.json",
+        "evidence/promotion-decision.json",
+    )
+    git(
+        root,
+        "-c",
+        "user.name=BooleanRazor Tests",
+        "-c",
+        "user.email=tests@example.invalid",
+        "-c",
+        "commit.gpgsign=false",
+        "commit",
+        "-q",
+        "-m",
+        "forged promotion proof",
+    )
+    project["claims"][0].update(
+        {
+            "claim_kind": "promotion_state",
+            "evidence": [
+                path_evidence("evidence/promotion-request.json"),
+                path_evidence("evidence/promotion-decision.json"),
+            ],
+            "proof": empty_claim_proof(
+                promotion_decision="evidence/promotion-decision.json",
+                promotion_request="evidence/promotion-request.json",
+            ),
+        }
+    )
+    write_source(source, project)
+    with pytest.raises(report_model.ModelError, match="recomputed Task 4 decision"):
+        report_model.load_project(source, root)
 
 
 def test_validate_project_returns_sorted_unique_errors(
@@ -637,7 +1395,8 @@ def test_renderer_escapes_html_attributes_and_markdown_table_link_syntax() -> No
     outputs = report_model.render_outputs(project, "a" * 64, "b" * 64)
     index = outputs["reports/site/index.html"]
     assert b'<img src="https://attacker.invalid/x"' not in index
-    assert b"&lt;img src=&quot;https://attacker.invalid/x&quot;" in index
+    assert b"&lt;img src=&quot;https://attacker.invalid/x&quot;" not in index
+    assert b"Blind advantage has not been demonstrated." in index
 
     methods = outputs["docs/METHODS.md"]
     assert b"<b>unsafe" not in methods
