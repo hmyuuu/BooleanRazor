@@ -69,39 +69,3 @@ not a gate-optimization improvement or a minimality certificate. Future
 leaderboard entries must retain exact accuracy and report improvements against
 both the published reference where available and the first committed internal
 baseline.
-
-## Current public field
-
-As of 2026-07-28, the harness has no merged aggregate leaderboard and still
-defines ranking per instance. The following comparison covers the public
-scored solution artifacts found in open pull requests:
-
-- [Ranger PR #220](https://github.com/QuantumBFS/quantum.harness/pull/220)
-  reports 100% hidden-row accuracy and `37, 50, 167, 186` gates.
-- [lifeIsShort PR #213](https://github.com/QuantumBFS/quantum.harness/pull/213)
-  reports prediction hashes matching the organizer commitments and
-  `37, 50, 168, 225` gates.
-- The other open issue-71 registrations inspected did not publish complete
-  scored circuit artifacts.
-
-| Instance | BooleanRazor | Best competing public artifact | Provisional position |
-| --- | ---: | ---: | --- |
-| mystery-A | 37 | 37 | tied first |
-| mystery-B | 49 | 50 | first by 1 gate |
-| mystery-C | 168 | 167 | second by 1 gate |
-| mystery-D | 127 | 186 | first by 59 gates |
-
-All compared rows have matching full prediction commitments, so gate count is
-the relevant tie-break. BooleanRazor and Ranger are not mutually dominating:
-Ranger leads mystery-C, while BooleanRazor leads mystery-B and mystery-D.
-
-For orientation only, BooleanRazor's four-instance gate sum is 381, versus 440
-for Ranger and 480 for lifeIsShort. That is 59 gates (13.4%) below the
-strongest competing total, but the challenge does not define this sum as an
-official score.
-
-These positions are provisional. BooleanRazor is public but has not yet been
-submitted to the harness as a challenge pull request, and its fresh
-reproduction has not been run through the official Julia verifier. The next
-gate-optimization target is therefore mystery-C: 167 gates ties the current
-public best and 166 would lead every inspected instance.
