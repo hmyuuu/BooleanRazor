@@ -1202,6 +1202,9 @@ missing comparison cell -> blocked
 filtered terminal failure -> reject
 present terminal failure remains visible and blocks a positive decision
 candidate worse or equal under strict ordering -> no_change
+bit-accuracy-only improvement at equal exact accuracy -> no_change
+equal exact accuracy with fewer reachable gates -> positive track-bounded decision
+higher exact accuracy remains a strict improvement regardless of diagnostic bit accuracy
 sealed result missing either baseline method -> blocked
 path escape, absolute path, symlink, duplicate path -> reject
 identical inputs -> byte-identical decision
@@ -1352,13 +1355,13 @@ control-only.
 
 - [ ] **Step 6: Implement the track decisions**
 
-Use lexicographic accuracy-first comparison:
+Use the frozen accuracy-first comparison. Per-bit accuracy remains a reported
+diagnostic and cannot override the declared exact-row/gate selection rule:
 
 ```python
-def quality_key(candidate: CandidateEvidence) -> tuple[Decimal, Decimal, int]:
+def quality_key(candidate: CandidateEvidence) -> tuple[Decimal, int]:
     return (
         Decimal(candidate.visible_cv_exact),
-        Decimal(candidate.visible_cv_bit_accuracy),
         -candidate.gates,
     )
 ```
@@ -2289,8 +2292,9 @@ Its required workflow is:
 3. Create one fresh worktree and root LOG.md; never reuse a hypothesis tree.
 4. Write the strict failing test before changing the method.
 5. Preserve training consistency and exhaustive completed-table equivalence.
-6. Rank exact-row accuracy, bit accuracy, then reachable challenge-native
-   XAG gates; free negation never receives a gate.
+6. Apply the frozen design comparator: rank exact-row accuracy, then reachable
+   challenge-native XAG gates; report bit accuracy as diagnostic only. Free
+   negation never receives a gate.
 7. Treat SAT Timeout/Unknown as censored, never UNSAT.
 8. Keep OxiDD as an oracle, not the production learner.
 9. Run two fresh deterministic artifact builds.
