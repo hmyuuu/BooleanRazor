@@ -1,0 +1,1 @@
+{"decision":"blocked","highest_legal_next_step":"freeze_candidate","input_sha256":{"CURRENT_PROMOTION_REQUEST.json":"9a36720f064a7b123c23b2a5beb56d9809ff31b15a6cefe4303c684767b5ec99"},"reasons":["candidate_evidence_absent","deterministic_pairs_absent","frozen_comparison_absent","official_verifications_absent"],"schema_version":1,"track":"blind_visible"}
