@@ -1206,7 +1206,7 @@ bit-accuracy-only improvement at equal exact accuracy -> no_change
 equal exact accuracy with fewer reachable gates -> positive track-bounded decision
 higher exact accuracy remains a strict improvement regardless of diagnostic bit accuracy
 sealed result missing either baseline method -> blocked
-path escape, absolute path, symlink, duplicate path -> reject
+path escape, absolute path, symlink, duplicate path -> input error and no output
 identical inputs -> byte-identical decision
 existing output -> no overwrite
 committed current request -> byte-identical committed blocked decision
@@ -1258,6 +1258,11 @@ Load every path in `candidate_evidence` first through
 `load_terminal_manifest`. Load the candidate-bearing subset again through
 `load_candidate_manifest`; never discard or omit a terminal failure when
 checking the frozen design's `expected_ids`.
+
+Malformed requests and unsafe or duplicate paths are not scientific decisions.
+They exit `2` without creating an output. A canonical, safely loaded request
+whose evidence is stale, foreign, nondeterministic, or otherwise ineligible
+produces the bounded `reject` decision and an allowed reason code.
 
 - [ ] **Step 5: Implement common gates and deterministic pairing**
 
@@ -1331,8 +1336,20 @@ control_instance_set_mismatch
 prediction_commitment_mismatch
 ```
 
-Each deterministic pair must have equal `deterministic_fingerprint()` and
-byte-equal completed-table, circuit, and artifact-index content.
+The ordered deterministic pairs must be a perfect partition of all
+candidate-bearing manifests. Each endpoint appears exactly once; `left` is the
+canonical representative. Each pair must have equal
+`deterministic_fingerprint()` and byte-equal completed-table, circuit, and
+artifact-index content.
+
+Require exactly one official pass record for every `left` representative and
+no other record. Before constructing `VerificationBinding`, require exact
+agreement with that left candidate on `comparison_id`, `manifest_sha256`,
+`run_spec_sha256`, `circuit_sha256`, and `gates`. Pair byte identity carries
+the verification coverage to `right`. `dataset_sha256` is the independently
+bound official-verifier input digest; do not equate it to the candidate's
+completed-table digest. The disclosed-control gate below additionally binds it
+to the public prediction commitment.
 
 For `disclosed_control`, hard-code and verify the four public prediction
 commitments already tracked by the disclosed-v1 challenge:
