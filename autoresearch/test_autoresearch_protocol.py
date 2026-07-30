@@ -8,6 +8,7 @@ from pathlib import Path
 
 
 AUTORESEARCH = Path(__file__).parent
+REPO_ROOT = AUTORESEARCH.parent
 LOG_TEMPLATE = AUTORESEARCH / "LOG_TEMPLATE.md"
 README = AUTORESEARCH / "README.md"
 FORBIDDEN = {
@@ -84,10 +85,10 @@ class AutoresearchProtocolTests(unittest.TestCase):
     def test_readme_binds_worktree_and_three_role_firewall(self) -> None:
         text = README.read_text(encoding="utf-8")
         required = (
-            "git worktree add ../occam-exp-<opaque-id>",
-            "-b codex/occam-exp-<opaque-id> <accepted-commit>",
-            "LOG_TEMPLATE.md",
-            "../occam-exp-<opaque-id>/LOG.md",
+            'git worktree add "../booleanrazor-exp-${experiment_id}"',
+            '-b "codex/booleanrazor-exp-${experiment_id}" "$accepted_commit"',
+            "autoresearch/LOG_TEMPLATE.md",
+            '"../booleanrazor-exp-${experiment_id}/LOG.md"',
             "custodian",
             "proposer",
             "evaluator",
@@ -103,6 +104,58 @@ class AutoresearchProtocolTests(unittest.TestCase):
         )
         for phrase in required:
             self.assertIn(phrase, text)
+
+    def test_navigation_documents_route_evidence_and_verifier_work(self) -> None:
+        required = {
+            "AGENTS.md": (
+                "Current answer",
+                "Choose the activity",
+                "Choose the evidence track",
+                "Verification ladder",
+                "Promotion state machine",
+                "VERIFIER_NOT_RUN",
+                "absolute paths",
+                "make report-check",
+            ),
+            "README.md": (
+                "reports/site/index.html",
+                "Internal exhaustive equivalence",
+                "Official Julia verification",
+                "Blind advantage has not been demonstrated",
+            ),
+            "autoresearch/README.md": (
+                "autoresearch/LOG_TEMPLATE.md",
+                "child runs in its cell directory",
+                "absolute",
+            ),
+            "reblind/README.md": (
+                "learn-care",
+                "record-verification.py",
+                "freeze_candidate",
+                "promote_blind_result",
+            ),
+        }
+        for relative, phrases in required.items():
+            text = (REPO_ROOT / relative).read_text(encoding="utf-8")
+            for phrase in phrases:
+                with self.subTest(path=relative, phrase=phrase):
+                    self.assertIn(phrase, text)
+
+        active_examples = "\n".join(
+            (REPO_ROOT / relative).read_text(encoding="utf-8")
+            for relative in (
+                "AGENTS.md",
+                "README.md",
+                "autoresearch/README.md",
+                "reblind/README.md",
+            )
+        )
+        self.assertNotIn(
+            "tracks/qcs/solutions/hmyuuu/autoresearch/LOG_TEMPLATE.md",
+            active_examples,
+        )
+        self.assertNotIn("--experiment-id", active_examples)
+        self.assertNotIn("--results-root", active_examples)
 
     def test_recursive_bundle_scan_rejects_forbidden_metadata_surfaces(self) -> None:
         sealed_digest = "f" * 64

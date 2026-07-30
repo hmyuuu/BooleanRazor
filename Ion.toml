@@ -28,3 +28,5 @@ using-slurm = { type = "local" }
 cluster-jobs = { type = "local" }
 setup-cluster = { type = "local" }
 build-apptainer-image = { type = "local" }
+exact-circuit-optimization = { type = "local" }
+circuit-evidence-promotion = { type = "local" }

@@ -541,11 +541,6 @@ def classify_zero_exit(
         verifier = metrics["verifier"]
         if verifier not in {"pass", "fail", "not_run"}:
             raise ValidationError("metrics-json verifier is invalid")
-        if verifier == "fail":
-            return "VERIFIER_FAILED", 66, "fail", None
-        if verifier == "not_run":
-            return "VERIFIER_NOT_RUN", 67, "not_run", None
-
         train_exact = canonical_accuracy(metrics["train_exact"], "train_exact")
         if train_exact != "1.0":
             raise ValidationError("train_exact must equal 1.0")
@@ -606,10 +601,15 @@ def classify_zero_exit(
         if circuit_digest != actual_circuit:
             raise ValidationError("circuit digest binding mismatch")
         relative_artifact = artifact_path.relative_to(prepared.run_root).as_posix()
+        status, exit_code = {
+            "pass": ("SUCCESS", 0),
+            "fail": ("VERIFIER_FAILED", 66),
+            "not_run": ("VERIFIER_NOT_RUN", 67),
+        }[verifier]
         return (
-            "SUCCESS",
-            0,
-            "pass",
+            status,
+            exit_code,
+            verifier,
             CandidateEvidence(
                 train_exact=train_exact,
                 visible_cv_exact=visible_exact,

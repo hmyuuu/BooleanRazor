@@ -48,6 +48,11 @@ TERMINAL_STATES = {
     "CANCELLED",
     "MISSING_SUCCESS_MANIFEST",
 }
+CANDIDATE_EVIDENCE_STATES = {
+    "SUCCESS",
+    "VERIFIER_FAILED",
+    "VERIFIER_NOT_RUN",
+}
 FAILED_STATES = TERMINAL_STATES - {"SUCCESS"}
 SEALED_TOKENS = {
     "family",
@@ -594,8 +599,13 @@ def check_terminal_metrics(row: dict[str, str], label: str, errors: list[str]) -
     if status == "SUCCESS":
         if row.get("exit_code") != "0" or row.get("timed_out") != "false":
             errors.append(f"{label} SUCCESS has inconsistent process status")
+    if status == "TIMEOUT" and row.get("timed_out") != "true":
+        errors.append(f"{label} TIMEOUT must set timed_out=true")
+    if status != "TIMEOUT" and row.get("timed_out") != "false":
+        errors.append(f"{label} non-timeout failure sets timed_out")
+    if status in CANDIDATE_EVIDENCE_STATES:
         if not HEX_64.fullmatch(row.get("artifact_sha256", "")):
-            errors.append(f"{label} SUCCESS has invalid artifact hash")
+            errors.append(f"{label} candidate has invalid artifact hash")
         if row.get("train_exact") != "1.0":
             errors.append(f"{label} train_exact must equal 1.0")
         for field in ("visible_cv_exact", "visible_cv_bit_accuracy"):
@@ -621,10 +631,6 @@ def check_terminal_metrics(row: dict[str, str], label: str, errors: list[str]) -
         ):
             if row.get(field) != "none":
                 errors.append(f"{label} failed row must set {field}=none")
-        if status == "TIMEOUT" and row.get("timed_out") != "true":
-            errors.append(f"{label} TIMEOUT must set timed_out=true")
-        if status != "TIMEOUT" and row.get("timed_out") != "false":
-            errors.append(f"{label} non-timeout failure sets timed_out")
         elapsed_text = row.get("elapsed_seconds", "")
         if status == "TIMEOUT" and elapsed_text == "none":
             errors.append(f"{label} TIMEOUT must record the declared censored cap")
@@ -1166,14 +1172,14 @@ def check_native_artifacts(
     artifact_path = scalar_text(payload.get("artifact_path"))
     completed_digest = scalar_text(payload.get("completed_table_sha256"))
     circuit_digest = scalar_text(payload.get("circuit_sha256"))
-    if row.get("status") != "SUCCESS":
+    if row.get("status") not in CANDIDATE_EVIDENCE_STATES:
         for field, value in (
             ("artifact_path", artifact_path),
             ("completed_table_sha256", completed_digest),
             ("circuit_sha256", circuit_digest),
         ):
             if value != "none":
-                errors.append(f"{label} failed manifest must set {field}=none")
+                errors.append(f"{label} non-candidate manifest must set {field}=none")
         return
     cell_id = row.get("comparison_id", "")
     expected_artifact_path = f"cells/{cell_id}/artifact.json"
@@ -1181,9 +1187,9 @@ def check_native_artifacts(
         errors.append(f"{label} artifact_path is not the fixed in-cell index")
         return
     if not HEX_64.fullmatch(completed_digest or ""):
-        errors.append(f"{label} SUCCESS has invalid completed table digest")
+        errors.append(f"{label} candidate has invalid completed table digest")
     if not HEX_64.fullmatch(circuit_digest or ""):
-        errors.append(f"{label} SUCCESS has invalid circuit digest")
+        errors.append(f"{label} candidate has invalid circuit digest")
     cell = run / "cells" / cell_id
     artifact_raw = regular_bytes(cell / "artifact.json", f"{label} artifact.json", errors)
     if artifact_raw is None:

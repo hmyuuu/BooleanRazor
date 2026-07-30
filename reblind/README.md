@@ -92,10 +92,62 @@ This export reuses the importer validation, assigns rows by the documented
 SHA-256 round-robin ranking, and writes only the validated visible rows with a
 hash manifest. It never opens a custodian path or exposes hidden outputs.
 
+The production care-BDD learner uses that same importer and the frozen
+visible-only folds:
+
+```bash
+cargo run --locked --release --bin occam-circuit-hmyuuu -- \
+  learn-care "$PUBLIC_ROOT" "$OPAQUE_ID" "$OUTPUT_DIR" \
+  --folds 5 --seed "$ALGORITHM_SEED" --policy reuse-sibling \
+  --max-order-evals 32
+```
+
+`PUBLIC_ROOT` must be the absolute, reviewed content-addressed extraction;
+`OPAQUE_ID` must occur in the tracked manifest; `OUTPUT_DIR` must be a fresh
+absolute directory. The public archive is not currently mounted, so this
+command describes the frozen gate rather than a completed benchmark result.
+
 The committed manifest must contain 180 opaque rows and no family, generator,
 secret seed, label, complete-table, sealed-table, or evaluator-derived field.
 The accompanying baseline matrix contains exactly two frozen methods × those
 180 IDs and is committed atomically with this manifest and commitment.
+
+## Verification and promotion boundary
+
+Internal Rust equivalence is necessary but does not establish an official
+verifier pass. For a retained candidate, record the official Julia result
+against the exact manifest, circuit, dataset, run specification, verifier, and
+Julia version:
+
+```bash
+repo_root=$(git rev-parse --show-toplevel)
+"$repo_root/.venv/bin/python" "$repo_root/scripts/record-verification.py" \
+  --manifest "$MANIFEST" \
+  --julia-bin "$JULIA_BIN" \
+  --verify-jl "$VERIFY_JL" \
+  --dataset "$DATASET" \
+  --output "$OFFICIAL_RECORD"
+```
+
+All paths must be absolute, and the output must not already exist. The tool
+creates one immutable `official-verification.json`; it does not repair,
+overwrite, or upgrade runner evidence.
+
+Promotion is then computed from a canonical evidence request:
+
+```bash
+"$repo_root/.venv/bin/python" "$repo_root/scripts/check-promotion.py" \
+  --request "$PROMOTION_REQUEST" \
+  --output "$PROMOTION_DECISION"
+```
+
+A `blind_visible` request can reach at most `freeze_candidate`. It needs the
+frozen public comparison, deterministic candidate pairs, and matching official
+records. Only a separately frozen `sealed_confirmation` request with the
+authenticated aggregate custodian result can reach
+`promote_blind_result`. The committed visible request currently has none of
+those candidate inputs, so its decision is `blocked`; no public, frozen, or
+sealed result may be inferred from the manifest commitments alone.
 
 ## Reveal boundary
 

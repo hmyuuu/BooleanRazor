@@ -587,7 +587,9 @@ class RunExperimentTests(unittest.TestCase):
                 for field in runner.FAILED_QUALITY_FIELDS:
                     self.assertEqual(manifest[field], "none")
 
-    def test_verifier_fail_and_not_run_have_distinct_terminal_codes(self) -> None:
+    def test_verifier_fail_and_not_run_retain_valid_candidate_evidence(self) -> None:
+        table_digest = hashlib.sha256(TABLE_BYTES).hexdigest()
+        circuit_digest = hashlib.sha256(CIRCUIT_BYTES).hexdigest()
         for verifier, status, code in (
             ("fail", "VERIFIER_FAILED", 66),
             ("not_run", "VERIFIER_NOT_RUN", 67),
@@ -603,17 +605,18 @@ class RunExperimentTests(unittest.TestCase):
                 _, manifest = self.read_manifest(run_root)
                 self.assertEqual(manifest["status"], status)
                 self.assertEqual(manifest["verifier"], verifier)
-                for field in (
-                    "train_exact",
-                    "visible_cv_exact",
-                    "visible_cv_bit_accuracy",
-                    "gates",
-                    "completed_table_sha256",
-                    "circuit_sha256",
-                    "artifact_sha256",
-                    "artifact_path",
-                ):
-                    self.assertEqual(manifest[field], "none")
+                self.assertEqual(manifest["train_exact"], "1.0")
+                self.assertEqual(manifest["visible_cv_exact"], "0.75")
+                self.assertEqual(manifest["visible_cv_bit_accuracy"], "0.875")
+                self.assertEqual(manifest["gates"], "37")
+                self.assertEqual(manifest["completed_table_sha256"], table_digest)
+                self.assertEqual(manifest["circuit_sha256"], circuit_digest)
+                self.assertEqual(
+                    manifest["artifact_path"], "cells/cell-001/artifact.json"
+                )
+                self.assertRegex(
+                    str(manifest["artifact_sha256"]), r"^[0-9a-f]{64}$"
+                )
 
     def test_integer_digit_limit_metrics_terminalize_as_invalid(self) -> None:
         run_root, metrics_path = self.write_run_spec("2")

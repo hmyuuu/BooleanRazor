@@ -1074,6 +1074,30 @@ git commit -m "feat: bind official verification to candidate evidence"
 - Produces decision keys:
   `schema_version`, `track`, `decision`, `highest_legal_next_step`, `reasons`,
   `input_sha256`.
+- Positive `disclosed_control`, `synthetic`, `blind_visible`, and
+  `sealed_confirmation` decisions additionally require the separately supplied
+  canonical CLI input `--trust-policy PATH` (it is not a request field):
+
+```json
+{"frozen_comparison_sha256":"<64 lowercase hex>","official_verifications":[{"comparison_id":"<left id>","sha256":"<64 lowercase hex>"}],"request_sha256":"<64 lowercase hex>","schema_version":1,"sealed_results_sha256":"none"}
+```
+
+`official_verifications` is a nonempty unique set by `comparison_id` and must
+exactly equal the request's one-record-per-pair-left set, binding each record's
+raw canonical bytes. `frozen_comparison_sha256` binds the raw frozen comparison;
+`request_sha256` binds the exact canonical request bytes and prevents replay
+across tracks or request variants. `sealed_results` is literal `none` outside
+`sealed_confirmation` and is rejected before any path resolution. For
+`sealed_confirmation`, `sealed_results_sha256` must be lowercase HEX64 and bind
+the raw sealed result; for every nonsealed track it must be exactly `"none"`.
+Every `input_sha256` entry comes from the exact raw bytes returned by the
+canonical validator that supplied the parsed object. The decision records the policy digest as
+`input_sha256.external_trust_policy`. The policy is an externally selected
+operator/custodian precommit: this checker verifies only byte bindings and does
+not authenticate the operator, establish selection, prove chronology, or make
+a cryptographic-authentication claim. `external_trust_policy` is a reserved
+digest-map key; reject a request filename or evidence-relative path that would
+collide with it.
 - Production types are:
 
 ```python
@@ -1202,8 +1226,11 @@ missing comparison cell -> blocked
 filtered terminal failure -> reject
 present terminal failure remains visible and blocks a positive decision
 candidate worse or equal under strict ordering -> no_change
+bit-accuracy-only improvement at equal exact accuracy -> no_change
+equal exact accuracy with fewer reachable gates -> positive track-bounded decision
+higher exact accuracy remains a strict improvement regardless of diagnostic bit accuracy
 sealed result missing either baseline method -> blocked
-path escape, absolute path, symlink, duplicate path -> reject
+path escape, absolute path, symlink, duplicate path -> input error and no output
 identical inputs -> byte-identical decision
 existing output -> no overwrite
 committed current request -> byte-identical committed blocked decision
@@ -1255,6 +1282,11 @@ Load every path in `candidate_evidence` first through
 `load_terminal_manifest`. Load the candidate-bearing subset again through
 `load_candidate_manifest`; never discard or omit a terminal failure when
 checking the frozen design's `expected_ids`.
+
+Malformed requests and unsafe or duplicate paths are not scientific decisions.
+They exit `2` without creating an output. A canonical, safely loaded request
+whose evidence is stale, foreign, nondeterministic, or otherwise ineligible
+produces the bounded `reject` decision and an allowed reason code.
 
 - [ ] **Step 5: Implement common gates and deterministic pairing**
 
@@ -1326,10 +1358,26 @@ sealed_baseline_incomplete
 frozen_comparison_digest_mismatch
 control_instance_set_mismatch
 prediction_commitment_mismatch
+native_run_incomplete
+comparison_projection_mismatch
+external_trust_policy_absent
+external_trust_policy_mismatch
 ```
 
-Each deterministic pair must have equal `deterministic_fingerprint()` and
-byte-equal completed-table, circuit, and artifact-index content.
+The ordered deterministic pairs must be a perfect partition of all
+candidate-bearing manifests. Each endpoint appears exactly once; `left` is the
+canonical representative. Each pair must have equal
+`deterministic_fingerprint()` and byte-equal completed-table, circuit, and
+artifact-index content.
+
+Require exactly one official pass record for every `left` representative and
+no other record. Before constructing `VerificationBinding`, require exact
+agreement with that left candidate on `comparison_id`, `manifest_sha256`,
+`run_spec_sha256`, `circuit_sha256`, and `gates`. Pair byte identity carries
+the verification coverage to `right`. `dataset_sha256` is the independently
+bound official-verifier input digest; do not equate it to the candidate's
+completed-table digest. The disclosed-control gate below additionally binds it
+to the public prediction commitment.
 
 For `disclosed_control`, hard-code and verify the four public prediction
 commitments already tracked by the disclosed-v1 challenge:
@@ -1352,13 +1400,13 @@ control-only.
 
 - [ ] **Step 6: Implement the track decisions**
 
-Use lexicographic accuracy-first comparison:
+Use the frozen accuracy-first comparison. Per-bit accuracy remains a reported
+diagnostic and cannot override the declared exact-row/gate selection rule:
 
 ```python
-def quality_key(candidate: CandidateEvidence) -> tuple[Decimal, Decimal, int]:
+def quality_key(candidate: CandidateEvidence) -> tuple[Decimal, int]:
     return (
         Decimal(candidate.visible_cv_exact),
-        Decimal(candidate.visible_cv_bit_accuracy),
         -candidate.gates,
     )
 ```
@@ -1388,7 +1436,12 @@ Sort all reason codes. `highest_legal_next_step` is always
 `TRACK_CEILINGS[track]`, even for `blocked`, `reject`, or `no_change`.
 `input_sha256` is a sorted object containing the request digest and each
 resolved input's digest keyed by its request-relative path. Do not include a
-timestamp, hostname, absolute path, or environment value.
+timestamp, hostname, absolute path, or environment value. A sealed positive
+requires one uniform outcome: `matched_100x_against` equals both frozen
+baselines and `scaling_advantage_against` is empty, or the scaling set equals
+both baselines and the `100×` set is empty. A one-baseline/one-baseline hybrid
+is `sealed_baseline_incomplete`. The declared `baseline_methods` must also
+equal the `method` set read from the frozen baseline manifests.
 
 - [ ] **Step 7: Run the promotion tests**
 
@@ -1430,6 +1483,7 @@ Generate into a temporary directory and compare:
 
 ```bash
 promotion_tmp=$(mktemp -d)
+promotion_tmp=$(cd "$promotion_tmp" && pwd -P)
 uv run --default-index https://pypi.org/simple python \
   scripts/check-promotion.py \
   --request research/CURRENT_PROMOTION_REQUEST.json \
@@ -1523,8 +1577,12 @@ EXPERIMENT_FIELDS = {
     "decision", "limitations", "evidence",
 }
 CLAIM_FIELDS = {
-    "claim_id", "track", "status", "summary", "evidence", "limitations",
-    "missing_proof",
+    "claim_id", "claim_kind", "track", "status", "summary", "evidence",
+    "limitations", "missing_proof", "proof",
+}
+CLAIM_PROOF_FIELDS = {
+    "official_record", "promotion_decision", "promotion_request",
+    "trust_policy",
 }
 LAYER_FIELDS = {
     "layer_id", "title", "authority", "meaning", "current_state", "command",
@@ -1607,19 +1665,35 @@ CONTROL_GATES = {
 Every evidence reference has uniform keys. Enforce:
 
 ```text
-kind=path    -> revision=main, locator is a Git-tracked existing regular file
-kind=commit  -> revision is one lowercase 40-hex SHA, locator is safe relative
+kind=path    -> revision=main, locator is an exact current-HEAD blob and the
+                stable worktree bytes equal that blob
+kind=commit  -> revision is an existing lowercase 40-hex commit and locator is
+                an exact blob at that commit
 kind=command -> revision=none, locator is one nonempty command string
 kind=test    -> revision=main, locator is one nonempty test selector
 kind=url     -> revision=none, locator is an https URL without credentials
 ```
 
 Require all non-`verified_main` claims, methods, and experiments to have a
-nonempty limitation. Reject a `verified_main` sealed-confirmation claim unless
-its evidence includes a tracked path to a canonical sealed promotion decision.
-Reject a `verified_main` summary that claims official-verifier pass unless its
-path evidence includes a canonical `official-verification.json` with
-`status="pass"`.
+nonempty limitation. Every `verified_main` row requires current-HEAD path
+evidence; every `verified_branch_only` row requires an existing commit/blob
+reference. Define a closed `CLAIM_POLICY` keyed by
+`(claim_kind, track, status)`, render only its canonical statement as
+authoritative, and treat `claim_id`/`summary` as non-authoritative metadata.
+
+Proof roles must name exact path-evidence locators. Recompute any cited
+promotion decision through Task 4 and compare canonical bytes exactly. Reject
+shape-only official/sealed credentials. The current repository may report a
+replayed blocked blind-visible decision and a historical branch-bound
+disclosed-control Julia result. The latter uses only the closed
+`historical_disclosed_julia_pass` binding to
+`41518ce876b9c2a5939a525e538473165765203c:LOG.md` and its exact blob digest.
+It must reject positive current-head official, blind, or sealed claims until a
+complete replayable package and a separately designed sanitized authenticated
+public attestation exist. Git validation disables replacement refs and
+inherited `GIT_*` repository/object overrides, pins one HEAD OID, bounds blobs
+before reading, and accepts fetched exact historical commit objects without
+requiring developer-local branch names.
 
 - [ ] **Step 4: Run schema tests**
 
@@ -1668,9 +1742,22 @@ Expected: import or subprocess failure because
 
 ```python
 project, digest = report_model.load_project(source, repo_root)
-generator_digest = hashlib.sha256(
-    (repo_root / "scripts/report_model.py").read_bytes()
-).hexdigest()
+component_bytes = read_stable_regular_generator_components(
+    repo_root,
+    (
+        "scripts/evidence_io.py",
+        "scripts/candidate_evidence.py",
+        "scripts/check-promotion.py",
+        "scripts/report_model.py",
+    ),
+)
+generator_digest = independently_frame_and_hash(component_bytes)
+assert generator_digest == report_model.report_generator_digest(
+    component_bytes["scripts/report_model.py"],
+    component_bytes["scripts/evidence_io.py"],
+    component_bytes["scripts/candidate_evidence.py"],
+    component_bytes["scripts/check-promotion.py"],
+)
 expected = report_model.render_outputs(project, digest, generator_digest)
 ```
 
@@ -1680,19 +1767,30 @@ library `HTMLParser` subclass, and enforce:
 
 ```text
 all local href/src targets exist
+all same-page and cross-page fragments resolve
 no http(s) stylesheet or script src
+inline SVG is rejected
 one meta viewport
-one skip link
-one main landmark
-CSS contains @media print and :focus-visible
+one skip link targeting the sole main landmark
+one main landmark and no duplicate fragment IDs
+effective comment-stripped CSS contains @media print and a nonzero visible
+  :focus-visible style
+CSS escapes/imports/alternate loaders/remote tokens are rejected
+report.js equals the independently fixed safe script byte for byte
+the checker-owned canonical ten-path set equals OUTPUT_PATHS and rendered keys
 each HTML and generated Markdown file contains the project source digest
-each HTML and generated Markdown file contains the report-model digest
+each HTML and generated Markdown file contains the four-component report-generator digest
 each generated Markdown file begins <!-- GENERATED; DO NOT EDIT
 ```
 
-The CLI accepts optional `--source` and `--repo-root`, defaulting to
-`reports/data/project.json` and the repository root. It prints sorted errors to
-stderr and exits `1`, or prints
+The checker accepts only the canonical
+`reports/data/project.json`, securely pins all four executable generator
+components before import, verifies their canonical repository identities,
+independently recomputes their domain-separated, named, length-framed digest,
+and reads all evidence and generated
+content through descriptor-anchored stable-file primitives. The CLI accepts
+optional `--source` and `--repo-root` flags for their canonical values. It
+prints sorted errors to stderr and exits `1`, or prints
 `deliverable check: pass (10 generated files)` and exits `0`.
 
 - [ ] **Step 8: Run checker tests and commit the model**
@@ -1740,12 +1838,66 @@ git commit -m "feat: validate canonical deliverable evidence"
 **Interfaces:**
 - Consumes the schema frozen in Task 5 and the current blocked promotion
   request/decision from Task 4.
+- Extends the canonical source with an append-only `research_rounds` lineage.
+  This is the actual evidence-backed trace of executed research rounds, not a
+  conceptual method diagram or a reconstructed leaderboard.
 - Produces one deterministic `dict[str, bytes]` with ten generated files and
   no filesystem-dependent ordering, timestamp, absolute path, or environment
   value.
 - CLI:
-  `python scripts/build-report.py --source reports/data/project.json
+  `.venv/bin/python scripts/build-report.py --source reports/data/project.json
   --repo-root .`.
+
+Each exact round record contains:
+
+```text
+round_id
+parent_round_ids
+round_index
+title
+branch
+base_revision
+result_revision
+track
+status
+turning_point
+hypothesis
+independent_variable
+permitted_data
+frozen_controls
+runs
+outcome
+decision
+insight
+limitations
+next_pivot
+evidence
+```
+
+Each `runs` item has exact keys `run_id`, `status`, `classification`,
+`outcome`, and `evidence`. Require one root with no parents, unique contiguous
+positive indexes, prior existing parents, no duplicate/self edges or cycles,
+strict Boolean turning-point flags, full revision bindings, and the existing
+evidence/limitation rules. Multiple parents preserve the real Care-BDD/SAT
+integration and TN refresh merges. Preserve failed, timed-out, invalid, equal,
+rejected, and superseded observations inside their rounds.
+
+The executed lineage contains exactly the evidence-backed rounds R01–R11:
+disclosed-v1 control; blind protocol; care-BDD; bounded SAT; integration and
+scheduler audit; fair-order R1; GreedyExactConflict R1; ProjectedSupportBDD R2;
+TN pilot; historical disclosed-v1 Julia; and deliverability/promotion
+infrastructure. ProjectedSupportBDD R2 is the current internal tracked-formula
+synthetic frontier (`104857/104857`, 72 gates), never a public, blind, sealed,
+external, or global SOTA result. Public baseline, visible-blind, and sealed
+studies remain future gates outside the executed lineage.
+
+The landing page renders a compact static lineage. The experiments page
+renders the complete round and run records: hypothesis, independent variable,
+permitted data, frozen controls, outcomes, decisions, insights, limitations,
+next pivots, and evidence. Highlight a turning point only when the recorded
+decision changed the next research direction. Keep the never-executed public
+and sealed studies in the blocker/next-gate section, outside the executed
+trajectory.
 
 - [ ] **Step 1: Write renderer tests before renderer code**
 
@@ -1842,7 +1994,7 @@ def html_page(
         f'  <main id="content">{body}</main>\n'
         "  <footer>"
         f"Evidence source SHA-256: <code>{source_digest}</code>; "
-        f"report model SHA-256: <code>{generator_digest}</code>"
+        f"report generator SHA-256: <code>{generator_digest}</code>"
         "</footer>\n"
         '  <script src="assets/report.js"></script>\n'
         "</body>\n"
@@ -1984,7 +2136,7 @@ for (const button of document.querySelectorAll("[data-status-filter]")) {
 Every Markdown file begins:
 
 ```markdown
-<!-- GENERATED; DO NOT EDIT. Source: reports/data/project.json SHA-256: {source_digest}; report model SHA-256: {generator_digest} -->
+<!-- GENERATED; DO NOT EDIT. Source: reports/data/project.json SHA-256: {source_digest}; report generator SHA-256: {generator_digest} -->
 ```
 
 Render:
@@ -2046,6 +2198,7 @@ bounded-sat             verified_main (tool evidence scope)
 oxidd-oracle            verified_main (oracle-only scope)
 bounded-runner          verified_main
 official-julia-wrapper  verified_main (wrapper infrastructure)
+projected-support-bdd   verified_branch_only
 tensor-network-pilot    verified_branch_only
 ```
 
@@ -2059,6 +2212,8 @@ fair-order-r1            rejected
   d019a3dc3d5afe1aef76a25f266afe27f9d66c6e
 greedy-conflict-r1       verified_branch_only
   7ac3c3ba2430ed787bab5ca215c259e259fa1fb5
+projected-support-r2     verified_branch_only
+  8f6eda40e089a12faa8df3827207024afd719865
 tn-pilot                 verified_branch_only
   96429f981170766575fd167713a528078f297d67
 public-baselines         blocked
@@ -2069,9 +2224,13 @@ sealed-confirmation      absent
 Record the fair scheduler as deterministic but tied and rejected. Record
 GreedyExactConflict as synthetic `36084 -> 34917` gates with exact-row CV
 still `0 / 104857`, advancing only to public-candidate consideration. Record
-TN as a deterministic synthetic pipeline only. Record the Julia run as
-historical disclosed-v1 evidence bound to its branch source, not a fresh
-current-HEAD record.
+ProjectedSupportBDD R2 as the internal tracked-formula synthetic frontier:
+two executable-bound repeats at `104857 / 104857` exact rows and 72 gates
+against the matched 34,917-gate, zero-exact R1 control. Preserve its three
+superseded pilot cells and two rejected preflights. Do not describe it as
+public, blind, sealed, external, or global SOTA. Record TN as a deterministic
+synthetic pipeline only. Record the Julia run as historical disclosed-v1
+evidence bound to its branch source, not a fresh current-HEAD record.
 
 Claims must explicitly state:
 
@@ -2122,7 +2281,7 @@ cargo run --locked --all-features --release \
   --max-cut-inputs 6 --deadline-seconds 285 \
   --metrics-json "$OUTPUT_DIR/metrics.json"
 
-python "$REPO_ROOT/scripts/run-experiment.py" \
+"$REPO_ROOT/.venv/bin/python" "$REPO_ROOT/scripts/run-experiment.py" \
   --run-root "$RUN_ROOT" --cell-id "$CELL_ID" \
   --metrics-json "$RUN_ROOT/cells/$CELL_ID/metrics.json" -- \
   "$REPO_ROOT/target/release/occam-circuit-hmyuuu" \
@@ -2134,12 +2293,12 @@ python "$REPO_ROOT/scripts/run-experiment.py" \
   "$JULIA_BIN" "$VERIFY_JL" "$CIRCUIT" "$DATASET" \
   "$EXPECTED_GATES" "$INSTANCE"
 
-python "$REPO_ROOT/scripts/record-verification.py" \
+"$REPO_ROOT/.venv/bin/python" "$REPO_ROOT/scripts/record-verification.py" \
   --manifest "$MANIFEST" --julia-bin "$JULIA_BIN" \
   --verify-jl "$VERIFY_JL" --dataset "$DATASET" \
   --output "$OFFICIAL_RECORD"
 
-python "$REPO_ROOT/scripts/check-promotion.py" \
+"$REPO_ROOT/.venv/bin/python" "$REPO_ROOT/scripts/check-promotion.py" \
   --request "$PROMOTION_REQUEST" --output "$PROMOTION_DECISION"
 
 make report
@@ -2156,13 +2315,21 @@ use = structured-content/static-render information architecture reference
   only; no source, style, result, circuit, or claim copied
 ```
 
+The landing page renders every validated external reference in a final
+`Report design references` section with its exact adaptation-only use note.
+These links are citations, not runtime dependencies; the generated site still
+loads only its local CSS and JavaScript.
+
 - [ ] **Step 7: Implement the build CLI and report README**
 
 `scripts/build-report.py` must parse `--source` and `--repo-root`, call
-`load_project`, hash exact `scripts/report_model.py` bytes, pass both digests
-to `render_outputs`, reject a symlink or non-directory parent, and atomically
-replace each generated regular file only after all output bytes have been
-computed. It prints generated paths in sorted order.
+`load_project`, securely load and revalidate exact regular-file bytes for
+`scripts/evidence_io.py`, `scripts/candidate_evidence.py`,
+`scripts/check-promotion.py`, and `scripts/report_model.py`, bind them into the
+same domain-separated named/length-framed report-generator digest, pass both
+digests to `render_outputs`, reject a symlink or non-directory parent, and
+atomically replace each generated regular file only after all output bytes have
+been computed. It prints generated paths in sorted order.
 
 `reports/README.md` contains:
 
@@ -2176,7 +2343,7 @@ hand.
 ```bash
 make report
 make report-check
-python3 -m http.server 8765 --directory reports/site
+.venv/bin/python -m http.server 8765 --directory reports/site
 ```
 
 The report is offline-first: it uses no CDN, tracker, external font, runtime
@@ -2289,8 +2456,9 @@ Its required workflow is:
 3. Create one fresh worktree and root LOG.md; never reuse a hypothesis tree.
 4. Write the strict failing test before changing the method.
 5. Preserve training consistency and exhaustive completed-table equivalence.
-6. Rank exact-row accuracy, bit accuracy, then reachable challenge-native
-   XAG gates; free negation never receives a gate.
+6. Apply the frozen design comparator: rank exact-row accuracy, then reachable
+   challenge-native XAG gates; report bit accuracy as diagnostic only. Free
+   negation never receives a gate.
 7. Treat SAT Timeout/Unknown as censored, never UNSAT.
 8. Keep OxiDD as an oracle, not the production learner.
 9. Run two fresh deterministic artifact builds.
@@ -2471,7 +2639,8 @@ Use exactly these top-level sections:
 
 ```text
 Verified main: disclosed controls and exact core/infrastructure.
-Verified branch-only: historical v1 Julia run, GreedyExactConflict, TN pilot.
+Verified branch-only: historical v1 Julia run, GreedyExactConflict,
+ProjectedSupportBDD R2, TN pilot.
 Rejected: fair scheduler as a quality improvement.
 Blocked/absent: public baseline results, visible freeze, sealed confirmation,
 and blind advantage.
@@ -2786,7 +2955,7 @@ report freshness passes
 Start a local static server:
 
 ```bash
-python3 -m http.server 8765 --directory reports/site
+.venv/bin/python -m http.server 8765 --directory reports/site
 ```
 
 Inspect all four pages at approximately `1440×900` and `390×844`. Confirm:
