@@ -1,61 +1,84 @@
 # Session handoff
 
-Focus: Ratify, implement, and evaluate the fair-scheduled Rust care-BDD order
-search without changing the frozen blind-learning contract.
+## Current answer
 
-State:
-- Repo/path: `/Users/hmyuuu/workspace/BooleanRazor`
-- Branch/commit: `codex/task-11-12-integration` / `7e99409`
-- Main: `main` / `61312ed`
-- PR/issue: QuantumBFS/quantum.harness issue 71
+Blind advantage has not been demonstrated. ProjectedSupportBDD R2 is the
+current internal tracked-formula synthetic frontier at 104,857/104,857 exact
+rows and 72 reachable gates, but it is historical branch-only evidence—not a
+public, blind, sealed, external, or global SOTA result.
 
-Done:
-- Exact disclosed-v1 controls remain A=37, B=49, C=168, D=127 reachable
-  challenge gates; BDD candidates do not replace them.
-- Survey, frozen blind benchmark commitment, two baselines, bounded runner,
-  firewall, and opaque public importer are committed.
-- Care-BDD Steps 1–7: `c757952`, provenance `6946bb4`; 16 focused tests pass,
-  including exhaustive XAG equivalence and OxiDD finalist checks.
-- SAT resynthesis is hardened through `61312ed`; DD/SAT integration is
-  `0f62ae2`.
-- DD audit `9f7e2a1` measured 70.273820 seconds for the synthetic 20-bit,
-  32-evaluation cell and proved scheduler allocation `19/5/0/0`.
-- The authoritative plan was reconciled at `7e99409`.
-- Fail-closed Julia wrapper is separate at `codex/task-15-julia-wrapper`
-  commit `6bf77f1`; fixture/full tests pass.
+Use the generated views for the current state:
 
-References:
-- `GOAL.md`
-- `docs/plans/2026-07-23-occam-circuit-rust-bdd-tn.md`
-- `LOG.md`
-- `docs/LEADERBOARD.md`
+- `docs/STATUS.md`
+- `docs/METHODS.md`
+- `docs/EXPERIMENT_INDEX.md`
+- `research/EVIDENCE_LEDGER.md`
+- `reports/site/index.html`
 
-Next:
-1. Obtain explicit human ratification for the proposed fair `6/6/6/6`
-   post-seed scheduler.
-2. If approved, create a fresh hypothesis worktree from `7e99409`, add a root
-   `LOG.md`, and use TDD while freezing folds, seeds, completion, beam, score,
-   32-evaluation cap, and OxiDD oracle role.
-3. Run the same synthetic 20-bit calibration and full verification; retain the
-   candidate only if deterministic, exact, inside 300 seconds, and better by
-   the frozen accuracy-first/XAG tie-break.
-4. When the content-addressed public bundle exists, run the frozen baseline and
-   candidate cells before any sealed evaluation.
+## Integrated scope
 
-Suggested Skills:
-- `brainstorming`: preserve the design-ratification gate.
-- `using-git-worktrees`: isolate the DD scheduling hypothesis.
-- `test-driven-development`: require red/green evidence for scheduling.
-- `verification-before-completion`: verify exactness, timing, diff, and tests.
-- `using-slurm`: only for a separately ratified promoted hpccube cell.
+The accepted integration includes the exact Rust/XAG core, disclosed controls,
+public importer, care-BDD and bounded-SAT tools, bounded runner with truthful
+verifier states, fail-closed Julia wrapper, immutable verification-record
+tool, evidence-bounded promotion checker, deterministic offline report, and
+the optimization/promotion skills.
 
-Do Not Assume:
-- The fair scheduler is approved, the public reblind bundle is present, Julia
-  is installed, TN packages are installed, or any HPC submission is
-  authorized.
-- Synthetic cross-validation or leaked-v1 recovery demonstrates blind
-  benchmark accuracy.
+Historical fair, GreedyExactConflict, ProjectedSupportBDD, TN, and real-Julia
+outcomes remain branch evidence. Their algorithm implementations were not
+silently merged into the accepted method set. The report preserves their
+failures, invalid cells, superseded runs, decisions, and exact commit/path
+locators.
 
-Ask Human If:
-- Before implementing the fair scheduler, installing Julia/TN dependencies,
-  attaching nonpublic data, or submitting any hpccube job.
+## Evidence boundary
+
+- `research/BASELINES.csv` has no executed public rows.
+- The content-addressed public bundle is not mounted in this repository.
+- `research/CURRENT_PROMOTION_REQUEST.json` contains no candidate evidence,
+  deterministic pairs, frozen comparison, or official records.
+- Its replayed decision is `blocked`; the maximum visible-only next step is
+  `freeze_candidate`.
+- Sealed confirmation and `promote_blind_result` are absent.
+- No private custodian material, public archive, sealed row, or cluster
+  authorization is bundled here.
+
+Internal exhaustive Rust equivalence is separate from Official Julia
+verification. `VERIFIER_NOT_RUN` retains a candidate but is a runner failure
+with code 67. A child-reported `verifier="pass"` becomes promotion proof only
+through a separately bound `official-verification.json`.
+
+## Next safe work
+
+1. From a clean accepted checkout, run:
+
+   ```bash
+   make setup
+   make skills
+   make test
+   make report-check
+   ```
+
+2. Obtain the exact content-addressed public archive through the reviewed
+   custodian boundary. Do not request sealed rows or private digests.
+3. Freeze one public candidate integration decision, then run the two baseline
+   methods and matched candidate repeats through the bounded runner.
+4. Require byte-identical pairs, internal equivalence, immutable official
+   records, and a complete frozen comparison before `freeze_candidate`.
+5. Keep sealed confirmation external and later. Do not use it to tune the
+   proposer.
+
+HPC remains unauthorized. Local work is the default; a later `hpccube`
+submission needs a separately ratified exact revision, environment/image
+digest, public data boundary, partition, resources, array, wall time, and
+output paths.
+
+## Navigation
+
+- `AGENTS.md` — choose activity, evidence track, verification rung, and
+  promotion action.
+- `autoresearch/README.md` — fresh-worktree and five-minute runner protocol.
+- `reblind/README.md` — public/sealed publication boundary.
+- `skills/exact-circuit-optimization/SKILL.md` — new optimization hypothesis.
+- `skills/circuit-evidence-promotion/SKILL.md` — validation and promotion.
+- `docs/plans/2026-07-23-occam-circuit-rust-bdd-tn.md` — scientific authority.
+- `docs/superpowers/specs/2026-07-30-booleanrazor-deliverability-verifier-design.md`
+  — deliverable/verifier architecture.

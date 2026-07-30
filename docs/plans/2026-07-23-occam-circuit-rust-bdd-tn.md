@@ -2850,24 +2850,30 @@ development instance, one public selection seed, and the four-cell grid
 `results/occam-tn-local/run_spec.json`. Each cell uses:
 
 ```bash
-python3 scripts/run-experiment.py \
-  --experiment-id <opaque-cell-id> \
-  --seed <public-selection-seed> \
-  --hardware local-cpu \
-  --results-root results/occam-tn-local/cells \
-  --timeout-seconds 300 \
-  --metrics-json results/occam-tn-local/cells/<opaque-cell-id>/candidate-metrics.json \
-  -- uv run --offline --project tn \
+repo_root=$(git rev-parse --show-toplevel)
+run_id=${RUN_ID:?supply a frozen run ID}
+cell_id=${CELL_ID:?supply a frozen opaque cell ID}
+run_root="$repo_root/results/occam-tn-local/$run_id"
+cell_dir="$run_root/cells/$cell_id"
+public_root=${OCCAM_REBLIND_PUBLIC_ROOT:?supply an absolute reviewed public root}
+
+python3 "$repo_root/scripts/run-experiment.py" \
+  --run-root "$run_root" \
+  --cell-id "$cell_id" \
+  --metrics-json "$cell_dir/candidate-metrics.json" -- \
+  uv run --offline --project "$repo_root/tn" \
   python -m occam_tn.pipeline \
-  --public-root <content-addressed-public-root> \
-  --run-spec results/occam-tn-local/run_spec.json \
-  --cell-index <one-based-index> \
-  --occam-bin target/release/occam-circuit-hmyuuu \
-  --output-dir results/occam-tn-local/cells/<opaque-cell-id> \
-  --metrics-json results/occam-tn-local/cells/<opaque-cell-id>/candidate-metrics.json
+  --public-root "$public_root" \
+  --run-spec "$run_root/run_spec.json" \
+  --cell-index "$CELL_INDEX" \
+  --occam-bin "$repo_root/target/release/occam-circuit-hmyuuu" \
+  --output-dir "$cell_dir" \
+  --metrics-json "$cell_dir/candidate-metrics.json"
 ```
 
-JAX tracing/compilation is inside the timed command. Compare with the
+The runner child executes inside `cell_dir`; every repository, data, spec,
+output, and metrics argument is therefore absolute. JAX tracing/compilation is
+inside the timed command. Compare with the
 care-BDD candidate on the identical visible folds and common Rust backend.
 Promote TN only if its aggregate visible exact-row accuracy is greater than the
 care-BDD value, or the exact integer numerator/denominator ties and TN has
@@ -3167,10 +3173,12 @@ conversion claim.
 
 ### Task 15: Differential Verification, Research Decision, and Submission README
 
-**Status:** The fail-closed Julia wrapper is implemented and fixture-tested on
-the separate `codex/task-15-julia-wrapper` branch at `6bf77f1`. Remaining Task
-15 analysis, real-Julia execution, public/sealed evaluation, and final research
-decision are incomplete.
+**Status:** Deliverability integration includes the reviewed fail-closed Julia
+wrapper, immutable official-record tool, and evidence-bounded promotion
+checker. The real disclosed-v1 Julia execution remains historical branch
+evidence at its cited revision rather than a fresh current-HEAD record. Public
+and sealed evaluation, claim-grade result artifacts, and the final blind
+decision remain absent.
 
 **Files:**
 - Create: `scripts/verify-julia.sh`
