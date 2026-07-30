@@ -443,6 +443,9 @@ promotion, the raw sealed-result digest; its own digest is recorded as
 operator/custodian selection and precommit. The checker verifies bindings only:
 authentication, authority, selection, chronology, and cryptographic
 authentication remain external duties and are not checker claims.
+`request_sha256` binds the exact canonical request bytes, preventing replay
+across tracks; `sealed_results` is literal `none` outside `sealed_confirmation`
+and is rejected before the checker resolves or reads a path.
 
 ### 11.2 Common gates
 

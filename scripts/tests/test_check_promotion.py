@@ -94,6 +94,7 @@ class PromotionFixture:
                 for item in read_json(self.request_path)["official_verifications"] if isinstance(read_json(self.request_path)["official_verifications"], list)
             ],
             "schema_version": 1,
+            "request_sha256": sha256(self.request_path.read_bytes()),
             "sealed_results_sha256": sha256((self.root / "sealed.json").read_bytes()) if sealed else "none",
         }
         path = self.root / "trust-policy.json"
@@ -273,7 +274,7 @@ class DisclosedControlFixture:
         request = {"candidate_evidence": [f"cells/{identifier}/manifest.json" for identifier in self.ids], "deterministic_pairs": [{"left": f"cells/mystery-{letter}-r0/manifest.json", "right": f"cells/mystery-{letter}-r1/manifest.json"} for letter in "ABCD"], "frozen_comparison": "frozen-comparison.json", "official_verifications": [f"cells/mystery-{letter}-r0/official-verification.json" for letter in "ABCD"], "schema_version": 1, "sealed_results": "none", "track": "disclosed_control"}
         write_json(self.request, request)
         self.policy = self.root / "policy.json"
-        policy = {"frozen_comparison_sha256": sha256((self.root / "frozen-comparison.json").read_bytes()), "official_verifications": [{"comparison_id": f"mystery-{letter}-r0", "sha256": sha256((self.root / f"cells/mystery-{letter}-r0/official-verification.json").read_bytes())} for letter in "ABCD"], "schema_version": 1, "sealed_results_sha256": "none"}
+        policy = {"frozen_comparison_sha256": sha256((self.root / "frozen-comparison.json").read_bytes()), "official_verifications": [{"comparison_id": f"mystery-{letter}-r0", "sha256": sha256((self.root / f"cells/mystery-{letter}-r0/official-verification.json").read_bytes())} for letter in "ABCD"], "request_sha256": sha256(self.request.read_bytes()), "schema_version": 1, "sealed_results_sha256": "none"}
         write_json(self.policy, policy)
 
     def run(self) -> tuple[subprocess.CompletedProcess[str], Path]:
@@ -336,6 +337,28 @@ def test_positive_track_requires_separate_external_trust_policy(promotion_fixtur
     assert result.returncode == 0, result.stderr
     assert read_json(output)["decision"] == "blocked"
     assert "external_trust_policy_absent" in read_json(output)["reasons"]
+
+
+def test_policy_cannot_be_replayed_for_a_different_request_track(promotion_fixture: PromotionFixture) -> None:
+    request = promotion_fixture.write_valid_request("blind_visible")
+    policy = promotion_fixture.write_trust_policy()
+    value = read_json(request)
+    value["track"] = "synthetic"
+    write_json(request, value)
+    result, output = promotion_fixture.run_checker(request, policy=policy)
+    assert result.returncode == 0, result.stderr
+    assert read_json(output)["decision"] == "reject"
+    assert "external_trust_policy_mismatch" in read_json(output)["reasons"]
+
+
+def test_nonsealed_track_rejects_sealed_path_without_reading_it(promotion_fixture: PromotionFixture) -> None:
+    request = promotion_fixture.write_valid_request("blind_visible")
+    value = read_json(request)
+    value["sealed_results"] = "does-not-exist.json"
+    write_json(request, value)
+    result, output = promotion_fixture.run_checker(request)
+    assert result.returncode == 2
+    assert not output.exists()
 
 
 def test_same_metadata_other_run_root_is_not_a_complete_native_run(promotion_fixture: PromotionFixture) -> None:

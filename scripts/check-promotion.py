@@ -192,12 +192,12 @@ class _Reject(Exception):
         self.code = code
 
 
-def _load_trust_policy(path: Path | None, digests: dict[str, str]) -> dict[str, object] | None:
+def _load_trust_policy(path: Path | None, request_raw: bytes, digests: dict[str, str]) -> dict[str, object] | None:
     if path is None:
         return None
     policy, raw = load_canonical_object(path, "external trust policy")
-    _require_exact_fields(policy, {"frozen_comparison_sha256", "official_verifications", "schema_version", "sealed_results_sha256"}, "external trust policy")
-    if type(policy["schema_version"]) is not int or policy["schema_version"] != 1 or not isinstance(policy["frozen_comparison_sha256"], str) or not HEX_64.fullmatch(policy["frozen_comparison_sha256"]) or (policy["sealed_results_sha256"] != "none" and (not isinstance(policy["sealed_results_sha256"], str) or not HEX_64.fullmatch(policy["sealed_results_sha256"]))):
+    _require_exact_fields(policy, {"frozen_comparison_sha256", "official_verifications", "request_sha256", "schema_version", "sealed_results_sha256"}, "external trust policy")
+    if type(policy["schema_version"]) is not int or policy["schema_version"] != 1 or not isinstance(policy["request_sha256"], str) or not HEX_64.fullmatch(policy["request_sha256"]) or not isinstance(policy["frozen_comparison_sha256"], str) or not HEX_64.fullmatch(policy["frozen_comparison_sha256"]) or (policy["sealed_results_sha256"] != "none" and (not isinstance(policy["sealed_results_sha256"], str) or not HEX_64.fullmatch(policy["sealed_results_sha256"]))):
         raise EvidenceError("external trust policy has invalid schema")
     entries = policy["official_verifications"]
     if not isinstance(entries, list):
@@ -208,6 +208,7 @@ def _load_trust_policy(path: Path | None, digests: dict[str, str]) -> dict[str, 
             raise EvidenceError("external trust policy has invalid official bindings")
         identifiers.add(entry["comparison_id"])
     digests["external_trust_policy"] = sha256_bytes(raw)
+    policy["_request_mismatch"] = policy["request_sha256"] != sha256_bytes(request_raw)
     return policy
 
 
@@ -219,11 +220,13 @@ def build_decision(request_path: Path, trust_policy_path: Path | None = None) ->
     track = request["track"]
     root = request_path.parent
     digests: dict[str, str] = {request_path.name: sha256_bytes(request_raw)}
-    trust_policy = _load_trust_policy(trust_policy_path, digests)
+    trust_policy = _load_trust_policy(trust_policy_path, request_raw, digests)
     candidate_paths = _resolve_many(root, request["candidate_evidence"], "candidate evidence", digests)
     verification_paths = _resolve_many(root, request["official_verifications"], "official verifications", digests)
     frozen_path = _resolve_one(root, request["frozen_comparison"], "frozen comparison", digests)
-    sealed_path = _resolve_one(root, request["sealed_results"], "sealed results", digests)
+    if track != "sealed_confirmation" and request["sealed_results"] != "none":
+        raise EvidenceError("sealed_results is only permitted for sealed_confirmation")
+    sealed_path = _resolve_one(root, request["sealed_results"], "sealed results", digests) if track == "sealed_confirmation" else None
     pair_rows = request["deterministic_pairs"]
     if pair_rows != "none" and (not isinstance(pair_rows, list) or not pair_rows):
         raise EvidenceError("deterministic pairs must be none or a nonempty list")
@@ -322,7 +325,7 @@ def build_decision(request_path: Path, trust_policy_path: Path | None = None) ->
                 reasons.add("comparison_projection_mismatch")
         if trust_policy is None:
             reasons.add("external_trust_policy_absent")
-        elif trust_policy["frozen_comparison_sha256"] != sha256_bytes(comparison_raw):
+        elif trust_policy["_request_mismatch"] or trust_policy["frozen_comparison_sha256"] != sha256_bytes(comparison_raw):
             reasons.add("external_trust_policy_mismatch")
         else:
             anchored = {(entry["comparison_id"], entry["sha256"]) for entry in trust_policy["official_verifications"]}
