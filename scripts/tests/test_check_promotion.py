@@ -398,6 +398,24 @@ def test_policy_must_bind_exact_official_record_bytes(promotion_fixture: Promoti
     assert "external_trust_policy_mismatch" in read_json(output)["reasons"]
 
 
+def test_request_name_cannot_collide_with_external_policy_digest_key(
+    promotion_fixture: PromotionFixture,
+) -> None:
+    request = promotion_fixture.write_valid_request("synthetic")
+    policy = promotion_fixture.write_trust_policy()
+    colliding_request = request.with_name("external_trust_policy")
+    request.rename(colliding_request)
+
+    result, output = promotion_fixture.run_checker(
+        colliding_request,
+        policy=policy,
+    )
+
+    assert result.returncode == 2
+    assert not output.exists()
+    assert "reserved input digest key" in result.stderr
+
+
 def test_input_digests_match_the_exact_canonical_bytes_parsed(promotion_fixture: PromotionFixture) -> None:
     request = promotion_fixture.write_valid_request("sealed_confirmation")
     policy = promotion_fixture.write_trust_policy(sealed=True)
@@ -407,6 +425,24 @@ def test_input_digests_match_the_exact_canonical_bytes_parsed(promotion_fixture:
     for relative in read_json(request)["candidate_evidence"] + read_json(request)["official_verifications"] + ["frozen-comparison.json", "visible-design.json", "sealed.json"]:
         assert inputs[relative] == sha256((promotion_fixture.root / relative).read_bytes())
     assert inputs["external_trust_policy"] == sha256(policy.read_bytes())
+
+
+def test_sealed_result_requires_one_uniform_outcome_against_both_baselines(
+    promotion_fixture: PromotionFixture,
+) -> None:
+    request = promotion_fixture.write_valid_request("sealed_confirmation")
+    sealed_path = promotion_fixture.root / "sealed.json"
+    sealed = read_json(sealed_path)
+    sealed["matched_100x_against"] = ["hamming-1nn"]
+    sealed["scaling_advantage_against"] = ["zero-fill"]
+    write_json(sealed_path, sealed)
+
+    result, output = promotion_fixture.run_checker(request)
+
+    assert result.returncode == 0, result.stderr
+    decision = read_json(output)
+    assert decision["decision"] == "blocked"
+    assert "sealed_baseline_incomplete" in decision["reasons"]
 
 
 @pytest.mark.parametrize("field, value", (("exact_accuracy", "0.9"), ("bit_accuracy", "0.9"), ("samples", True), ("julia_version", {"sha256": "D" * 64, "text": ""}), ("julia_version", {"sha256": "0" * 64, "text": "julia version 1.12.4"})))

@@ -20,6 +20,7 @@ TRACK_CEILINGS = {
     "sealed_confirmation": "promote_blind_result",
 }
 REQUEST_FIELDS = {"schema_version", "track", "candidate_evidence", "deterministic_pairs", "official_verifications", "frozen_comparison", "sealed_results"}
+EXTERNAL_POLICY_DIGEST_KEY = "external_trust_policy"
 DISCLOSED_PREDICTION_COMMITMENTS = {
     "mystery-A": "51e3f026def41778ecd0d7dcaee9f970b9937488e6716891932b73824c16d4c7",
     "mystery-B": "e2c9d0e23ee36bfc0f12d7f39fdfe2ca5a8abe8eb194fec56500733694b75c28",
@@ -66,9 +67,12 @@ def _require_exact_fields(value: dict[str, object], fields: set[str], label: str
 
 def _relative_key(root: Path, path: Path) -> str:
     try:
-        return path.relative_to(root).as_posix()
+        key = path.relative_to(root).as_posix()
     except ValueError as exc:
         raise EvidenceError("resolved input escapes request root") from exc
+    if key == EXTERNAL_POLICY_DIGEST_KEY:
+        raise EvidenceError("evidence path uses reserved input digest key")
+    return key
 
 
 def _resolve_many(root: Path, value: object, label: str, digests: dict[str, str]) -> list[Path]:
@@ -211,7 +215,9 @@ def _load_trust_policy(path: Path | None, request_raw: bytes, digests: dict[str,
         if not isinstance(entry, dict) or set(entry) != {"comparison_id", "sha256"} or not isinstance(entry["comparison_id"], str) or not HEX_64.fullmatch(entry["sha256"] if isinstance(entry["sha256"], str) else "") or entry["comparison_id"] in identifiers:
             raise EvidenceError("external trust policy has invalid official bindings")
         identifiers.add(entry["comparison_id"])
-    digests["external_trust_policy"] = sha256_bytes(raw)
+    if EXTERNAL_POLICY_DIGEST_KEY in digests:
+        raise EvidenceError("external trust policy uses reserved input digest key")
+    digests[EXTERNAL_POLICY_DIGEST_KEY] = sha256_bytes(raw)
     policy["_request_mismatch"] = policy["request_sha256"] != sha256_bytes(request_raw)
     return policy
 
@@ -221,6 +227,8 @@ def build_decision(request_path: Path, trust_policy_path: Path | None = None) ->
     _require_exact_fields(request, REQUEST_FIELDS, "promotion request")
     if type(request["schema_version"]) is not int or request["schema_version"] != 1 or request["track"] not in TRACK_CEILINGS:
         raise EvidenceError("promotion request has invalid schema version or track")
+    if request_path.name == EXTERNAL_POLICY_DIGEST_KEY:
+        raise EvidenceError("promotion request uses reserved input digest key")
     track = request["track"]
     root = request_path.parent
     digests: dict[str, str] = {request_path.name: sha256_bytes(request_raw)}
@@ -362,14 +370,20 @@ def build_decision(request_path: Path, trust_policy_path: Path | None = None) ->
                 raise EvidenceError("sealed result has invalid schema")
             elif not isinstance(sealed["frozen_comparison_sha256"], str) or not HEX_64.fullmatch(sealed["frozen_comparison_sha256"]):
                 raise EvidenceError("sealed result has invalid digest")
-            elif set(sealed["comparison_ids"]) != set(comparison["expected_ids"]) or set(sealed["baseline_methods"]) != {"hamming-1nn", "zero-fill"} or set(sealed["matched_100x_against"]) & set(sealed["scaling_advantage_against"]) or not (set(sealed["matched_100x_against"]) | set(sealed["scaling_advantage_against"])).issubset({"hamming-1nn", "zero-fill"}):
+            required_baselines = {"hamming-1nn", "zero-fill"}
+            matched_100x = set(sealed["matched_100x_against"])
+            scaling_advantage = set(sealed["scaling_advantage_against"])
+            uniform_outcome = (
+                matched_100x == required_baselines and not scaling_advantage
+            ) or (
+                scaling_advantage == required_baselines and not matched_100x
+            )
+            if set(sealed["comparison_ids"]) != set(comparison["expected_ids"]) or set(sealed["baseline_methods"]) != required_baselines or not uniform_outcome:
                 reasons.add("sealed_baseline_incomplete")
             elif sealed["frozen_comparison_sha256"] != sha256_bytes(comparison_raw):
                 reasons.add("frozen_comparison_digest_mismatch")
             elif trust_policy is None or trust_policy["sealed_results_sha256"] != sha256_bytes(sealed_raw):
                 reasons.add("external_trust_policy_mismatch")
-            elif not {"hamming-1nn", "zero-fill"}.issubset(set(sealed["baseline_methods"])) or not {"hamming-1nn", "zero-fill"}.issubset(set(sealed["matched_100x_against"]) | set(sealed["scaling_advantage_against"])):
-                reasons.add("sealed_baseline_incomplete")
             else:
                 sealed_ok = True
     if track == "disclosed_control":

@@ -449,7 +449,8 @@ and is rejected before the checker resolves or reads a path.
 Nonsealed policies likewise require `sealed_results_sha256` exactly `none`;
 sealed policies require lowercase HEX64 bound to the exact parsed sealed bytes.
 Decision input digests come from validated raw snapshots that supplied the
-parsed objects.
+parsed objects. `external_trust_policy` is a reserved digest-map key: neither
+the request filename nor an evidence path may collide with it.
 
 ### 11.2 Common gates
 
@@ -510,8 +511,9 @@ inputs produce byte-identical output.
 - requires `FROZEN_COMPARISON.json`, every predeclared candidate and baseline
   row, normalized failed cells, deterministic repeats, bound verifier records,
   matched hardware/caps/provenance, and the predeclared analysis decision;
-- can promote only when the existing `100×` or scaling rule passes against
-  both baseline curves;
+- can promote only when one uniform outcome passes against both baseline
+  curves: `100×` against both or scaling advantage against both; a hybrid split
+  across the two outcomes is not promotable;
 - otherwise emits `no_change`, `reject`, or `blocked` with exact reasons.
 
 The absent public bundle and sealed results mean the current repository should

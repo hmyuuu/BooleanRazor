@@ -1095,7 +1095,9 @@ canonical validator that supplied the parsed object. The decision records the po
 `input_sha256.external_trust_policy`. The policy is an externally selected
 operator/custodian precommit: this checker verifies only byte bindings and does
 not authenticate the operator, establish selection, prove chronology, or make
-a cryptographic-authentication claim.
+a cryptographic-authentication claim. `external_trust_policy` is a reserved
+digest-map key; reject a request filename or evidence-relative path that would
+collide with it.
 - Production types are:
 
 ```python
@@ -1434,7 +1436,11 @@ Sort all reason codes. `highest_legal_next_step` is always
 `TRACK_CEILINGS[track]`, even for `blocked`, `reject`, or `no_change`.
 `input_sha256` is a sorted object containing the request digest and each
 resolved input's digest keyed by its request-relative path. Do not include a
-timestamp, hostname, absolute path, or environment value.
+timestamp, hostname, absolute path, or environment value. A sealed positive
+requires one uniform outcome: `matched_100x_against` equals both frozen
+baselines and `scaling_advantage_against` is empty, or the scaling set equals
+both baselines and the `100×` set is empty. A one-baseline/one-baseline hybrid
+is `sealed_baseline_incomplete`.
 
 - [ ] **Step 7: Run the promotion tests**
 
