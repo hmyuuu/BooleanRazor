@@ -147,6 +147,12 @@ class CandidateRun:
     def read_json(self, path: Path) -> dict[str, object]:
         return evidence_io.load_canonical_object(path, path.name)[0]
 
+    def replace_run_spec(self, spec: dict[str, object]) -> None:
+        self.write_json(self.run_spec, spec)
+        manifest = self.read_json(self.manifest)
+        manifest["run_spec_sha256"] = sha256(self.run_spec.read_bytes())
+        self.write_json(self.manifest, manifest)
+
     def apply_mutation(self, mutation: str) -> None:
         manifest = self.read_json(self.manifest)
         if mutation == "manifest_hash":
@@ -431,6 +437,82 @@ def test_terminal_loader_rejects_candidate_without_all_quality_evidence(
     manifest["artifact_path"] = "none"
     candidate_run.write_json(candidate_run.manifest, manifest)
     with pytest.raises(evidence_io.EvidenceError, match="candidate-bearing"):
+        candidate_evidence.load_terminal_manifest(candidate_run.manifest)
+
+
+def _nonselected_run_spec_cell(candidate_run: CandidateRun) -> dict[str, object]:
+    spec = candidate_run.read_json(candidate_run.run_spec)
+    params = dict(spec["cells"][0]["params"])
+    params["comparison_id"] = "cell-b"
+    return {"cell_id": "cell-b", "params": params}
+
+
+def test_terminal_loader_rejects_malformed_nonselected_run_spec_cell(
+    candidate_run: CandidateRun,
+) -> None:
+    candidate_evidence = load_module("candidate_evidence", "candidate_evidence.py")
+    spec = candidate_run.read_json(candidate_run.run_spec)
+    spec["cells"].append({"cell_id": "cell-b", "params": {}, "extra": "field"})
+    candidate_run.replace_run_spec(spec)
+    with pytest.raises(evidence_io.EvidenceError):
+        candidate_evidence.load_terminal_manifest(candidate_run.manifest)
+
+
+@pytest.mark.parametrize("duplicate", ("selected", "other"))
+def test_terminal_loader_rejects_duplicate_run_spec_cell_ids(
+    candidate_run: CandidateRun, duplicate: str
+) -> None:
+    candidate_evidence = load_module("candidate_evidence", "candidate_evidence.py")
+    spec = candidate_run.read_json(candidate_run.run_spec)
+    if duplicate == "selected":
+        spec["cells"].append(spec["cells"][0])
+    else:
+        sibling = _nonselected_run_spec_cell(candidate_run)
+        spec["cells"].extend((sibling, sibling))
+    candidate_run.replace_run_spec(spec)
+    with pytest.raises(evidence_io.EvidenceError):
+        candidate_evidence.load_terminal_manifest(candidate_run.manifest)
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        lambda cell: cell["params"].pop("method"),
+        lambda cell: cell["params"].update({"unexpected": "field"}),
+        lambda cell: cell["params"].update({"repeat": 0}),
+    ),
+)
+def test_terminal_loader_rejects_invalid_nonselected_run_spec_param_shape_or_type(
+    candidate_run: CandidateRun, mutation: object
+) -> None:
+    candidate_evidence = load_module("candidate_evidence", "candidate_evidence.py")
+    spec = candidate_run.read_json(candidate_run.run_spec)
+    sibling = _nonselected_run_spec_cell(candidate_run)
+    mutation(sibling)
+    spec["cells"].append(sibling)
+    candidate_run.replace_run_spec(spec)
+    with pytest.raises(evidence_io.EvidenceError):
+        candidate_evidence.load_terminal_manifest(candidate_run.manifest)
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    (
+        ("comparison_id", "cell-a"),
+        ("blind", "false"),
+        ("timeout_seconds", "301"),
+    ),
+)
+def test_terminal_loader_rejects_invalid_nonselected_run_spec_param_semantics(
+    candidate_run: CandidateRun, field: str, value: str
+) -> None:
+    candidate_evidence = load_module("candidate_evidence", "candidate_evidence.py")
+    spec = candidate_run.read_json(candidate_run.run_spec)
+    sibling = _nonselected_run_spec_cell(candidate_run)
+    sibling["params"][field] = value
+    spec["cells"].append(sibling)
+    candidate_run.replace_run_spec(spec)
+    with pytest.raises(evidence_io.EvidenceError):
         candidate_evidence.load_terminal_manifest(candidate_run.manifest)
 
 

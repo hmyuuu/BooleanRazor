@@ -53,6 +53,7 @@ SCHEDULER_FIELDS = {
 }
 CANONICAL_INTEGER = re.compile(r"(?:0|[1-9][0-9]*)")
 CANONICAL_DECIMAL = re.compile(r"(?:0|[1-9][0-9]*)\.[0-9]+")
+CELL_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*")
 COMMIT_40 = re.compile(r"[0-9a-f]{40}")
 RFC3339_UTC = re.compile(
     r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]+)?Z"
@@ -218,6 +219,23 @@ def _validate_params(params: dict[str, object], cell_id: str) -> Decimal:
     return _canonical_timeout(params["timeout_seconds"])
 
 
+def _validate_run_spec_cell(
+    cell: object, index: int, seen: set[str]
+) -> tuple[str, dict[str, object], Decimal]:
+    if not isinstance(cell, dict) or set(cell) != {"cell_id", "params"}:
+        raise EvidenceError(f"run_spec cells[{index}] has an invalid shape")
+    cell_id = cell["cell_id"]
+    if not isinstance(cell_id, str) or not CELL_ID.fullmatch(cell_id):
+        raise EvidenceError(f"run_spec cells[{index}] has an invalid cell_id")
+    if cell_id in seen:
+        raise EvidenceError(f"run_spec has duplicate cell_id: {cell_id}")
+    seen.add(cell_id)
+    params = cell["params"]
+    if not isinstance(params, dict) or set(params) != PARAM_FIELDS:
+        raise EvidenceError(f"run_spec params for {cell_id} have missing or extra fields")
+    return cell_id, params, _validate_params(params, cell_id)
+
+
 def _validate_provenance(provenance: dict[str, object]) -> None:
     if any(not isinstance(value, str) for value in provenance.values()):
         raise EvidenceError("provenance values must be strings")
@@ -300,21 +318,21 @@ def load_terminal_manifest(path: Path, evidence_root: Path | None = None) -> Ter
         raise EvidenceError("run_spec digest binding mismatch")
     if not isinstance(spec["provenance"], dict) or set(spec["provenance"]) != PROVENANCE_FIELDS:
         raise EvidenceError("run_spec provenance is invalid")
-    if not isinstance(spec["cells"], list):
-        raise EvidenceError("run_spec cells is invalid")
+    if not isinstance(spec["cells"], list) or not spec["cells"]:
+        raise EvidenceError("run_spec cells must be a nonempty array")
     selected: dict[str, object] | None = None
-    for cell in spec["cells"]:
-        if not isinstance(cell, dict) or set(cell) != {"cell_id", "params"} or cell.get("cell_id") != comparison_id:
-            continue
-        if selected is not None:
-            raise EvidenceError("run_spec has duplicate comparison_id")
-        selected = cell
-    if selected is None or not isinstance(selected["params"], dict) or set(selected["params"]) != PARAM_FIELDS:
+    timeout: Decimal | None = None
+    seen: set[str] = set()
+    for index, cell in enumerate(spec["cells"]):
+        cell_id, params, cell_timeout = _validate_run_spec_cell(cell, index, seen)
+        if cell_id == comparison_id:
+            selected = params
+            timeout = cell_timeout
+    if selected is None or timeout is None:
         raise EvidenceError("run_spec does not contain the manifest cell")
-    timeout = _validate_params(selected["params"], comparison_id)
     _validate_provenance(spec["provenance"])
     for field in PARAM_FIELDS:
-        if selected["params"][field] != manifest[field]:
+        if selected[field] != manifest[field]:
             raise EvidenceError("manifest parameters disagree with run_spec")
     for field in PROVENANCE_FIELDS:
         if spec["provenance"][field] != manifest[field]:
