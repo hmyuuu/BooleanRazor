@@ -85,10 +85,30 @@ class PromotionFixture:
         write_json(self.request_path, request)
         return self.request_path
 
-    def run_checker(self, request: Path) -> tuple[subprocess.CompletedProcess[str], Path]:
+    def write_trust_policy(self, *, sealed: bool = False) -> Path:
+        frozen = self.root / "frozen-comparison.json"
+        policy = {
+            "frozen_comparison_sha256": sha256(frozen.read_bytes()),
+            "official_verifications": [
+                {"comparison_id": read_json(self.root / item)["comparison_id"], "sha256": sha256((self.root / item).read_bytes())}
+                for item in read_json(self.request_path)["official_verifications"] if isinstance(read_json(self.request_path)["official_verifications"], list)
+            ],
+            "schema_version": 1,
+            "sealed_results_sha256": sha256((self.root / "sealed.json").read_bytes()) if sealed else "none",
+        }
+        path = self.root / "trust-policy.json"
+        write_json(path, policy)
+        return path
+
+    def run_checker(self, request: Path, *, policy: Path | None | bool = True) -> tuple[subprocess.CompletedProcess[str], Path]:
         output = self.root / "decision.json"
+        command = [sys.executable, str(CHECKER), "--request", str(request), "--output", str(output)]
+        if policy is True:
+            command.extend(["--trust-policy", str(self.write_trust_policy(sealed=read_json(request)["track"] == "sealed_confirmation"))])
+        elif isinstance(policy, Path):
+            command.extend(["--trust-policy", str(policy)])
         result = subprocess.run(
-            [sys.executable, str(CHECKER), "--request", str(request), "--output", str(output)],
+            command,
             text=True, capture_output=True, cwd=ROOT,
         )
         return result, output
@@ -246,6 +266,39 @@ def test_literal_none_is_canonically_blocked(promotion_fixture: PromotionFixture
     assert read_json(output)["reasons"] == ["candidate_evidence_absent", "deterministic_pairs_absent", "frozen_comparison_absent", "official_verifications_absent"]
 
 
+def test_positive_track_requires_separate_external_trust_policy(promotion_fixture: PromotionFixture) -> None:
+    result, output = promotion_fixture.run_checker(promotion_fixture.write_valid_request("synthetic"), policy=None)
+    assert result.returncode == 0, result.stderr
+    assert read_json(output)["decision"] == "blocked"
+    assert "external_trust_policy_absent" in read_json(output)["reasons"]
+
+
+def test_same_metadata_other_run_root_is_not_a_complete_native_run(promotion_fixture: PromotionFixture) -> None:
+    request = promotion_fixture.write_valid_request("synthetic")
+    other = promotion_fixture.root / "other"
+    shutil.copytree(promotion_fixture.root, other, ignore=shutil.ignore_patterns("other", "request.json", "decision.json", "trust-policy.json"))
+    value = read_json(request)
+    value["candidate_evidence"][-1] = "other/cells/candidate-r1/manifest.json"
+    value["deterministic_pairs"][-1]["right"] = "other/cells/candidate-r1/manifest.json"
+    write_json(request, value)
+    result, output = promotion_fixture.run_checker(request)
+    assert result.returncode == 0, result.stderr
+    assert read_json(output)["decision"] == "reject"
+    assert "native_run_incomplete" in read_json(output)["reasons"]
+
+
+def test_policy_must_bind_exact_official_record_bytes(promotion_fixture: PromotionFixture) -> None:
+    request = promotion_fixture.write_valid_request("synthetic")
+    policy = promotion_fixture.write_trust_policy()
+    value = read_json(policy)
+    value["official_verifications"][0]["sha256"] = "0" * 64
+    write_json(policy, value)
+    result, output = promotion_fixture.run_checker(request, policy=policy)
+    assert result.returncode == 0, result.stderr
+    assert read_json(output)["decision"] == "reject"
+    assert "external_trust_policy_mismatch" in read_json(output)["reasons"]
+
+
 @pytest.mark.parametrize("mutation, expected", [
     ("missing_verification", "official_verifications_absent"),
     ("foreign_record", "foreign_verification_record"),
@@ -290,7 +343,7 @@ def test_evidence_gates_classify_failures(promotion_fixture: PromotionFixture, m
         promotion_fixture.terminal_failure("candidate-r1")
     result, output = promotion_fixture.run_checker(request)
     assert result.returncode == 0, result.stderr
-    assert read_json(output)["decision"] == ("blocked" if expected in {"official_verifications_absent", "missing_comparison_cell"} else "reject")
+    assert read_json(output)["decision"] == ("blocked" if expected == "official_verifications_absent" else "reject")
     assert expected in read_json(output)["reasons"]
 
 

@@ -31,6 +31,7 @@ REJECTION_CODES = {
     "mixed_tree_digest", "mixed_dataset_boundary", "mixed_hardware", "mixed_timeout_cap",
     "filtered_terminal_failure", "frozen_comparison_digest_mismatch",
     "control_instance_set_mismatch", "prediction_commitment_mismatch",
+    "native_run_incomplete", "comparison_projection_mismatch", "external_trust_policy_mismatch",
 }
 
 
@@ -155,6 +156,8 @@ def _load_comparison(root: Path, path: Path, track: str, digests: dict[str, str]
     for field in ("baseline_ids", "candidate_ids", "expected_ids"):
         if not isinstance(comparison[field], list) or not comparison[field] or not all(isinstance(item, str) for item in comparison[field]) or len(set(comparison[field])) != len(comparison[field]):
             raise EvidenceError("frozen comparison has invalid identifiers")
+    if set(comparison["baseline_ids"]) & set(comparison["candidate_ids"]) or comparison["frozen_candidate_id"] not in comparison["candidate_ids"]:
+        raise EvidenceError("frozen comparison has invalid role partition")
     if not isinstance(comparison["design_path"], str) or not isinstance(comparison["design_sha256"], str) or not HEX_64.fullmatch(comparison["design_sha256"]):
         raise EvidenceError("frozen comparison has invalid design binding")
     design_path = resolve_evidence_path(root, comparison["design_path"], "visible design")
@@ -170,7 +173,7 @@ def _load_comparison(root: Path, path: Path, track: str, digests: dict[str, str]
         if not isinstance(cell, dict) or set(cell) != {"comparison_id", "dataset_id"} or not all(isinstance(cell[key], str) for key in cell):
             raise EvidenceError("visible design has invalid cell")
         projection.append((cell["comparison_id"], cell["dataset_id"]))
-    if len(set(projection)) != len(projection) or {pair[0] for pair in projection} != set(comparison["expected_ids"]):
+    if len(projection) != len(comparison["expected_ids"]) or len({pair[0] for pair in projection}) != len(projection) or {pair[0] for pair in projection} != set(comparison["expected_ids"]):
         raise EvidenceError("visible design does not match comparison identifiers")
     if track in {"blind_visible", "sealed_confirmation"}:
         commitment_raw = read_stable_regular(Path(__file__).resolve().parents[1] / "reblind" / "COMMITMENT.txt", "reblind commitment", DEFAULT_MAX_BYTES)
@@ -187,7 +190,26 @@ class _Reject(Exception):
         self.code = code
 
 
-def build_decision(request_path: Path) -> dict[str, object]:
+def _load_trust_policy(path: Path | None, digests: dict[str, str]) -> dict[str, object] | None:
+    if path is None:
+        return None
+    policy, raw = load_canonical_object(path, "external trust policy")
+    _require_exact_fields(policy, {"frozen_comparison_sha256", "official_verifications", "schema_version", "sealed_results_sha256"}, "external trust policy")
+    if type(policy["schema_version"]) is not int or policy["schema_version"] != 1 or not isinstance(policy["frozen_comparison_sha256"], str) or not HEX_64.fullmatch(policy["frozen_comparison_sha256"]) or (policy["sealed_results_sha256"] != "none" and (not isinstance(policy["sealed_results_sha256"], str) or not HEX_64.fullmatch(policy["sealed_results_sha256"]))):
+        raise EvidenceError("external trust policy has invalid schema")
+    entries = policy["official_verifications"]
+    if not isinstance(entries, list):
+        raise EvidenceError("external trust policy has invalid official bindings")
+    identifiers: set[str] = set()
+    for entry in entries:
+        if not isinstance(entry, dict) or set(entry) != {"comparison_id", "sha256"} or not isinstance(entry["comparison_id"], str) or not HEX_64.fullmatch(entry["sha256"] if isinstance(entry["sha256"], str) else "") or entry["comparison_id"] in identifiers:
+            raise EvidenceError("external trust policy has invalid official bindings")
+        identifiers.add(entry["comparison_id"])
+    digests["external_trust_policy"] = sha256_bytes(raw)
+    return policy
+
+
+def build_decision(request_path: Path, trust_policy_path: Path | None = None) -> dict[str, object]:
     request, request_raw = load_canonical_object(request_path, "promotion request")
     _require_exact_fields(request, REQUEST_FIELDS, "promotion request")
     if type(request["schema_version"]) is not int or request["schema_version"] != 1 or request["track"] not in TRACK_CEILINGS:
@@ -195,6 +217,7 @@ def build_decision(request_path: Path) -> dict[str, object]:
     track = request["track"]
     root = request_path.parent
     digests: dict[str, str] = {request_path.name: sha256_bytes(request_raw)}
+    trust_policy = _load_trust_policy(trust_policy_path, digests)
     candidate_paths = _resolve_many(root, request["candidate_evidence"], "candidate evidence", digests)
     verification_paths = _resolve_many(root, request["official_verifications"], "official verifications", digests)
     frozen_path = _resolve_one(root, request["frozen_comparison"], "frozen comparison", digests)
@@ -219,10 +242,14 @@ def build_decision(request_path: Path) -> dict[str, object]:
         if len(set(endpoints)) != len(endpoints):
             raise EvidenceError("deterministic pair endpoints are duplicated")
     terminals = tuple(load_terminal_manifest(path) for path in candidate_paths)
+    if len({row.comparison_id for row in terminals}) != len(terminals):
+        raise EvidenceError("candidate evidence has duplicate comparison_id")
     candidates: list[CandidateEvidence] = []
     for terminal in terminals:
         if terminal.status in {"SUCCESS", "VERIFIER_FAILED", "VERIFIER_NOT_RUN"}:
             candidates.append(load_candidate_manifest(terminal.manifest_path))
+    if len({row.comparison_id for row in candidates}) != len(candidates):
+        raise EvidenceError("candidate evidence has duplicate candidate comparison_id")
     by_path = {row.manifest_path: row for row in candidates}
     pairs: list[DeterministicPair] = []
     pair_partition_bad = False
@@ -236,16 +263,16 @@ def build_decision(request_path: Path) -> dict[str, object]:
                     pair_partition_bad = True
                 pairs.append(DeterministicPair(left, right, _pair_byte_identical(left, right)))
     records: list[VerificationBinding] = []
-    record_rows = [_load_record(path)[0] for path in verification_paths]
+    record_rows = [(path, *_load_record(path)) for path in verification_paths]
     lefts = {pair.left.comparison_id: pair.left for pair in pairs}
     record_bad = False
     if record_rows:
-        if len(record_rows) != len(lefts) or {record["comparison_id"] for record in record_rows} != set(lefts):
+        if len(record_rows) != len(lefts) or {record["comparison_id"] for _, record, _ in record_rows} != set(lefts):
             record_bad = True
         else:
-            for record in record_rows:
+            for path, record, _ in record_rows:
                 left = lefts[record["comparison_id"]]
-                if any(record[field] != getattr(left, field) for field in ("manifest_sha256", "run_spec_sha256", "circuit_sha256")) or record["gates"] != left.gates:
+                if path != left.manifest_path.with_name("official-verification.json") or any(record[field] != getattr(left, field) for field in ("manifest_sha256", "run_spec_sha256", "circuit_sha256")) or record["gates"] != left.gates:
                     record_bad = True
                     continue
                 records.append(VerificationBinding(record["comparison_id"], record["manifest_sha256"], record["circuit_sha256"], record["dataset_sha256"], record["gates"]))
@@ -255,6 +282,16 @@ def build_decision(request_path: Path) -> dict[str, object]:
         reasons.add("nondeterministic_pair")
     if record_bad:
         reasons.add("foreign_verification_record")
+    if terminals:
+        run_roots = {row.run_root for row in terminals}
+        if len(run_roots) != 1:
+            reasons.add("native_run_incomplete")
+        else:
+            run_root = next(iter(run_roots))
+            spec, _ = load_canonical_object(run_root / "run_spec.json", "run_spec.json")
+            native = {run_root / "cells" / cell["cell_id"] / "manifest.json" for cell in spec["cells"] if isinstance(cell, dict) and isinstance(cell.get("cell_id"), str)}
+            if native != set(candidate_paths):
+                reasons.add("native_run_incomplete")
     comparison: dict[str, object] | None = None
     comparison_raw: bytes | None = None
     design: dict[str, object] | None = None
@@ -274,7 +311,22 @@ def build_decision(request_path: Path) -> dict[str, object]:
             reasons.update({"filtered_terminal_failure", "terminal_failure_present"})
         projection = {cell["comparison_id"]: cell["dataset_id"] for cell in design["cells"]}
         if any(row.comparison_id not in projection or row.dataset_id != projection[row.comparison_id] for row in terminals):
-            reasons.add("missing_comparison_cell")
+            reasons.add("comparison_projection_mismatch")
+        if set(pair.left.comparison_id for pair in pairs) != set(comparison["baseline_ids"]) | set(comparison["candidate_ids"]) or {item.comparison_id for pair in pairs for item in (pair.left, pair.right)} != expected_ids:
+            reasons.add("comparison_projection_mismatch")
+        baseline_ids, candidate_ids = set(comparison["baseline_ids"]), set(comparison["candidate_ids"])
+        for pair in pairs:
+            if pair.left.role != pair.right.role or (pair.left.comparison_id in baseline_ids and pair.left.role != "baseline") or (pair.left.comparison_id in candidate_ids and pair.left.role != "candidate"):
+                reasons.add("comparison_projection_mismatch")
+        if trust_policy is None:
+            reasons.add("external_trust_policy_absent")
+        elif trust_policy["frozen_comparison_sha256"] != sha256_bytes(comparison_raw):
+            reasons.add("external_trust_policy_mismatch")
+        else:
+            anchored = {(entry["comparison_id"], entry["sha256"]) for entry in trust_policy["official_verifications"]}
+            actual = {(record["comparison_id"], sha256_bytes(raw)) for _, record, raw in record_rows}
+            if anchored != actual:
+                reasons.add("external_trust_policy_mismatch")
     sealed_ok = False
     if track == "sealed_confirmation":
         if sealed_path is None:
@@ -282,8 +334,16 @@ def build_decision(request_path: Path) -> dict[str, object]:
         elif comparison is not None and comparison_raw is not None:
             sealed, _ = load_canonical_object(sealed_path, "sealed result")
             _require_exact_fields(sealed, {"analysis_rule", "baseline_methods", "comparison_ids", "failed_cells_normalized", "frozen_comparison_sha256", "matched_100x_against", "scaling_advantage_against", "schema_version"}, "sealed result")
-            if sealed["frozen_comparison_sha256"] != sha256_bytes(comparison_raw):
+            if type(sealed["schema_version"]) is not int or sealed["schema_version"] != 1 or sealed["analysis_rule"] != "predeclared_100x_or_scaling" or sealed["failed_cells_normalized"] is not True or not all(isinstance(sealed[key], list) and all(isinstance(value, str) for value in sealed[key]) and len(set(sealed[key])) == len(sealed[key]) for key in ("baseline_methods", "comparison_ids", "matched_100x_against", "scaling_advantage_against")):
+                raise EvidenceError("sealed result has invalid schema")
+            elif not isinstance(sealed["frozen_comparison_sha256"], str) or not HEX_64.fullmatch(sealed["frozen_comparison_sha256"]):
+                raise EvidenceError("sealed result has invalid digest")
+            elif set(sealed["comparison_ids"]) != set(comparison["expected_ids"]) or set(sealed["baseline_methods"]) != {"hamming-1nn", "zero-fill"} or set(sealed["matched_100x_against"]) & set(sealed["scaling_advantage_against"]) or not (set(sealed["matched_100x_against"]) | set(sealed["scaling_advantage_against"])).issubset({"hamming-1nn", "zero-fill"}):
+                reasons.add("sealed_baseline_incomplete")
+            elif sealed["frozen_comparison_sha256"] != sha256_bytes(comparison_raw):
                 reasons.add("frozen_comparison_digest_mismatch")
+            elif trust_policy is None or trust_policy["sealed_results_sha256"] != sha256_bytes(read_stable_regular(sealed_path, "sealed result", DEFAULT_MAX_BYTES)):
+                reasons.add("external_trust_policy_mismatch")
             elif not {"hamming-1nn", "zero-fill"}.issubset(set(sealed["baseline_methods"])) or not {"hamming-1nn", "zero-fill"}.issubset(set(sealed["matched_100x_against"]) | set(sealed["scaling_advantage_against"])):
                 reasons.add("sealed_baseline_incomplete")
             else:
@@ -295,7 +355,7 @@ def build_decision(request_path: Path) -> dict[str, object]:
         elif any(bindings[key].dataset_sha256 != digest for key, digest in DISCLOSED_PREDICTION_COMMITMENTS.items()):
             reasons.add("prediction_commitment_mismatch")
     rejection = sorted(reason for reason in reasons if reason in REJECTION_CODES)
-    blocking = sorted(reason for reason in reasons if reason in {"candidate_evidence_absent", "deterministic_pairs_absent", "official_verifications_absent", "frozen_comparison_absent", "sealed_results_absent", "missing_comparison_cell", "terminal_failure_present", "sealed_baseline_incomplete"})
+    blocking = sorted(reason for reason in reasons if reason in {"candidate_evidence_absent", "deterministic_pairs_absent", "official_verifications_absent", "frozen_comparison_absent", "sealed_results_absent", "missing_comparison_cell", "terminal_failure_present", "sealed_baseline_incomplete", "external_trust_policy_absent"})
     if rejection:
         decision = "reject"
     elif blocking:
@@ -333,9 +393,10 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--request", required=True, type=Path)
     parser.add_argument("--output", required=True, type=Path)
+    parser.add_argument("--trust-policy", type=Path)
     args = parser.parse_args(argv)
     try:
-        decision = build_decision(args.request)
+        decision = build_decision(args.request, args.trust_policy)
         atomic_create(args.output, canonical_json_bytes(decision))
     except (EvidenceError, OSError, ValueError, TypeError, KeyError) as exc:
         print(f"promotion input error: {exc}", file=sys.stderr)
